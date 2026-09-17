@@ -102,6 +102,7 @@ from kiro_crew.cron import (
     CronService,
     CronStoreBusy,
     CronStoreUnreadable,
+    agent_sequence_dispatches,
     build_cron_session_context,
     effective_wake_budget,
 )
@@ -189,7 +190,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
-from kiro_crew.kiro_cli import resolve_kiro_cli
+from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -322,6 +323,7 @@ from kiro_crew.slack.handler import (
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.retry import open_dm_with_retry
 from kiro_crew.slack.scope_probe import warn_unreadable_tracked_channels
+from kiro_crew.slack.transport import SlackTransport
 from kiro_crew.subagent import (
     _TRANSIENT_CONTINUE_MSG,
     DIGEST_HOLD_SECS,
@@ -347,6 +349,7 @@ from kiro_crew.validation import CHANNEL_ID_RE
 from kiro_crew.wecom.gateway import warn_if_channel_uncredentialed
 
 if TYPE_CHECKING:
+    from kiro_crew.adaptive.controller import AdaptiveController
     from kiro_crew.dashboard.state import _ChatSlot
     from kiro_crew.discord.client import DiscordClient
     from kiro_crew.imessage.client import IMessageClient
@@ -449,6 +452,49 @@ def _injection_slot_busy(slot: Any) -> bool:
     """
     task = slot.task
     return bool(slot.running) or (task is not None and not task.done())
+
+
+async def _subagent_work_pending(manager: Any, parent_session_key: str) -> bool:
+    """Whether *parent_session_key* still has sub-agents running or QUEUED.
+
+    Asked through ``SubagentManager.has_pending_work_for_async``, whose store
+    ``count_pending`` runs on the task store's writer thread: the synchronous
+    entry takes the SQLite connection on this loop, and a wait there freezes
+    every session's turn behind it. A manager double without the async sibling
+    is asked synchronously -- the pre-queue behaviour those doubles model, and
+    the same probe ``dashboard.handlers.messaging._spawn_on_loop`` makes for
+    ``spawn_async``.
+    """
+    import inspect
+
+    entry = getattr(manager, "has_pending_work_for_async", None)
+    if inspect.iscoroutinefunction(entry):
+        return bool(await entry(parent_session_key))
+    return bool(manager.has_pending_work_for(parent_session_key))
+
+
+async def _subagent_queued_count(manager: Any, parent_session_key: str) -> int:
+    """This parent's QUEUED spawn count, read off-loop like
+    :func:`_subagent_work_pending` (which also counts the running ones)."""
+    import inspect
+
+    entry = getattr(manager, "queued_count_for_async", None)
+    if inspect.iscoroutinefunction(entry):
+        return int(await entry(parent_session_key))
+    return int(manager.queued_count_for(parent_session_key))
+
+
+async def _subagent_batch_pending(manager: Any, batch_id: str) -> bool:
+    """Whether any member of *batch_id* is still outstanding, read off-loop for
+    :func:`_subagent_work_pending`'s reason: the store half of
+    ``batch_members_pending`` is a ``fetch_pending_by_batch`` on the connection
+    this loop would otherwise block on."""
+    import inspect
+
+    entry = getattr(manager, "batch_members_pending_async", None)
+    if inspect.iscoroutinefunction(entry):
+        return bool(await entry(batch_id))
+    return bool(manager.batch_members_pending(batch_id))
 
 
 # Whole-callback transient retries for the cron LLM path (session acquire /
@@ -881,6 +927,14 @@ def _apply_gate_verdict(job: CronJob, tally: _GateTally) -> bool:
     # every kind's success path gets it rather than only this one.
     job.record_success()
     return False
+
+
+def _defer_cron_before_dispatch(job: CronJob, reason: str) -> None:
+    """Retain an undispatched run without counting success or failure."""
+    job.clear_carried_result()
+    job.last_status = "error"
+    job.last_error = reason
+    job.run_never_started = True
 
 
 async def _await_cron_fire_time_gate(
@@ -1547,21 +1601,6 @@ def _channel_transport_permitted(member: str) -> bool:
 _KIRO_CLI_RESOLVE_TIMEOUT_SECS = 5.0
 
 
-def _kiro_cli_pin_probe() -> tuple[str | None, bool]:
-    """``(pinned path, an unpinned install exists)`` — the sync half of the pin.
-
-    The second element separates the two ways the pin can come back empty, which
-    a caller must report differently: kiro-cli is not installed at all (nothing
-    to say — the backend is optional), or it IS installed somewhere the pin does
-    not accept, which is a state an operator needs told about.
-    """
-
-    pinned = resolve_kiro_cli(include_inherited_path=False)
-    if pinned is not None:
-        return pinned, False
-    return None, resolve_kiro_cli() is not None
-
-
 async def _pinned_kiro_cli(purpose: str) -> str | None:
     """kiro-cli's absolute path for an unattended spawn, or ``None`` to refuse.
 
@@ -1580,12 +1619,15 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
     override, and hence its condition — an install the pin declined is worth a
     line, a backend that simply is not installed is not.
 
-    Off the loop and bounded: see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
+    The sync half is :func:`kiro_crew.kiro_cli.pin_kiro_cli`, shared with the
+    CLI's update command and the diagnostics bundle; this wrapper adds only
+    what an unattended path on the event loop needs. Off the loop and bounded:
+    see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
     """
 
     try:
         pinned, unpinned_exists = await asyncio.wait_for(
-            asyncio.to_thread(_kiro_cli_pin_probe),
+            asyncio.to_thread(pin_kiro_cli),
             timeout=_KIRO_CLI_RESOLVE_TIMEOUT_SECS,
         )
     except (TimeoutError, asyncio.TimeoutError):
@@ -1596,12 +1638,7 @@ async def _pinned_kiro_cli(purpose: str) -> str | None:
         )
         return None
     if pinned is None and unpinned_exists:
-        logger.warning(
-            "kiro-cli resolves only through PATH, which an unattended spawn does "
-            "not trust, so %s is skipped. Point KIROCREW_KIRO_BIN at the binary "
-            "to have it used here.",
-            purpose,
-        )
+        logger.warning("%s is skipped: %s.", purpose, PATH_ONLY_INSTALL_NOTE)
     return pinned
 
 
@@ -1737,6 +1774,10 @@ class GatewayOrchestrator:
         # as an inert None so other modules referencing it degrade gracefully.
         self.secretary_svc: object | None = None
         self.subagent_mgr: SubagentManager | None = None
+        # Adaptive concurrency controller: started by _start_adaptive_controller
+        # after dashboard and task-store readiness; stopped in shutdown before
+        # the manager is cancelled so no actuator fires into a closing manager.
+        self._adaptive_controller: AdaptiveController | None = None
         self._subagent_coalescer_inst: "SubagentEventCoalescer | None" = None
         # Wave accounting for the completion digest (batch_id -> progress).
         self._batch_progress: dict[str, dict] = {}
@@ -1745,6 +1786,14 @@ class GatewayOrchestrator:
             set()
         )  # job IDs with in-flight script/command execution
         self.task_runner: TaskRunner | None = None
+        # Runner admission over the task queue, attached by _wire_runner_admission
+        self._runner_admission: Any = None
+        # Whether the consumers' orphan-adoption sweep has already been handed
+        # out over a store that existed. The first wiring pass can run while the
+        # store is still opening off the loop, and adopting nothing is not the
+        # same as having adopted: _runner_admission_store_ready re-attaches then,
+        # and this keeps that from becoming a SECOND sweep over the same rows.
+        self._runner_admission_adopted = False
         self.channel_history: ChannelHistory | None = None
         self.dashboard_state: DashboardState | None = None
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
@@ -1779,10 +1828,14 @@ class GatewayOrchestrator:
         self._model_download_task: "asyncio.Task[bool] | None" = None
         self._feature_video_task: "asyncio.Task[bool] | None" = None
         self._auto_migrate_task: "asyncio.Task[None] | None" = None
-        # Boot-time update check, started fire-and-forget after the signal
-        # handlers are installed (see start()). Cancelled on shutdown so a
-        # stalled git fetch cannot hold the process open.
+        # Recurring update coordinator, started after signal handlers are
+        # installed. Cancelled on shutdown so stalled network or installer work
+        # cannot hold the process open.
         self._update_check_task: "asyncio.Task[None] | None" = None
+        self._update_apply_deferred = False
+        self._pending_update_respawn: Callable[[], str] | None = None
+        self._mandatory_update_deferred_at: float | None = None
+        self._mandatory_update_deferred_key: str | None = None
         self._mcp_gateway_manager: GatewayManager | None = None
         # Detached pre-resolve pass for npm-launcher MCP targets. Held so the
         # loop keeps a strong reference (a bare create_task is only weakly held)
@@ -1798,40 +1851,222 @@ class GatewayOrchestrator:
 
         self._mcp_resolve_home: str = str(config_dir())
 
-    def _count_in_flight_work(self) -> int:
-        """Count in-flight backend tasks that an abrupt restart would lose.
+    def _in_flight_work_counts(self) -> tuple[int, int]:
+        """Return ``(turns, background)`` that a restart would interrupt.
 
-        Used by the stale-asset watchdog to drain before shutting down: an
-        update prune only breaks static-asset serving, not live ACP turns, so
-        letting active turns finish avoids the "❌ lost to gateway restart /
-        no result captured" orphaning. Counts active provider turns (dashboard
-        chat + task-runner sessions) plus in-flight Slack session turns.
-
-        Defensive: any failure to introspect a surface is treated as idle, so
-        a broken accessor can never wedge shutdown.
+        Unknown provider state is classified as background so a mandatory
+        cooperative turn drain never cancels work whose ownership is unclear.
         """
-        count = 0
+        turns = 0
+        background = 0
         state = self.dashboard_state
         if state is not None:
             try:
                 for provider in state.sessions.active_providers():
                     checker = getattr(provider, "has_active_turn", None)
                     if not callable(checker):
+                        background += 1
                         continue
                     try:
                         if checker():
-                            count += 1
+                            turns += 1
                     except Exception:
-                        # A provider that can't report turn state must not
-                        # block shutdown — treat it as idle.
-                        pass
+                        logger.warning("in-flight count: provider turn state failed", exc_info=True)
+                        background += 1
             except Exception:
-                logger.debug("in-flight count: active_providers() failed", exc_info=True)
-        # In-flight Slack session turns (one task per active thread turn).
+                logger.warning("in-flight count: active_providers() failed", exc_info=True)
+                background += 1
+
+            slots = getattr(state, "_slots", None)
+            if isinstance(slots, dict):
+                seen_slot_tasks: set[int] = set()
+                for slot in list(slots.values()):
+                    task = getattr(slot, "task", None)
+                    if task is not None:
+                        marker = id(task)
+                        if marker in seen_slot_tasks:
+                            continue
+                        seen_slot_tasks.add(marker)
+                        try:
+                            if not task.done():
+                                turns += 1
+                        except Exception:
+                            logger.warning(
+                                "in-flight count: dashboard slot task failed", exc_info=True
+                            )
+                            background += 1
+                    elif bool(getattr(slot, "_in_stage_execution", False)):
+                        # The Python stage loop remains live between stage turns
+                        # while slot.task is intentionally momentarily None.
+                        background += 1
+
+            workflows = getattr(state, "workflow_service", None)
+            if workflows is not None:
+                try:
+                    background += sum(
+                        1
+                        for run in workflows.list_runs()
+                        if isinstance(run, dict) and run.get("status") == "running"
+                    )
+                except Exception:
+                    logger.warning("in-flight count: workflow listing failed", exc_info=True)
+                    background += 1
+
         for task in list(self._session_tasks.values()):
             if not task.done():
-                count += 1
-        return count
+                turns += 1
+
+        sessions = self.sessions
+        if sessions is not None:
+            try:
+                background += max(0, int(sessions.inbound_callback_count))
+            except Exception:
+                logger.warning("in-flight count: inbound callback state failed", exc_info=True)
+                background += 1
+        try:
+            background += max(0, int(inbound_spool.pending_refusal_write_count()))
+        except Exception:
+            logger.warning("in-flight count: refusal write state failed", exc_info=True)
+            background += 1
+
+        seen_handler_tasks: set[int] = set()
+        handler_owners: list[object] = [
+            self,
+            *getattr(self, "_channel_handles", {}).values(),
+        ]
+        handler_owners.extend(
+            peer
+            for owner in list(handler_owners)
+            if (peer := getattr(owner, "_peer", None)) is not None
+        )
+        for owner in handler_owners:
+            tasks = getattr(owner, "_handler_tasks", None)
+            if not isinstance(tasks, (set, list, tuple)):
+                continue
+            for task in list(tasks):
+                marker = id(task)
+                if marker in seen_handler_tasks:
+                    continue
+                seen_handler_tasks.add(marker)
+                try:
+                    if not task.done():
+                        background += 1
+                except Exception:
+                    logger.warning("in-flight count: channel handler state failed", exc_info=True)
+                    background += 1
+
+        subagents = self.subagent_mgr
+        if subagents is not None:
+            try:
+                background += max(0, int(subagents.pending_work_count))
+            except Exception:
+                logger.warning("in-flight count: subagent state failed", exc_info=True)
+                background += 1
+
+        background += len(self._running_script_ids)
+
+        runner = self.task_runner
+        if runner is not None:
+            try:
+                if runner.running:
+                    background += 1
+            except Exception:
+                logger.warning("in-flight count: TaskRunner state failed", exc_info=True)
+                background += 1
+        return turns, background
+
+    def _count_in_flight_work(self) -> int:
+        """Count all gateway work that an automatic restart would interrupt."""
+        turns, background = self._in_flight_work_counts()
+        return turns + background
+
+    def _live_update_handler_tasks(self) -> list[asyncio.Task[Any]]:
+        """Return deduplicated channel handler tasks the restart must preserve."""
+        current = asyncio.current_task()
+        seen: set[int] = set()
+        pending: list[asyncio.Task[Any]] = []
+        state = self.dashboard_state
+        slots = getattr(state, "_slots", None) if state is not None else None
+        if isinstance(slots, dict):
+            for slot in list(slots.values()):
+                task = getattr(slot, "task", None)
+                if task is None or task is current:
+                    continue
+                marker = id(task)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                if not task.done():
+                    pending.append(task)
+        background_tasks = getattr(state, "_background_tasks", None) if state is not None else None
+        if isinstance(background_tasks, (set, list, tuple)):
+            for task in list(background_tasks):
+                if task is current or not callable(getattr(task, "get_name", None)):
+                    continue
+                if not task.get_name().startswith("dashboard-stage:"):
+                    continue
+                marker = id(task)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                if not task.done():
+                    pending.append(task)
+
+        owners: list[object] = [self, *getattr(self, "_channel_handles", {}).values()]
+        owners.extend(
+            peer for owner in list(owners) if (peer := getattr(owner, "_peer", None)) is not None
+        )
+        for owner in owners:
+            tasks = getattr(owner, "_handler_tasks", None)
+            if not isinstance(tasks, (set, list, tuple)):
+                continue
+            for task in list(tasks):
+                marker = id(task)
+                if marker in seen or task is current:
+                    continue
+                seen.add(marker)
+                if not task.done():
+                    pending.append(task)
+        return pending
+
+    async def _drain_update_callback_work(self, *, timeout: float | None) -> bool:
+        """Wait without cancellation until callbacks and refusal writes are durable."""
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+        while True:
+            handlers = self._live_update_handler_tasks()
+            writes = list(inbound_spool.pending_refusal_writes())
+            reservations = 0
+            if self.sessions is not None:
+                try:
+                    reservations = max(0, int(self.sessions.inbound_callback_count))
+                except Exception:
+                    logger.warning("update restart: callback count unavailable", exc_info=True)
+                    return False
+            if not handlers and not writes and reservations <= 0:
+                # Let callbacks already queued on the loop either reserve or
+                # observe the closed gate, then recheck. The caller commits the
+                # synchronous restart fence immediately after this returns.
+                await asyncio.sleep(0)
+                handlers = self._live_update_handler_tasks()
+                writes = list(inbound_spool.pending_refusal_writes())
+                reservations = (
+                    max(0, int(self.sessions.inbound_callback_count))
+                    if self.sessions is not None
+                    else 0
+                )
+                if not handlers and not writes and reservations <= 0:
+                    return True
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                return False
+            awaitables = [*handlers, *writes]
+            if awaitables:
+                _done, still_pending = await asyncio.wait(awaitables, timeout=remaining)
+                if still_pending and deadline is not None and loop.time() >= deadline:
+                    return False
+            else:
+                await asyncio.sleep(0.01 if remaining is None else min(0.01, remaining))
 
     def _live_internal_secret(self) -> str:
         """This gateway's LIVE internal-API secret, for script-cron ``notify()``.
@@ -1856,6 +2091,93 @@ class GatewayOrchestrator:
             return runner.app.get("local_secret", "") or ""
         except Exception:
             return ""
+
+    _UPDATE_BUSY_RETRY_SECS = 300.0
+    _MANDATORY_UPDATE_MAX_DEFER_SECS = 600.0
+    #: How long the pre-restart drain waits for callbacks and refusal writes to
+    #: become durable before giving up and deferring the restart.
+    #:
+    #: Named rather than inlined at the call site so a test that is about the
+    #: fetch/reset/venv SEQUENCE can shorten it. When nothing makes the drain
+    #: condition true, ``_drain_update_callback_work`` polls at 10ms to the
+    #: deadline, so an inlined 30.0 cost eleven such tests thirty seconds EACH --
+    #: ~330s of pure sleeping per full suite run, asserted on by none of them.
+    #: The value itself stays pinned by the test that IS about it
+    #: (``test_restart_fences_then_closes_and_final_drains`` asserts
+    #: ``drain:30.0``), so shortening it elsewhere cannot hide a change here.
+    _UPDATE_DRAIN_TIMEOUT_SECS = 30.0
+
+    async def _prepare_auto_update_apply(
+        self,
+        *,
+        mandatory: bool,
+        mandatory_key: str = "",
+    ) -> bool:
+        """Pause admission and reach an idle boundary before automatic apply."""
+        if not mandatory:
+            self._mandatory_update_deferred_at = None
+            self._mandatory_update_deferred_key = None
+        sessions = self.sessions
+        if sessions is None:
+            return True
+        try:
+            paused = await sessions.pause_turn_admission_for_update()
+        except Exception:
+            logger.exception("Auto-update could not pause turn admission")
+            self._update_apply_deferred = True
+            return False
+        if not paused:
+            self._update_apply_deferred = True
+            return False
+
+        turn_busy, background_busy = self._in_flight_work_counts()
+        busy = turn_busy + background_busy
+        if busy <= 0:
+            self._mandatory_update_deferred_at = None
+            self._mandatory_update_deferred_key = None
+            return True
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if mandatory:
+            target_key = mandatory_key or "mandatory"
+            if self._mandatory_update_deferred_key != target_key:
+                self._mandatory_update_deferred_key = target_key
+                self._mandatory_update_deferred_at = now
+            elif self._mandatory_update_deferred_at is None:
+                self._mandatory_update_deferred_at = now
+        mandatory_due = bool(
+            mandatory
+            and self._mandatory_update_deferred_at is not None
+            and now - self._mandatory_update_deferred_at >= self._MANDATORY_UPDATE_MAX_DEFER_SECS
+        )
+        if mandatory_due:
+            logger.warning(
+                "Mandatory update remains deferred after its grace period: "
+                "%d active turn(s), %d background workload(s)",
+                turn_busy,
+                background_busy,
+            )
+
+        await sessions.resume_turn_admission_after_update()
+        self._schedule_inbound_replay()
+        self._update_apply_deferred = True
+        logger.info("Auto-update deferred: %d in-flight turn(s)", busy)
+        if self.dashboard_state:
+            self.dashboard_state.push_refresh("update_available")
+        return False
+
+    async def _finish_auto_update_apply(self) -> None:
+        """Reopen admission when apply returns instead of replacing the process."""
+        sessions = self.sessions
+        if sessions is None:
+            return
+        try:
+            await sessions.resume_turn_admission_after_update()
+        except Exception:
+            logger.exception("Auto-update could not resume turn admission")
+        else:
+            self._schedule_inbound_replay()
 
     # ------------------------------------------------------------------
     # Tool approval callback (shared by cron, heartbeat, subagent, task)
@@ -3672,6 +3994,11 @@ class GatewayOrchestrator:
                                     slot,
                                     wrapped,
                                     _directive_user_origin=False,
+                                    # Structural provenance for the session
+                                    # ledger: the queued twin above carries
+                                    # CRON_NOTIFICATION_KIND, and this branch is
+                                    # the same injector dispatching directly.
+                                    _turn_actor="cron",
                                 ),
                             )
                             slot.task = task
@@ -3873,6 +4200,10 @@ class GatewayOrchestrator:
 
             # ── Command mode: direct shell execution (sandboxed) ──
             if job.command:
+                if getattr(self.sessions, "admission_closed", False) is True:
+                    logger.info("Cron '%s': gateway admission is closed, deferring", job.name)
+                    _defer_cron_before_dispatch(job, "gateway admission is closed")
+                    return None
                 self._running_script_ids.add(job.id)
                 # Bound to the overlap guard's own lifetime, and created HERE rather
                 # than at the submit below so the ``finally`` that releases the guard
@@ -4246,6 +4577,10 @@ class GatewayOrchestrator:
 
             # ── Code-based script execution (deterministic, no LLM) ──
             if job.script:
+                if getattr(self.sessions, "admission_closed", False) is True:
+                    logger.info("Cron '%s': gateway admission is closed, deferring", job.name)
+                    _defer_cron_before_dispatch(job, "gateway admission is closed")
+                    return None
                 self._running_script_ids.add(job.id)
                 # Bound to the overlap guard's own lifetime, and created HERE rather
                 # than at the submit below so the ``finally`` that releases the guard
@@ -4711,7 +5046,23 @@ class GatewayOrchestrator:
                 """get_or_create honoring job.model; if that model is
                 unavailable, retry once with the registry default.
                 Returns (client, is_new, resumed, downgraded)."""
+
                 assert self.sessions is not None
+                modes = getattr(self.ctx_builder, "_session_memory_modes", None)
+                if isinstance(modes, dict):
+                    from kiro_crew.messaging.privacy_mode import strictest
+                    from kiro_crew.subagent_persistence import bind_session_memory_mode
+                    from kiro_crew.workflows.registry import _await_owned
+
+                    # A separately scheduled run is durable work, not a child
+                    # conversation. Only this trusted dispatch admits its key.
+                    publication = asyncio.create_task(
+                        asyncio.to_thread(bind_session_memory_mode, key, "persistent")
+                    )
+                    admitted_mode = await _await_owned(publication)
+                    modes[key] = (
+                        strictest((admitted_mode, modes.get(key, "persistent"))) or "persistent"
+                    )
                 if cron_memory_store:
                     from kiro_crew.context import prepare_store_vectors
                     from kiro_crew.member_memory_auth import bind_private_session_store
@@ -4779,7 +5130,7 @@ class GatewayOrchestrator:
             # When agent_sequence has multiple agents, run them sequentially
             # with per-agent session keys and per-job env vars.
             agents = job.agent_sequence if job.agent_sequence else []
-            if len(agents) > 1:
+            if agent_sequence_dispatches(agents):
                 assert self.sessions is not None
                 assert self.ctx_builder is not None
                 result_text = "_No response._"
@@ -4814,10 +5165,14 @@ class GatewayOrchestrator:
                         full_message, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
                             msg,
-                            True,
+                            is_new,
+                            agent_session_key,
                             interactive=False,
                             agent=agent,
                             memory_store=cron_memory_store or None,
+                            context_provider=client,
+                            resumed=_resumed,
+                            minimal_context=job.minimal_context,
                         )
                         # Wall clock for the cron agent turn: acp never assigns
                         # TurnUsage.duration_ms, so the row falls back to this.
@@ -4900,7 +5255,9 @@ class GatewayOrchestrator:
                             # for the NEXT agent's still-in-flight turn.
                             _has_pending = bool(
                                 self.subagent_mgr
-                                and self.subagent_mgr.has_pending_work_for(agent_session_key)
+                                and await _subagent_work_pending(
+                                    self.subagent_mgr, agent_session_key
+                                )
                             )
                             _has_injecting = self._cron_injecting.get(agent_session_key, 0) > 0
                             if _has_pending or _has_injecting:
@@ -4956,10 +5313,13 @@ class GatewayOrchestrator:
                 full_message, _ = await run_in_embed_pool(
                     self.ctx_builder.build_message,
                     msg,
-                    True,
+                    is_new,
+                    session_key,
                     interactive=False,
-                    agent=job.agent_id or None,
+                    agent=cron_agent or None,
                     memory_store=cron_memory_store or None,
+                    context_provider=client,
+                    resumed=_resumed,
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
@@ -5288,6 +5648,13 @@ class GatewayOrchestrator:
                 # Session cleanup happens in finally block
                 return result_text
             except Exception as exc:
+                if isinstance(exc, SessionClosingError) and not _prompt_dispatched:
+                    logger.info(
+                        "Cron '%s': gateway admission closed before dispatch, deferring",
+                        job.name,
+                    )
+                    _defer_cron_before_dispatch(job, "gateway admission is closed")
+                    return None
                 # Attempt one retry for ACP process death before any dedup / alert.
                 exc_msg = str(exc).lower()
                 if (
@@ -5611,7 +5978,8 @@ class GatewayOrchestrator:
                     # queued behind the concurrency/stagger gate, or
                     # mid-injection — _subagent_done will reset after the last one.
                     has_pending = bool(
-                        self.subagent_mgr and self.subagent_mgr.has_pending_work_for(session_key)
+                        self.subagent_mgr
+                        and await _subagent_work_pending(self.subagent_mgr, session_key)
                     )
                     has_injecting = self._cron_injecting.get(session_key, 0) > 0
                     if has_pending or has_injecting:
@@ -5947,6 +6315,8 @@ class GatewayOrchestrator:
                 key,
                 memory_store=_memory_store,
                 provider_type=_provider,
+                context_provider=client,
+                resumed=_resumed,
             )
             _completion_hook = self._monitor_completion_hook(loop)
             if wake_message is not None and _completion_hook is None:
@@ -7598,6 +7968,15 @@ class GatewayOrchestrator:
 
     def _init_subagents(self) -> None:
         """Initialize the subagent manager."""
+        from kiro_crew.recovery.ladder import configure_default_ladder
+
+        # The process recovery ladder is snapshotted from config HERE because
+        # this step is unconditional and runs before the task runner, the
+        # dashboard and any chat slot — i.e. before any layer can decide a
+        # retry, and outside the event-loop failure branch that would otherwise
+        # be the first to want a delay. `agent.recovery_backoff_*` are
+        # restart=True, so one snapshot is the whole contract.
+        configure_default_ladder(self._cfg)
 
         # Per-slot WS events route by EXACT slot-key match in the frontend —
         # `subagent_event_slot` maps a parent session key to the tab that
@@ -7700,6 +8079,10 @@ class GatewayOrchestrator:
                         slot,
                         msg,
                         _directive_user_origin=False,
+                        # The text is the re-injected sub-agent completion or
+                        # failure this recovery drains, so the sub-agent is what
+                        # caused the turn.
+                        _turn_actor="subagent",
                     )
                 ),
             )
@@ -7909,6 +8292,16 @@ class GatewayOrchestrator:
                 )
             elif info.error:
                 detail = f"Error: {info.error}"
+                # A run that ended on a stall / cancel / transport death keeps
+                # what it streamed as a flagged PARTIAL (``info.partial``, set by
+                # the stop-reason classifier in subagent_manager/run.py); deliver
+                # it so the parent continues from it instead of re-submitting the
+                # whole task.
+                if info.partial and info.result:
+                    detail += (
+                        "\n\nPartial output (the run did NOT finish — do not treat "
+                        f"this as a completed result):\n{info.result}"
+                    )
             elif result_path and (info.result_truncated or _is_orchestrator):
                 detail = summarize_result(info.result, result_path)
             else:
@@ -8075,7 +8468,7 @@ class GatewayOrchestrator:
                     try:
                         _last = bool(
                             self.subagent_mgr
-                            and not self.subagent_mgr.batch_members_pending(_batch_id)
+                            and not await _subagent_batch_pending(self.subagent_mgr, _batch_id)
                         )
                     except Exception:
                         _last = False
@@ -8197,15 +8590,51 @@ class GatewayOrchestrator:
                     )
                     if _last:
                         # Final chunk: release the spawn-discipline gate.
+                        #
+                        # The tally counts this wave's DIRECT members only.
+                        # ``wave_has_live_nested_spawns`` reports whether a
+                        # member of this wave has itself spawned work that is
+                        # still running (its own independent batch, so not in
+                        # this total). When it is, the completion wording is
+                        # scoped to the direct members and states that their
+                        # nested work reports on its own; the unconditional
+                        # "This run is complete / All results delivered" claim
+                        # is reserved for a wave with no live nested work. The
+                        # check is read-only and never withholds the digest.
+                        try:
+                            _nested_live = bool(
+                                self.subagent_mgr
+                                and self.subagent_mgr.wave_has_live_nested_spawns(_batch_id)
+                            )
+                        except Exception:
+                            _nested_live = False
+                        if _nested_live:
+                            _completion_line = (
+                                f"These {bp['total']} sub-agents finished: "
+                                f"{bp['ok']} ✅ · {bp['err']} ❌ · "
+                                f"{bp['stopped']} ⏹. Their results are below. "
+                                f"NOTE: a sub-agent in this wave spawned further "
+                                f"work that is still running; that nested work "
+                                f"is tracked as its own wave and reports "
+                                f"separately when it finishes — this digest does "
+                                f"NOT cover it.\n"
+                                f"Finish processing these results before "
+                                f"spawning any follow-up sub-agents.\n"
+                            )
+                        else:
+                            _completion_line = (
+                                f"wave finished: "
+                                f"{bp['ok']} ✅ · {bp['err']} ❌ · "
+                                f"{bp['stopped']} ⏹ of {bp['total']} agents. "
+                                f"All results delivered.\n"
+                                f"This run is complete. Finish processing all "
+                                f"results before spawning any follow-up "
+                                f"sub-agents.\n"
+                            )
                         announce = (
                             f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
-                            f"Batch results {_chunk_k}/{_chunk_j} — wave finished: "
-                            f"{bp['ok']} ✅ · {bp['err']} ❌ · "
-                            f"{bp['stopped']} ⏹ of {bp['total']} agents. "
-                            f"All results delivered.\n"
-                            f"This run is complete. Finish processing all "
-                            f"results before spawning any follow-up "
-                            f"sub-agents.\n"
+                            f"Batch results {_chunk_k}/{_chunk_j} — "
+                            f"{_completion_line}"
                             f"{_footer}\n\n{_digest_body}{_guards}"
                         )
                         # This member's completion is delivered as the wave-close
@@ -8484,6 +8913,11 @@ class GatewayOrchestrator:
                                     _injection_slot,
                                     announce,
                                     _directive_user_origin=False,
+                                    # Structural provenance for the session
+                                    # ledger: the queued twin above carries
+                                    # SUBAGENT_COMPLETION_KIND, and this branch
+                                    # is the same injector dispatching directly.
+                                    _turn_actor="subagent",
                                     **_run_kwargs,
                                 )
                             )
@@ -8597,6 +9031,8 @@ class GatewayOrchestrator:
                                 parent_key,
                                 memory_store=_memory_store,
                                 provider_type=_provider,
+                                context_provider=client,
+                                resumed=_resumed,
                             )
                         else:
                             msg = announce
@@ -8820,6 +9256,8 @@ class GatewayOrchestrator:
                             parent_key,
                             memory_store=_memory_store,
                             provider_type=_provider,
+                            context_provider=client,
+                            resumed=_resumed,
                         )
                     else:
                         msg = announce
@@ -8894,7 +9332,7 @@ class GatewayOrchestrator:
                         a.parent_session_key == parent_key and a.id != info.id
                         for a in self.subagent_mgr.running
                     )
-                    or self.subagent_mgr.queued_count_for(parent_key) > 0
+                    or await _subagent_queued_count(self.subagent_mgr, parent_key) > 0
                 )
                 still_injecting = self._cron_injecting.get(parent_key, 0) > 0
                 if not still_running and not still_injecting:
@@ -9144,6 +9582,304 @@ class GatewayOrchestrator:
         )
         self.subagent_mgr.start_reaper()
 
+    def _start_adaptive_controller(self, cfg: KiroCrewConfig | None = None) -> None:
+        """Run the adaptive concurrency controller beside the subagent manager.
+
+        It bounds the manager's live cap beneath the user's ceiling and moves
+        the MCP daemon's spawn gate through ``GatewayManager.set_spawn_capacity``
+        (read through ``self._mcp_gateway_manager`` at call time, so a broker
+        that starts or restarts later is picked up without rewiring).
+        """
+        if self.subagent_mgr is None or self._adaptive_controller is not None:
+            return
+        from kiro_crew.config import live
+
+        cfg = cfg if cfg is not None else self._cfg
+        if not getattr(cfg.agent, "adaptive_concurrency", True):
+            if getattr(self, "_adaptive_start_sub", None) is None:
+                self._adaptive_start_sub: Subscription | None = live.watch_object(
+                    self,
+                    "agent.adaptive_concurrency",
+                    method="_start_adaptive_controller",
+                    name="GatewayAdaptiveStart",
+                )
+            return
+        # Inside the ENABLED branch, not at module scope: a module-level import
+        # here drags ``adaptive.{controller,policy,signals}`` into every
+        # importer of ``slack.gateway`` -- the boot path -- for an operator who
+        # turned the controller off, which the AUTOSDE boot-path rule forbids
+        # for a subsystem a disabled switch never uses. The watch above is what
+        # brings the import back when the switch flips, so gating the import
+        # costs a disabled host nothing and an enabled one one lazy load.
+        from kiro_crew.adaptive import controller as adaptive_controller
+        from kiro_crew.adaptive.controller import AdaptiveController
+
+        async def _set_gate(capacity: int) -> int | None:
+            mgr = self._mcp_gateway_manager
+            return None if mgr is None else await mgr.set_spawn_capacity(capacity)
+
+        async def _gate_stats() -> dict:
+            mgr = self._mcp_gateway_manager
+            return {} if mgr is None else await mgr.stats()
+
+        cfg_gw = cfg.mcp_gateway
+        try:
+            controller = AdaptiveController(
+                self.subagent_mgr,
+                cfg=cfg,
+                set_gate_capacity=_set_gate,
+                read_gate_stats=_gate_stats,
+                gate_initial=int(getattr(cfg_gw, "spawn_concurrency_initial", 4)),
+                gate_floor=int(getattr(cfg_gw, "spawn_concurrency_min", 1)),
+                gate_ceiling=int(getattr(cfg_gw, "spawn_concurrency_max", 8)),
+            )
+            controller.start()
+        except Exception:
+            logger.warning("adaptive concurrency controller failed to start", exc_info=True)
+            return
+        self._adaptive_controller = controller
+        subscription = getattr(self, "_adaptive_start_sub", None)
+        if subscription is not None:
+            subscription.cancel()
+            self._adaptive_start_sub = None
+        adaptive_controller.register(controller)
+        self._wire_overload_health(controller)
+
+    def _wire_overload_health(self, controller: AdaptiveController) -> None:
+        """Publish the controller's caps and degrade reason to session health,
+        and the subagent manager's dependency coordinator to the process.
+
+        ``session_health`` renders ``effective_caps`` per lane and one
+        ``degrade_reason``; both are pulled through the sources registered
+        here at compute time, so the health payload never holds a stale copy.
+        The degrade reason is a closed-set token (``adaptive_<action>``) because
+        it is also a metric attribute. The dependency coordinator is whatever
+        the manager built beside its task store; ``register_coordinator`` is
+        how a caller with no task row (main chat, monitors) reads the shared
+        ``retry_at`` for a scope.
+        """
+        from kiro_crew.dashboard import session_health
+        from kiro_crew.taskq import dependency as taskq_dependency
+
+        def _spawn_gate_cap() -> dict | None:
+            state = controller.state()
+            if not state.get("enabled"):
+                return None
+            return {
+                "effective": state.get("spawn_gate_capacity"),
+                "applied": state.get("applied_gate_cap"),
+                "pending": state.get("gate_pending"),
+                "floor": state.get("gate_floor"),
+                "ceiling": state.get("gate_ceiling"),
+            }
+
+        def _exec_cap() -> dict | None:
+            state = controller.state()
+            if not state.get("enabled"):
+                return None
+            return {
+                "adaptive": state.get("effective_exec_cap"),
+                "ceiling": state.get("exec_ceiling"),
+                "paused": bool(state.get("paused")),
+                "probing": bool(state.get("probing")),
+            }
+
+        def _degrade_reason() -> str | None:
+            state = controller.state()
+            if state.get("paused"):
+                return "adaptive_pause"
+            if state.get("probing"):
+                return "adaptive_probe"
+            last = state.get("last") or {}
+            action = last.get("action") if isinstance(last, dict) else None
+            return "adaptive_decrease" if action == "decrease" else None
+
+        monitor = session_health.default_monitor()
+        monitor.register_cap_source("spawn_gate", _spawn_gate_cap)
+        monitor.register_cap_source("subagents", _exec_cap)
+        monitor.register_pressure_source(_degrade_reason)
+
+        coordinator = self._subagent_dependency_coordinator()
+        if coordinator is not None:
+            taskq_dependency.register_coordinator(coordinator)
+
+    def _subagent_dependency_coordinator(self) -> Any:
+        """The subagent manager's ONE dependency coordinator, or None.
+
+        None while the manager's store is still opening off the loop: the
+        coordinator's whole point is a schedule over durable rows.
+
+        Read on the loop by the wiring passes, so the FIRST build -- which reads
+        every waiting row -- is paid for off-loop by
+        :meth:`_ensure_subagent_coordinator` before each of them.
+        """
+        coordinator = getattr(self.subagent_mgr, "dependency_coordinator", None)
+        if callable(coordinator):
+            coordinator = coordinator()
+        return coordinator
+
+    async def _ensure_subagent_coordinator(self) -> None:
+        """Build the manager's dependency coordinator on the store's writer
+        thread, before the loop-side wiring asks for it.
+
+        A no-op with no manager, with the store still opening (there is nothing
+        to schedule yet -- the second wiring pass binds it then), and once one
+        exists.
+        """
+        mgr = self.subagent_mgr
+        if mgr is None:
+            return
+        entry = getattr(mgr, "dependency_coordinator_async", None)
+        if entry is None:
+            return
+        await entry()
+
+    def _unwire_overload_health(self) -> None:
+        """Drop the health sources and the coordinator handle at shutdown so a
+        late health read reports no caps instead of a stopped controller's."""
+        from kiro_crew.dashboard import session_health
+        from kiro_crew.taskq import dependency as taskq_dependency
+
+        session_health.default_monitor().clear_sources()
+        taskq_dependency.register_coordinator(None)
+        self._unwire_runner_admission()
+
+    def _wire_runner_admission(self) -> None:
+        """Put TaskRunner steps and workflow ``ctx.agent()`` calls on the task queue.
+
+        First of two passes, run while the dashboard socket is being bound so
+        both consumers have their admission -- and therefore the typed
+        ``task_store_unavailable`` refusal -- from the moment they can serve a
+        request. One :class:`RunnerAdmission` over the subagent manager's store
+        and effective cap, attached to the TaskRunner and the WorkflowService,
+        with the lane's raise edge registered on the manager (see
+        :meth:`SubagentManager.set_cap_raise_listener`).
+
+        The manager's store may still be opening off the loop here, in which
+        case there is no dependency coordinator yet and no rows to adopt;
+        :meth:`_runner_admission_store_ready` is the second pass that binds
+        both once there is. Until then the admission's own ``tick`` is what
+        wakes its time-based waits, from the reaper sweep -- which is also the
+        steady state when the durable queue is OFF for good.
+        """
+        mgr = self.subagent_mgr
+        if mgr is None:
+            return
+        try:
+            from kiro_crew.recovery.ladder import default_ladder
+            from kiro_crew.taskq.adapters.runner import runner_admission_for
+
+            coordinator = self._subagent_dependency_coordinator()
+            admission = runner_admission_for(
+                mgr, cfg=self._cfg, ladder=default_ladder(), coordinator=coordinator
+            )
+            # Before anything else in here, so a manager that cannot take the
+            # raise edge leaves nothing half-wired: the lane's ceiling is this
+            # manager's cap whether or not a coordinator exists yet.
+            mgr.set_cap_raise_listener(admission.lane.pump)
+            # Unconditional too, and NOT part of the fallback ``tick``: a
+            # terminal write the store refused holds its row ``running`` under
+            # this incarnation's lease, so it must be replayed while the process
+            # lives, and a bound coordinator is exactly what stops ``tick``
+            # (the adapter's own replay) from ever running again.
+            setattr(mgr, "_runner_terminal_write_retry", admission.retry_terminal_writes)
+            if coordinator is not None:
+                self._subscribe_runner_admission(coordinator, admission)
+            else:
+                setattr(mgr, "_runner_admission_tick", admission.tick)
+        except Exception:
+            logger.warning("runner task admission not wired", exc_info=True)
+            return
+        self._runner_admission = admission
+        self._attach_runner_admission_consumers(admission)
+
+    @staticmethod
+    def _subscribe_runner_admission(coordinator: Any, admission: Any) -> None:
+        """Put the runner's waiters on the coordinator's per-scope schedule, so
+        a 429 seen by a TaskRunner step and one seen by a sub-agent share ONE
+        retry instant. A give-up is delivered as a wake: the waiter reads the
+        row, finds it terminal and stops retrying."""
+        coordinator.subscribe(
+            on_wake=admission.on_wake,
+            on_fail=lambda task_id, _reason: admission.on_wake(task_id),
+        )
+
+    def _attach_runner_admission_consumers(self, admission: Any) -> None:
+        """Hand *admission* (or ``None``, to detach) to both runner consumers.
+
+        Attaching is also what runs each consumer's orphan-adoption sweep, and
+        a sweep has rows only once the store exists -- so record whether THIS
+        attach carried one. Adopting nothing is not the same as having adopted.
+        """
+        if admission is not None:
+            self._runner_admission_adopted = admission.store is not None
+        if self.task_runner is not None:
+            self.task_runner.attach_task_admission(admission)
+        workflow_service = getattr(self.dashboard_state, "workflow_service", None)
+        if workflow_service is not None:
+            workflow_service.attach_task_admission(admission)
+
+    async def _runner_admission_store_ready(self) -> None:
+        """Second pass: bind what the first pass had no store for. Idempotent.
+
+        Called once the manager's store is attached. A boot that never lost the
+        race passes straight through it -- the coordinator is already bound and
+        the sweep already ran. A boot that did lose the race gets, HERE, the
+        three things that were unavailable at socket-bind time: the shared
+        coordinator (the runner's only wake path once a store exists, because
+        the reaper pump stops calling the fallback ``tick`` from the moment
+        there are rows), the wake / give-up subscription, and the consumers'
+        adoption sweep over the rows a dead incarnation left behind.
+
+        Runs while both consumers are still idle: the sweep settles any
+        unleased ACTIVE row, so it must not race live work.
+        """
+        mgr = self.subagent_mgr
+        admission = getattr(self, "_runner_admission", None)
+        if mgr is None or admission is None:
+            return
+        try:
+            coordinator = await mgr.dependency_coordinator_async()
+            if coordinator is not None and admission.coordinator is None:
+                admission.attach_coordinator(coordinator)
+                self._subscribe_runner_admission(coordinator, admission)
+                if hasattr(mgr, "_runner_admission_tick"):
+                    delattr(mgr, "_runner_admission_tick")
+                # A wait parked through the ledger between the coordinator's
+                # own build and this handover is in neither schedule: the
+                # build-time rebuild ran before it, and an attached
+                # coordinator stops ``tick`` scanning the ledger. Re-reading
+                # the rows AFTER the attach leaves no such window, because a
+                # park from here on reports to the coordinator itself.
+                store = admission.store
+                if store is not None:
+                    restored = await store.run(coordinator.rebuild)
+                    if restored:
+                        logger.info(
+                            "runner admission: %d dependency waiter(s) rejoined on store ready",
+                            restored,
+                        )
+            if admission.store is not None and not self._runner_admission_adopted:
+                self._attach_runner_admission_consumers(admission)
+        except Exception:
+            logger.warning("runner task admission not bound to its store", exc_info=True)
+
+    def _unwire_runner_admission(self) -> None:
+        admission = getattr(self, "_runner_admission", None)
+        if admission is None:
+            return
+        self._runner_admission = None
+        self._runner_admission_adopted = False
+        self._attach_runner_admission_consumers(None)
+        mgr = self.subagent_mgr
+        if mgr is None:
+            return
+        mgr.set_cap_raise_listener(None)
+        if hasattr(mgr, "_runner_admission_tick"):
+            delattr(mgr, "_runner_admission_tick")
+        if hasattr(mgr, "_runner_terminal_write_retry"):
+            delattr(mgr, "_runner_terminal_write_retry")
+
     def _start_dashboard_workers_after_memory_ready(self) -> None:
         """Start dashboard workers whose restored jobs may enter memory."""
         if self.dashboard_state is None:
@@ -9309,6 +10045,7 @@ class GatewayOrchestrator:
         self._local_only = is_local_only(configured_host, self._slack_enabled)
         self._dashboard_runner, self.dashboard_state = await start_api_server(
             sessions=self.sessions,
+            context_builder=self.ctx_builder,
             crons=self.cron_svc,
             lessons=LessonStore(),
             port=dashboard_port,
@@ -9791,6 +10528,15 @@ class GatewayOrchestrator:
                 max_backends=cfg_gw.max_backends,
                 mcp_target_env=target_env,
                 prewarm_count=cfg_gw.prewarm_count,
+                # Admission keys ride the daemon's argv like max_backends.
+                spawn_concurrency_initial=cfg_gw.spawn_concurrency_initial,
+                spawn_concurrency_min=cfg_gw.spawn_concurrency_min,
+                spawn_concurrency_max=cfg_gw.spawn_concurrency_max,
+                spawn_queue_wait_secs=cfg_gw.spawn_queue_wait_secs,
+                initialize_timeout_secs=cfg_gw.initialize_timeout_secs,
+                host_budget_max_procs=cfg_gw.host_budget_max_procs,
+                host_budget_max_rss_mb=cfg_gw.host_budget_max_rss_mb,
+                host_budget_max_fds=cfg_gw.host_budget_max_fds,
             )
         )
         # Pre-resolve npm-launcher targets in the background. An npx spec asks the
@@ -10156,6 +10902,15 @@ class GatewayOrchestrator:
 
         # Kill all ACP processes and close connections
         cleanup_tasks: list = []
+        if self._adaptive_controller is not None:
+            # Reached only past a live controller, so the module is resident
+            # already: this import is a dict lookup, never the load a
+            # module-scope spelling puts on the boot path.
+            from kiro_crew.adaptive import controller as adaptive_controller
+
+            adaptive_controller.register(None)
+            self._unwire_overload_health()
+            cleanup_tasks.append(self._adaptive_controller.stop())
         if self.subagent_mgr:
             cleanup_tasks.append(self.subagent_mgr.cancel_all())
         if self.sessions:
@@ -10181,10 +10936,13 @@ class GatewayOrchestrator:
         # Cancel background auto-migration if still in flight
         if self._auto_migrate_task is not None and not self._auto_migrate_task.done():
             self._auto_migrate_task.cancel()
-        # Cancel the boot update check if still in flight — its git subprocesses
-        # can take ~70s to time out and nothing downstream needs the result.
+        # Cancel the recurring update coordinator if it is still in flight — a
+        # check or installer subprocess can take ~70s to time out.
         if self._update_check_task is not None and not self._update_check_task.done():
             self._update_check_task.cancel()
+        from kiro_crew.dashboard.handlers.updates import _cancel_update_check
+
+        cleanup_tasks.append(_cancel_update_check())
 
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
@@ -10194,6 +10952,41 @@ class GatewayOrchestrator:
     # ------------------------------------------------------------------
     # Auto-update
     # ------------------------------------------------------------------
+
+    async def _run_update_checks(self) -> None:
+        """Run the full check-and-apply coordinator now and every interval."""
+        from kiro_crew.dashboard.handlers import _UPDATE_CHECK_INTERVAL
+
+        while True:
+            self._update_apply_deferred = False
+            try:
+                if getattr(self, "_pending_update_respawn", None) is not None:
+                    await self._retry_pending_update_restart()
+                else:
+                    await self._check_for_updates()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A failed cycle must not permanently kill automatic updates.
+                logger.exception("Automatic update coordinator failed")
+            delay = (
+                self._UPDATE_BUSY_RETRY_SECS
+                if self._update_apply_deferred
+                else _UPDATE_CHECK_INTERVAL
+            )
+            await asyncio.sleep(delay)
+
+    async def _retry_pending_update_restart(self) -> None:
+        """Retry only the safe restart after an update already applied."""
+        respawn = getattr(self, "_pending_update_respawn", None)
+        if respawn is None:
+            return
+        if not await self._prepare_auto_update_apply(mandatory=False):
+            return
+        try:
+            await self._restart_after_update(respawn)
+        finally:
+            await self._finish_auto_update_apply()
 
     async def _check_for_updates(self) -> None:
         """Blocking update check — auto-applies if enabled, otherwise notifies.
@@ -10290,7 +11083,11 @@ class GatewayOrchestrator:
         # still be updated even when the provider's check could not complete
         # (a timed-out or misconfigured command must not strand the host below
         # the policy floor).
-        if update_required(_running_version):
+        mandatory_required = update_required(_running_version)
+        if not mandatory_required:
+            self._mandatory_update_deferred_at = None
+            self._mandatory_update_deferred_key = None
+        if mandatory_required:
             # Guard against an infinite update→restart loop: only apply when the
             # check found a NEWER build available. If the floor is pinned above
             # the highest installable build (a policy typo, or a floor set ahead
@@ -10309,22 +11106,32 @@ class GatewayOrchestrator:
                 if self.dashboard_state:
                     self.dashboard_state.push_refresh("update_available")
                 return
-            logger.warning(
-                "Version compliance: running %s is below the policy minimum %s — "
-                "applying mandatory update via provider (overrides auto_update)",
-                _running_version,
-                min_version(),
-            )
-            if self.dashboard_state:
-                self.dashboard_state.push_update_progress("pulling", "Applying mandatory update…")
-            success = await provider.apply()
-            if success:
-                await self._restart_after_update(respawn_executable)
-            else:
+            if not await self._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key=f"provider:{min_version()}:{result.remote_version or ''}",
+            ):
+                self._publish_provider_update_state(result)
+                return
+            try:
+                logger.warning(
+                    "Version compliance: running %s is below the policy minimum %s — "
+                    "applying mandatory update via provider (overrides auto_update)",
+                    _running_version,
+                    min_version(),
+                )
                 if self.dashboard_state:
+                    self.dashboard_state.push_update_progress(
+                        "pulling", "Applying mandatory update…"
+                    )
+                success = await provider.apply()
+                if success:
+                    await self._restart_after_update(respawn_executable)
+                elif self.dashboard_state:
                     self.dashboard_state.push_update_progress(
                         "failed", "Update apply failed — run manually: kirocrew update"
                     )
+            finally:
+                await self._finish_auto_update_apply()
             return
 
         # Below the mandatory floor: a check error is a non-answer, not a
@@ -10336,17 +11143,22 @@ class GatewayOrchestrator:
         if result.available:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             if cfg.auto_update:
-                logger.info("Auto-update enabled — applying update via provider")
-                if self.dashboard_state:
-                    self.dashboard_state.push_update_progress("pulling", "Downloading update…")
-                success = await provider.apply()
-                if success:
-                    await self._restart_after_update(respawn_executable)
-                else:
+                if not await self._prepare_auto_update_apply(mandatory=False):
+                    self._publish_provider_update_state(result)
+                    return
+                try:
+                    logger.info("Auto-update enabled — applying update via provider")
                     if self.dashboard_state:
+                        self.dashboard_state.push_update_progress("pulling", "Downloading update…")
+                    success = await provider.apply()
+                    if success:
+                        await self._restart_after_update(respawn_executable)
+                    elif self.dashboard_state:
                         self.dashboard_state.push_update_progress(
                             "failed", "Update apply failed — run manually: kirocrew update"
                         )
+                finally:
+                    await self._finish_auto_update_apply()
             else:
                 self._publish_provider_update_state(result)
                 if self.dashboard_state:
@@ -10355,18 +11167,16 @@ class GatewayOrchestrator:
             print("👻 Already on latest version")
 
     async def _restart_after_update(self, respawn: Callable[[], str]) -> None:
-        """Save state and restart the process after a successful update apply.
+        """Save state and restart only after callback/refusal work is durable.
 
-        ``respawn`` is :func:`kiro_crew.platform.wheel_engine.respawn_executable`,
-        imported by the caller BEFORE ``provider.apply()`` ran: the apply may
-        have deleted the venv this process imports from, so nothing here may
-        import from disk. Calling it is still deferred to this point, because
-        the answer (stable link vs. ``sys.executable``) is only right after the
-        apply has repointed the link.
+        ``respawn`` is loaded before apply can replace the environment. If the
+        pre-fence drain cannot finish, retain it and retry the restart in five
+        minutes with admission reopened; never force through accepted work.
         """
-        logger.info("Update applied, restarting gateway")
+        logger.info("Update applied, preparing a callback-safe gateway restart")
+        self._pending_update_respawn = respawn
         if self.dashboard_state:
-            self.dashboard_state.push_update_progress("restarting", "Restarting server…")
+            self.dashboard_state.push_update_progress("restarting", "Preparing safe restart…")
             from kiro_crew.dashboard.chat import save_all_slots_to_history
 
             try:
@@ -10383,18 +11193,44 @@ class GatewayOrchestrator:
                     "Dashboard slot save before update restart failed",
                     exc_info=True,
                 )
-        if self.sessions:
-            await self.sessions.close_all()
-        # Same reason as the dashboard restart path: the safety-override record
-        # publishes on a worker thread, and os.execv does not drain it, so a
-        # grant activated just before a self-update would lose its notice
-        # (found in review). Offloaded and bounded so a stalled write can
-        # neither block the loop nor hold up the restart.
+        # Same reason as the dashboard restart path: os.execv does not drain the
+        # safety-override writer. Resolve the successor executable before the
+        # final fence too; no await is permitted between the final drain and exec.
         try:
             await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
         except Exception:
             logger.debug("Breadcrumb flush before update restart failed", exc_info=True)
         exe = await asyncio.to_thread(respawn)
+
+        if not await self._drain_update_callback_work(timeout=self._UPDATE_DRAIN_TIMEOUT_SECS):
+            self._update_apply_deferred = True
+            logger.warning(
+                "Update applied but restart deferred: callback/refusal work did not drain"
+            )
+            if self.dashboard_state:
+                self.dashboard_state.push_update_progress(
+                    "restarting", "Update ready — restart deferred until messages are safe"
+                )
+            return
+
+        sessions = self.sessions
+        if sessions is not None:
+            # Yield-free with the successful drain above: a callback is now
+            # either already counted, or it observes this fence and writes its
+            # refusal synchronously before returning. That closes the final
+            # snapshot-to-exec window without holding ordinary retries closed.
+            if not sessions.fence_update_restart():
+                self._update_apply_deferred = True
+                logger.warning("Update restart fence lost to real shutdown; deferring restart")
+                return
+            await sessions.close_all()
+
+        # Any callback that ran while close_all awaited used the synchronous
+        # fenced refusal path. Drain pre-fence workers and registered handlers
+        # one final time; never cancel or force through them.
+        await self._drain_update_callback_work(timeout=None)
+        logger.info("Update callback drain complete, restarting gateway")
+        self._pending_update_respawn = None
         platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
 
     async def _check_for_updates_legacy(self) -> None:
@@ -10408,7 +11244,17 @@ class GatewayOrchestrator:
             # between them, and a dashboard-triggered check running
             # concurrently replaces the cache wholesale.
             info = dict(_update_info)
+            managed_venv = False
+            if _remediation_command(info):
+                from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+                managed_venv = await asyncio.to_thread(running_from_managed_venv)
             from kiro_crew.platform.update_governance import min_version, update_required
+
+            mandatory_target_key = (
+                f"legacy:{min_version()}:{info.get('channel') or ''}:"
+                f"{info.get('latest_version') or ''}:{info.get('managed_by') or ''}"
+            )
 
             # A policy-pinned minimum version makes the update MANDATORY: it
             # overrides the user's auto_update=False, because user config sits
@@ -10420,7 +11266,11 @@ class GatewayOrchestrator:
             # not about whether a newer build was advertised. `_auto_apply_update`
             # still applies the source pin and its own no-new-commits early
             # return, so this cannot bypass the ceiling or loop.
-            if update_required(_running_version):
+            mandatory_required = update_required(_running_version)
+            if not mandatory_required:
+                self._mandatory_update_deferred_at = None
+                self._mandatory_update_deferred_key = None
+            if mandatory_required:
                 # A mandatory floor is handled by layout, because "apply" means
                 # different things per install shape:
                 #   * git checkout (`can_apply`) -> git fetch + reset applies.
@@ -10433,22 +11283,27 @@ class GatewayOrchestrator:
                 #     backend must not drive a git reset on a non-git tree nor show
                 #     an inapplicable CLI-update badge.
                 if info.get("can_apply"):
-                    logger.warning(
-                        "Version compliance: running %s is below the policy minimum %s — "
-                        "applying a mandatory update (overrides auto_update)",
-                        _running_version,
-                        min_version(),
-                    )
-                    await self._auto_apply_update()
+                    if not await self._prepare_auto_update_apply(
+                        mandatory=True,
+                        mandatory_key=mandatory_target_key,
+                    ):
+                        return
+                    try:
+                        logger.warning(
+                            "Version compliance: running %s is below the policy minimum %s — "
+                            "applying a mandatory update (overrides auto_update)",
+                            _running_version,
+                            min_version(),
+                        )
+                        await self._auto_apply_update()
+                    finally:
+                        await self._finish_auto_update_apply()
                     return
-                # A wheel install cannot apply in-process, but the installer can,
-                # and a policy floor outranks auto_update. Restricted to the
-                # `wheel` stamp: a `source` install carries the same installer
-                # command, yet re-running it there builds a SEPARATE managed venv
-                # while this interpreter re-execs unchanged — an endless
-                # update->restart loop. The stamp is baked at build time, so
-                # reading it costs no I/O on the event loop.
-                if _remediation_command(info) and distribution() == "wheel":
+                # A managed-venv install cannot apply in-process, but its
+                # installer can, and a policy floor outranks auto_update. Runtime
+                # ownership is authoritative: older managed wheels have no build
+                # stamp, while a foreign source or wheel must never be rewritten.
+                if _remediation_command(info) and managed_venv:
                     # Only apply when a NEWER build is available; otherwise the
                     # installer reinstalls the same below-floor version and the
                     # execv-restart re-enters this branch forever (the git path's
@@ -10464,13 +11319,21 @@ class GatewayOrchestrator:
                         if self.dashboard_state:
                             self.dashboard_state.push_refresh("update_available")
                         return
-                    logger.warning(
-                        "Version compliance: running %s is below the policy minimum %s — "
-                        "applying mandatory update via installer (overrides auto_update)",
-                        _running_version,
-                        min_version(),
-                    )
-                    await self._auto_apply_wheel_update()
+                    if not await self._prepare_auto_update_apply(
+                        mandatory=True,
+                        mandatory_key=mandatory_target_key,
+                    ):
+                        return
+                    try:
+                        logger.warning(
+                            "Version compliance: running %s is below the policy minimum %s — "
+                            "applying mandatory update via installer (overrides auto_update)",
+                            _running_version,
+                            min_version(),
+                        )
+                        await self._auto_apply_wheel_update()
+                    finally:
+                        await self._finish_auto_update_apply()
                     return
                 # Everything below cannot apply here, so the operator has to act.
                 # Two of the three cases light the badge; the third deliberately
@@ -10528,7 +11391,7 @@ class GatewayOrchestrator:
                 logger.info("Updates available from remote")
                 from kiro_crew.config import KiroCrewConfig
 
-                cfg = KiroCrewConfig.load()
+                cfg = await asyncio.to_thread(KiroCrewConfig.load)
                 # `_auto_apply_update` replaces code with git fetch + reset, so it
                 # can only serve a GIT CHECKOUT (`can_apply`). A wheel install
                 # replaces itself by re-running the installer, which the branch
@@ -10545,18 +11408,24 @@ class GatewayOrchestrator:
                 # dashboard's own apply path (`git pull`, dirty tree refused) is
                 # the non-destructive way in.
                 if cfg.auto_update and info.get("can_apply") and info.get("version_newer"):
-                    logger.info("Auto-update enabled — applying update")
-                    await self._auto_apply_update()
-                elif cfg.auto_update and _remediation_command(info) and distribution() == "wheel":
-                    # Only a managed WHEEL install can be safely self-updated by
-                    # re-running the cli.sh installer: it replaces the same venv
-                    # the running interpreter lives in. A "source" install (cloud
-                    # tarball / EC2) carries the same installer command but the
-                    # installer would create a SEPARATE managed venv while this
-                    # source interpreter re-execs unchanged — an infinite
-                    # update→restart loop. Those notify instead.
-                    logger.info("Auto-update enabled for wheel install — running installer")
-                    await self._auto_apply_wheel_update()
+                    if not await self._prepare_auto_update_apply(mandatory=False):
+                        return
+                    try:
+                        logger.info("Auto-update enabled — applying update")
+                        await self._auto_apply_update()
+                    finally:
+                        await self._finish_auto_update_apply()
+                elif cfg.auto_update and _remediation_command(info) and managed_venv:
+                    if not await self._prepare_auto_update_apply(mandatory=False):
+                        return
+                    try:
+                        # Only the managed venv can be safely self-updated by
+                        # re-running cli.sh: it replaces the environment serving this
+                        # process. Other source and wheel installs notify instead.
+                        logger.info("Auto-update enabled for managed install — running installer")
+                        await self._auto_apply_wheel_update()
+                    finally:
+                        await self._finish_auto_update_apply()
                 else:
                     if cfg.auto_update:
                         logger.warning(
@@ -11317,47 +12186,13 @@ class GatewayOrchestrator:
                     )
                 return
 
-            logger.info("Auto-update: rebuild complete, restarting")
-            # Re-read version from rebuilt package
+            logger.info("Auto-update: rebuild complete, preparing safe restart")
+            # Re-read version from rebuilt package for the operator-facing log;
+            # restart ownership itself is centralized below.
             importlib.reload(kiro_crew)
             new_ver = kiro_crew.__version__
             print(f"👻 New version {new_ver} available — auto-updating and restarting…")
-            if self.dashboard_state:
-                self.dashboard_state.push_update_progress("restarting", "Restarting server…")
-                from kiro_crew.dashboard.chat import save_all_slots_to_history
-
-                # Offload the synchronous per-slot save (per-session lock + disk
-                # I/O) to the bounded subprocess_executor with a deadline so a
-                # contended/wedged session can't stall the auto-update restart
-                # (mirrors the shutdown save above).
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(
-                            subprocess_executor(),
-                            save_all_slots_to_history,
-                            self.dashboard_state,
-                        ),
-                        timeout=5.0,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Dashboard slot save before auto-update restart failed",
-                        exc_info=True,
-                    )
-            if self.sessions:
-                await self.sessions.close_all()
-            # Drain the safety-override record before exec, for the same reason
-            # the other restart paths do: os.execv does not drain the publish
-            # worker, so a grant activated just before this would lose its notice.
-            try:
-                await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
-            except Exception:
-                logger.debug("Breadcrumb flush before auto-update restart failed", exc_info=True)
-            # Use -m kiro_crew rather than sys.argv[0] so the restart resolves
-            # the freshly reinstalled entry point regardless of how the
-            # original process was launched.
-            exe = await asyncio.to_thread(respawn_executable)
-            platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+            await self._restart_after_update(respawn_executable)
         except Exception:
             logger.warning("Auto-update failed", exc_info=True)
             if self.dashboard_state:
@@ -11560,36 +12395,8 @@ class GatewayOrchestrator:
                 )
             return
 
-        logger.info("Auto-update (wheel): installer succeeded, restarting gateway")
-        if self.dashboard_state:
-            self.dashboard_state.push_update_progress("restarting", "Restarting server…")
-            from kiro_crew.dashboard.chat import save_all_slots_to_history
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        subprocess_executor(),
-                        save_all_slots_to_history,
-                        self.dashboard_state,
-                    ),
-                    timeout=5.0,
-                )
-            except Exception:
-                logger.debug(
-                    "Dashboard slot save before wheel auto-update restart failed",
-                    exc_info=True,
-                )
-        if self.sessions:
-            await self.sessions.close_all()
-        # Same drain as the other restart paths: exec does not empty the publish
-        # worker, and a just-activated grant would otherwise lose its notice.
-        try:
-            await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
-        except Exception:
-            logger.debug("Breadcrumb flush before install restart failed", exc_info=True)
-        # Restart into the freshly-installed version.
-        exe = await asyncio.to_thread(respawn_executable)
-        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
+        logger.info("Auto-update (wheel): installer succeeded, preparing safe restart")
+        await self._restart_after_update(respawn_executable)
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -11823,7 +12630,6 @@ class GatewayOrchestrator:
             await self._init_dashboard()
         else:
             await self._init_api_server()
-
         # The dashboard/API socket is bound now. A missing wrapper can take the
         # full pip timeout to repair, so track that work without delaying READY.
         # The task itself catches and logs failures; startup remains available.
@@ -11880,9 +12686,30 @@ class GatewayOrchestrator:
             print(f"KIROCREW_READY:{json.dumps(ready_payload)}", flush=True)
 
         self._install_shutdown_signal_handlers()
+
+        # TaskRunner + workflow agent calls join the durable task queue and the
+        # runner lane now that both consumers exist (the WorkflowService is
+        # built by the dashboard server). AFTER the READY print, not before it:
+        # the coordinator's first build runs `rebuild()` over every waiting row,
+        # and `test_memory_startup` pins that no such work precedes readiness.
+        # Nothing dispatches in between -- the dashboard workers and cron start
+        # further down, after the memory barrier.
+        await self._ensure_subagent_coordinator()
+        self._wire_runner_admission()
+
         if not await self._wait_for_memory_preparation():
             await self._shutdown_and_exit()
             return
+        if self.subagent_mgr is not None:
+            await self.subagent_mgr.wait_taskq_ready()
+            # The store exists now; bind the coordinator and the adoption sweep
+            # the socket-bind pass could not see. Before the dashboard workers
+            # and cron start, so the sweep never races live runner work.
+            await self._runner_admission_store_ready()
+            # Also off-loop for the health wiring the controller start does: the
+            # pass above binds no coordinator when it wired no admission.
+            await self._ensure_subagent_coordinator()
+            self._start_adaptive_controller()
 
         # Persisted Crew work and legacy channel agents can dispatch providers
         # immediately when resumed, so start them only after the shared memory
@@ -12014,17 +12841,11 @@ class GatewayOrchestrator:
 
         await self._start_channel_transports()
 
-        # Update check — fire-and-forget, NOT awaited. It runs five sequential
-        # git subprocesses (fetch/rev-parse/...) whose timeouts sum to ~70s, and
-        # nothing later in boot depends on its result: it only flips
-        # _update_info / pushes a dashboard refresh, or applies an auto-update
-        # that restarts the process. Awaiting it delayed the dashboard URL by up
-        # to ~70s on a stalled network. handlers_system.api_status treats the
-        # same check as fire-and-forget for the same reason. Registered in
-        # _background_tasks so the task is not GC'd mid-flight and is reaped on
-        # shutdown with the rest.
+        # Update coordinator — fire-and-forget, NOT awaited. The first cycle runs
+        # immediately; later cycles own both checking and automatic application.
+        # Registered so shutdown can cancel a stalled network or installer child.
         print("👻 Checking for updates…")
-        self._update_check_task = asyncio.create_task(self._check_for_updates())
+        self._update_check_task = asyncio.create_task(self._run_update_checks())
         self._background_tasks.add(self._update_check_task)
         self._update_check_task.add_done_callback(self._background_tasks.discard)
 
@@ -12287,6 +13108,24 @@ class GatewayOrchestrator:
         # session by this point, so the sweep is not racing a mapping publisher --
         # the same position the sweep already held here before this change.
         await asyncio.to_thread(cleanup_orphaned_sessions)
+        # The session ledger's buffered appends, for EVERY gateway mode. The
+        # dashboard registers its own cleanup hook, but a mode that builds no
+        # dashboard app -- slack-only is the plain case -- never runs one, and
+        # os._exit below skips atexit, so without this the buffer dies with the
+        # process. What it drops is the last thing each session did, which is
+        # exactly what a reader looks for after a restart. Bounded inside the
+        # emitter and off-loop, like the log-queue drain that follows; calling it
+        # twice is a no-op, so the dashboard hook stays as it is.
+        try:
+            # Imported HERE, not at module scope: AUTOSDE's
+            # no-new-work-on-gateway-boot-path rule asks for an optional subsystem's
+            # import to be gated, and a shutdown drain is the only use in this module.
+            from kiro_crew import session_ledger_emit
+
+            if not await asyncio.to_thread(session_ledger_emit.drain_for_shutdown):
+                logger.warning("session ledger did not fully drain before exit")
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("session ledger drain failed during shutdown", exc_info=True)
         # This is a hard exit too: os._exit skips atexit, so the log queue's
         # drain hook never runs here either. Without this the whole shutdown
         # tail is lost -- including the "Graceful shutdown timed out" warning
@@ -13002,9 +13841,19 @@ class GatewayOrchestrator:
         # booted under. Under the test suite that moment is after the starting
         # test's pins are gone; five full runs left a lock file in the operator's
         # REAL data home that way.
-        self._inbound_replay_task = asyncio.create_task(
-            self._replay_spooled_inbound(spool=inbound_spool.spool_path())
-        )
+        self._schedule_inbound_replay()
+
+    def _schedule_inbound_replay(self) -> None:
+        """Serialize a new spool replay after any pass already in flight."""
+        previous = self._inbound_replay_task
+        spool = inbound_spool.spool_path()
+
+        async def _run() -> None:
+            if previous is not None and not previous.done():
+                await asyncio.gather(previous, return_exceptions=True)
+            await self._replay_spooled_inbound(spool=spool)
+
+        self._inbound_replay_task = asyncio.create_task(_run())
 
     async def _replay_spooled_inbound(self, *, spool: Path | None = None) -> None:
         """Notice inbound messages the shutdown gate refused before this start.
@@ -13022,7 +13871,18 @@ class GatewayOrchestrator:
         caller awaits the pass inline.
         """
         try:
-            transports = getattr(self.dashboard_state, "channel_transports", None) or {}
+            transports = dict(getattr(self.dashboard_state, "channel_transports", None) or {})
+            # Slack deliberately stays out of ``channel_transports``: its ordinary
+            # proactive sends use the gateway client and its own authorization
+            # path. Refused-turn replay still needs that live client, so overlay a
+            # pass-local adapter built from the CURRENT owner roster. Keeping it
+            # local prevents every other shared send ladder from discovering a
+            # Slack transport it was never designed to route through.
+            if self.slack is not None:
+                transports["slack"] = SlackTransport(
+                    self.slack,
+                    allowed_users=self._allowed_users,
+                )
             await inbound_spool.replay_spooled(transports=transports, path=spool)
         except asyncio.CancelledError:
             raise

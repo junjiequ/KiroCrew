@@ -28,13 +28,14 @@ from kiro_crew.acp.kas_transport import (
     build_kas_argv,
 )
 from kiro_crew.acp.types import ACP_BACKEND_KAS
-from kiro_crew.agent import AGENT_FILENAME
+from kiro_crew.agent import AGENT_FILENAME, agent_spec_path
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
     project_agent_files,
     project_agent_name,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import is_agent_spec_name
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_perf import _read_gateway_pid
@@ -255,8 +256,20 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
 
     bound_model = ""
     bound_spec: Path | None = None
+    bound_spec_missing = False
     if bound != "kirocrew":
-        bound_spec = agents_dir / f"{bound}.json"
+        # Display only, through the same resolver the writers use, so the path
+        # shown is the file that holds the agent -- whichever form (``.json``
+        # or ``.md``) and whichever filename declares the name -- rather than a
+        # ``.json`` join that names a file a markdown agent does not have.
+        try:
+            bound_spec = agent_spec_path(bound, agents_dir=agents_dir)
+        except ValueError:
+            # Two safe specs declare the name, so no single file IS the bound
+            # spec; the model resolver below refuses for the same reason and
+            # its tier shows as deferring.
+            bound_spec = None
+        bound_spec_missing = bound_spec is None
         # Read through the resolver's own accessor: it matches on the spec's
         # ``name`` field as well as the filename, which a bare path join misses.
         try:
@@ -292,6 +305,10 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
     print(f"  spec file:   {_safe_display(str(default_spec))}")
     if bound_spec is not None:
         print(f"  bound spec:  {_safe_display(str(bound_spec))}")
+    elif bound_spec_missing:
+        print(
+            f"  bound spec:  ⚠️  no spec for {_safe_display(bound)} under {_safe_display(str(agents_dir))}"
+        )
 
     # Self-check: the marked tier must be what the resolver actually returned.
     if decided_value != effective:
@@ -434,7 +451,7 @@ def _strict_agent_json_specs(directory: Path) -> list[Path]:
                 (
                     Path(entry.path)
                     for entry in entries
-                    if entry.name.endswith(".json") and not entry.name.startswith("._")
+                    if is_agent_spec_name(entry.name) and not entry.name.startswith("._")
                 ),
                 key=lambda path: path.stem,
             )
@@ -1091,6 +1108,127 @@ def _doctor_cron_script_sources(issues: list[str]) -> None:
             "A diverged copy may be a stale deploy OR an intentional local edit "
             "-- doctor cannot tell which, so it does not overwrite either one."
         )
+
+
+def _open_slot_agent_names() -> list[tuple[str, str]]:
+    """``(slot key, agent name)`` for every open dashboard tab persisting one.
+
+    Read-only + best-effort: reads ``open_slots.json`` and each open slot's
+    transcript metadata line off disk (no running gateway needed), returning an
+    empty list on any error. Slot keys pass through the restore path's own
+    sanitizer before they reach path construction -- the file is
+    attacker-writable, and doctor must not accept a key the restore path would
+    reject.
+    """
+    try:
+        from kiro_crew.dashboard.chat_persistence import (
+            _read_open_slots_keys,
+            _sanitize_open_slot_key,
+        )
+        from kiro_crew.dashboard.chat_utils import slot_transcript_key
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        out: list[tuple[str, str]] = []
+        for raw in _read_open_slots_keys():
+            key = _sanitize_open_slot_key(raw)
+            if not key:
+                continue
+            # slot_transcript_key, not _history_key_for: a channel-born tab's
+            # slot key (e.g. slack_<ts>) already addresses its transcript, and
+            # an unconditional dashboard: prefix would read a nonexistent file
+            # and silently skip that tab.
+            agent = log.get_metadata(slot_transcript_key(key)).get("agent")
+            if isinstance(agent, str) and agent:
+                out.append((key, agent))
+        return out
+    except Exception:
+        logger.debug("doctor: open-slot agent scan failed", exc_info=True)
+        return []
+
+
+def _doctor_deprecated_agent_specs(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Report configs that still name a deprecated agent spec.
+
+    A deprecated spec (``DEPRECATED_AGENT_SPECS`` in ``agent.py``) still
+    resolves for one release, so a config surface naming it -- a cron job, a
+    crew binding, an open chat slot, or one of the config's own agent
+    selectors -- keeps working today and breaks with ``Mode not found`` at
+    dispatch time once the alias is deleted. Each finding names the replacement so the owner
+    can migrate inside the window.
+
+    Silent when nothing names one: the installed alias spec by itself is
+    expected (the gateway installs it every boot), not a finding.
+    """
+    from kiro_crew.agent import DEPRECATED_AGENT_SPECS
+    from kiro_crew.cron import job_agent_names_from_disk
+
+    # (holder description, deprecated name, replacement). Holder text is
+    # user/LLM-writeable (crew names, job names, slot keys) so it goes through
+    # _safe_display; the matched name and its replacement are keys and values
+    # of our own table, so they print as-is.
+    findings: list[tuple[str, str, str]] = []
+
+    # A cron job, chat slot, or config selector may name a CREW rather than a
+    # kiro agent spec; the crew row owns that report, so those names are
+    # skipped on the leaf surfaces rather than double-flagged through the
+    # crew's binding.
+    crew_names = set(cfg.agents)
+
+    def _add(holder: str, name: object) -> None:
+        # config.json is hand-editable and agent-writable, and the loader
+        # preserves some of these values verbatim (e.g. kiro_agent), so a
+        # non-string can arrive here. dict.get on an unhashable value raises
+        # TypeError, and doctor must diagnose a malformed config, not crash
+        # on it -- a non-string never names a deprecated spec, so skip it.
+        if not isinstance(name, str) or not name or name in crew_names:
+            return
+        replacement = DEPRECATED_AGENT_SPECS.get(name)
+        if replacement:
+            findings.append((holder, name, replacement))
+
+    # Crew bindings: config.json agents.<name>.kiro_agent. A crew name is not
+    # skipped here -- crew_names shields only the LEAF surfaces that resolve
+    # through a crew, and a kiro_agent that happens to equal a crew name is
+    # not resolved again.
+    for crew_name, crew in cfg.agents.items():
+        name = crew.kiro_agent
+        if not isinstance(name, str) or not name:
+            continue
+        replacement = DEPRECATED_AGENT_SPECS.get(name)
+        if replacement:
+            findings.append((f"crew {_safe_display(crew_name)}", name, replacement))
+
+    # The config's own persisted agent selectors.
+    _add("agent.default_agent", cfg.agent.default_agent)
+    _add("session.pool_agent", cfg.session.pool_agent)
+    for channel_id, channel in cfg.slack_channels.items():
+        _add(f"slack channel {_safe_display(channel_id)}", channel.agent)
+
+    # Cron jobs: the agent names dispatch actually runs, read off crons.json
+    # (agent_id, or the agent_sequence entries when the sequence dispatches).
+    for holder, name in job_agent_names_from_disk():
+        _add(f"cron job {_safe_display(holder)}", name)
+
+    # Chat slots: each open tab's persisted agent from its transcript metadata.
+    for slot_key, name in _open_slot_agent_names():
+        _add(f"chat slot {_safe_display(slot_key)}", name)
+
+    if not findings:
+        return
+
+    print("\nDeprecated Agent Specs")
+    for holder, name, replacement in findings:
+        print(
+            f"  {holder}:  \u26a0\ufe0f  names deprecated agent spec "
+            f"'{name}' -- rename it to '{replacement}'"
+        )
+    print(
+        "               A deprecated spec still resolves this release and is "
+        "deleted next release; a config still naming it then fails with "
+        "'Mode not found' at dispatch time."
+    )
+    issues.append("a config names a deprecated agent spec")
 
 
 def _doctor_managed_service_policy(issues: list[str]) -> None:
@@ -2545,6 +2683,138 @@ def _format_job_labels(entries: list[tuple[str, str]]) -> str:
     return f"{shown}, +{len(labels) - _CRON_REPORT_CAP} more"
 
 
+def _doctor_task_store(issues: list[str]) -> None:
+    """Report the durable task queue: depth, oldest wait, journal warnings.
+
+    Reads ``$KIROCREW_HOME/tasks/tasks.db`` directly with a read-only view of
+    the store's own diagnostics, so a wedged gateway cannot hide a backlog.
+    Silent on a fresh install with no store yet. A network-filesystem data home
+    is reported here because the store then runs on ``journal_mode=DELETE``,
+    which is slower but never a refusal.
+    """
+    from kiro_crew.config.paths import data_home
+    from kiro_crew.taskq import TaskStore, TaskStoreUnavailable
+
+    path = TaskStore.default_path(data_home())
+    # A quarantined copy beside the live file is the boot-time verdict that the
+    # previous store was corrupt: the gateway recreated it empty and moved the
+    # damaged file here. Say so, once per copy, until the operator removes it.
+    quarantined = sorted(path.parent.glob(f"{path.name}.corrupt-*")) if path.parent.exists() else []
+    for copy in quarantined:
+        if copy.name.endswith(("-journal", "-wal", "-shm")):
+            continue
+        print(f"  task store: ⚠️  a corrupt store was quarantined as {copy.name}")
+        issues.append(
+            f"task store {path} was found corrupt at a gateway boot and quarantined as "
+            f"{copy}; work accepted into the old file was not recovered -- inspect or "
+            "delete the quarantined copy"
+        )
+    if not path.exists():
+        return
+    store = TaskStore(path, diagnostic=True)
+    try:
+        store.open()
+        lines = store.doctor_lines()
+        by_state = store.count_by_state()
+    except TaskStoreUnavailable as exc:
+        print(f"  task store: ⚠️  {path} cannot be opened ({exc})")
+        issues.append(
+            f"task store {path} cannot be opened: accepted subagent work cannot be "
+            "persisted or recovered until this is fixed"
+        )
+        return
+    finally:
+        store.close()
+    for line in lines:
+        print(f"  {line}")
+    queued = {state: n for state, n in sorted(by_state.items()) if n}
+    if queued:
+        print("  task states: " + ", ".join(f"{state}={n}" for state, n in queued.items()))
+    for warning in store.warnings:
+        issues.append(warning)
+
+
+def _doctor_overload_resilience(cfg: KiroCrewConfig) -> None:
+    """Print the overload-resilience contract this install runs under.
+
+    Configuration and static platform facts only: the live gate counts, the
+    adaptive caps and the per-scope dependency schedules are gateway-process
+    state, served by ``GET /api/sessions/health`` — a doctor process cannot
+    read them and must not pretend to. What it CAN state is the bound each
+    mechanism is configured to (so a stuck queue can be read against its
+    budget) and which liveness evidence this host's platform provides.
+    """
+    from kiro_crew.recovery.ladder import configure_default_ladder
+
+    agent = cfg.agent
+    gw = cfg.mcp_gateway
+    print(
+        "  admission: session_start_concurrency="
+        f"{agent.session_start_concurrency} "
+        f"spawn_gate={gw.spawn_concurrency_initial} "
+        f"[{gw.spawn_concurrency_min}..{gw.spawn_concurrency_max}] "
+        f"queue_wait={gw.spawn_queue_wait_secs}s "
+        f"dispatch_window={agent.task_dispatch_window} "
+        f"(live gate counts: GET /api/sessions/health)"
+    )
+    mode = agent.adaptive_concurrency_mode if agent.adaptive_concurrency else "off"
+    print(
+        f"  adaptive concurrency: {mode} floor={agent.adaptive_floor} "
+        f"initial={agent.adaptive_initial} sample={agent.controller_sample_secs}s"
+    )
+    print("  recovery ladder:")
+    # Through the boot seam a gateway uses, on this process's own ladder: these
+    # rows are the CONFIGURED schedule, so they cannot disagree with the
+    # dependency-wait line below, which reads the same two keys. Still config
+    # only — a doctor process has no live attempt count to show.
+    for row in configure_default_ladder(cfg).table():
+        print(
+            f"    {row['layer']}: backoff {row['backoff_base_secs']:g}s→"
+            f"{row['backoff_max_secs']:g}s, {row['attempts_before_escalation']} attempts → "
+            f"{row.get('escalates_to') or 'notify'}"
+        )
+    print(
+        "  dependency waits: backoff "
+        f"{agent.recovery_backoff_base_secs:g}s→{agent.recovery_backoff_max_secs:g}s "
+        "(the shared recovery schedule), "
+        f"max_attempts={agent.dependency_max_attempts}, "
+        f"deadline={agent.dependency_wait_deadline_secs}s"
+    )
+    print(f"  interactive commands: policy={agent.interactive_command_policy}")
+    print(
+        "  uncharged residency: native children (kiro-cli use_subagent / KAS subtasks) "
+        "are counted on the parent session, never a budget slot, lane slot or task row "
+        '(live count: GET /api/sessions/health "uncharged")'
+    )
+    print(f"  liveness evidence: {_liveness_platform_line()}")
+
+
+def _liveness_platform_line() -> str:
+    """Which stall evidence this platform's liveness oracle can produce.
+
+    Mirrors the platform matrix in ``acp/liveness.py``: a missing column is a
+    DECLARED degradation (bounded by the no-progress budget), never a stall
+    the oracle silently calls WORKING.
+    """
+    if sys.platform.startswith("linux"):
+        return (
+            "linux /proc — process tree, CPU+IO movement, STUCK_INPUT (blocked "
+            "tty/pipe read), established-flat sockets: full matrix"
+        )
+    if sys.platform == "darwin":
+        return (
+            "macOS libproc — process tree and CPU-only movement; STUCK_INPUT and "
+            "socket evidence absent (a live but flat shell child reads UNKNOWN "
+            "platform_limited and is bounded by the no-progress budget)"
+        )
+    if sys.platform.startswith("win"):
+        return (
+            "windows — no process-tree backend; shell and MCP tool calls read "
+            "UNKNOWN platform_limited and are bounded by the no-progress budget"
+        )
+    return f"{sys.platform} — no process-tree backend; UNKNOWN platform_limited"
+
+
 def _doctor_cron_health(issues: list[str]) -> None:
     """Report cron jobs that auto-paused or last ran with an error.
 
@@ -3597,6 +3867,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_cron_script_sources(issues)
+    _doctor_deprecated_agent_specs(cfg, issues)
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
@@ -3637,6 +3908,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # Reads crons.json off disk, not the gateway API: the gateway's own
     # per-job badge and hourly failure re-alert cannot report a wedged gateway.
     _doctor_cron_health(issues)
+
+    # ── Durable task queue (silent when no tasks.db exists yet) ──
+    _doctor_task_store(issues)
+
+    # ── Overload resilience: configured bounds + platform liveness evidence ──
+    _doctor_overload_resilience(cfg)
 
     # ── Agent Spec Paths (dead command/args/env paths) ──
     # Own module + single call so a sibling sweep wiring into doctor rebases

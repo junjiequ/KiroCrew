@@ -60,7 +60,7 @@ from kiro_crew.discord.session_resume import (
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES, _coerce_snowflakes
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
-from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
@@ -71,6 +71,7 @@ from kiro_crew.messaging.commands import (
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
+    admit_inbound_callback,
     build_auto_approve,
     build_directive_consumer,
     delivery_is_muted,
@@ -87,7 +88,10 @@ from kiro_crew.messaging.link import (
     seed_generation,
 )
 from kiro_crew.messaging.renderer import Renderer, SilentRenderer
-from kiro_crew.messaging.session_resume import persisted_session_agent
+from kiro_crew.messaging.session_resume import (
+    persisted_session_agent,
+    refused_resume_is_restricted,
+)
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.messaging.upload_gate import session_is_restricted, uploads_restricted
 from kiro_crew.monitoring.completion import MonitorCompletionHook
@@ -397,6 +401,38 @@ class DiscordDispatcher:
         thread_id = msg.thread_id or ""
         scope_id = self._scope_id(user_id, thread_id)
         text = msg.text
+        native_session_key = self._session_key(user_id, thread_id)
+
+        async def _resolve_refused_route() -> RoutingDecision:
+            if not (interpret_commands or bool(origin_tag)):
+                return RoutingDecision()
+            async with self._routing_turn(channel_id):
+                return await self._session_resume.route(channel_id)
+
+        async def _refused_turn_restricted() -> bool:
+            return await refused_resume_is_restricted(
+                native_session_key,
+                resolve=_resolve_refused_route,
+                is_restricted=self._session_restricted,
+            )
+
+        inbound_route = None
+        if monitor_completion is None:
+            inbound_route = InboundRoute(
+                conversation_id=channel_id,
+                text=msg.text,
+                user_id=user_id,
+                thread_id=thread_id,
+                message_id=str(getattr(msg, "message_id", "") or ""),
+                attachments_dropped=len(getattr(msg, "attachments", None) or ()),
+            )
+        if not await admit_inbound_callback(
+            self.sessions,
+            channel_type="discord",
+            route=inbound_route,
+            restricted=(True if monitor_completion is not None else _refused_turn_restricted),
+        ):
+            return MonitorDispatchResult.BUSY if monitor_completion is not None else None
 
         # Attachments make this a content-bearing turn, not a control command.
         # Otherwise a caption such as ``!help`` would intercept before ingestion
@@ -826,6 +862,7 @@ class DiscordDispatcher:
                 memory_store=_memory_store,
                 resumed=resumed,
                 runtime_source="discord",
+                context_provider=provider,
             )
 
             # PreToolUse security gate (channel-neutral, off ctx_builder.hooks).
@@ -834,14 +871,7 @@ class DiscordDispatcher:
                     getattr(event, "title", "") or "",
                     session_key=session_key,
                     agent=agent,
-                    tool_kind=getattr(event, "tool_kind", "") or "",
-                    raw_params=getattr(event, "raw_tool_params", None),
-                    diff_path=getattr(event, "diff_path", "") or "",
-                    command=getattr(event, "shell_command", None),
-                    is_shell=bool(getattr(event, "is_shell", False)),
-                    mcp_server_name=getattr(event, "mcp_server_name", "") or "",
-                    mcp_tool_name=getattr(event, "tool_name", "") or "",
-                    mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
+                    **hook_gate_kwargs(event),
                 )
                 if result.action == TOOL_DENY:
                     return "deny"

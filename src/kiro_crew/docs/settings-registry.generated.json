@@ -488,6 +488,13 @@
       "description": "Compact is the original view. Comfortable and Full use more screen space."
     },
     {
+      "id": "chat.content-filter-fallback-model",
+      "label": "Content-filter fallback model",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=key%3Aagent.refusal_fallback_model",
+      "configKey": "agent.refusal_fallback_model"
+    },
+    {
       "id": "chat.default-memory-mode",
       "label": "Default Memory Mode",
       "tab": "chat",
@@ -642,6 +649,14 @@
       "description": "Time window for session restoration"
     },
     {
+      "id": "chat.selectable-models",
+      "label": "Selectable Models",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=key%3Adashboard.model_picker_hidden_models",
+      "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
+      "configKey": "dashboard.model_picker_hidden_models"
+    },
+    {
       "id": "chat.send-shortcut",
       "label": "Send shortcut",
       "tab": "chat",
@@ -694,6 +709,13 @@
       "label": "Soft-stop budget (seconds)",
       "tab": "chat",
       "route": "/settings/chat?highlight=chat.soft-stop-budget-seconds"
+    },
+    {
+      "id": "chat.spell-check-message-input",
+      "label": "Spell Check Message Input",
+      "tab": "chat",
+      "route": "/settings/chat?highlight=chat.spell-check-message-input",
+      "description": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type."
     },
     {
       "id": "chat.split-side-by-side-diffs",
@@ -804,6 +826,38 @@
       "description": "Draw a cursor that glides to each target and pulses when it clicks, so you can follow along on screen. Purely visual — it changes nothing about what the agent is allowed to do, and it only appears for clicks that move the real pointer."
     },
     {
+      "id": "connections.client-id",
+      "label": "Client ID",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-id"
+    },
+    {
+      "id": "connections.client-secret",
+      "label": "Client secret",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-secret"
+    },
+    {
+      "id": "connections.client-secret-2",
+      "label": "Client secret",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.client-secret-2"
+    },
+    {
+      "id": "connections.oauth-client-github",
+      "label": "OAuth app",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.oauth-client-github",
+      "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+    },
+    {
+      "id": "connections.oauth-client-asana",
+      "label": "OAuth app",
+      "tab": "connections",
+      "route": "/settings/connections?highlight=connections.oauth-client-asana",
+      "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+    },
+    {
       "id": "developer.chat-on-a-crew",
       "label": "Chat on a crew",
       "tab": "developer",
@@ -823,6 +877,13 @@
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.developer-mode",
       "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals"
+    },
+    {
+      "id": "developer.remote-instance-sessions",
+      "label": "Remote instance sessions",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.remote-instance-sessions",
+      "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
     },
     {
       "id": "developer.run-a-local-gateway",
@@ -959,18 +1020,18 @@
       "configKey": "instances.enabled"
     },
     {
-      "id": "notifications.sound-category-turn",
-      "label": "Agent replies",
-      "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-turn",
-      "description": "When the agent finishes a turn in any chat"
-    },
-    {
       "id": "notifications.sound-category-approval",
-      "label": "Approval",
+      "label": "Approvals and questions",
       "tab": "notifications",
       "route": "/settings/notifications?highlight=notifications.sound-category-approval",
-      "description": "Tool approval requests"
+      "description": "When the agent needs a tool approval or an answer"
+    },
+    {
+      "id": "notifications.sound-category-turn",
+      "label": "Conversation handoffs",
+      "tab": "notifications",
+      "route": "/settings/notifications?highlight=notifications.sound-category-turn",
+      "description": "When a conversation finishes or pauses for your input"
     },
     {
       "id": "notifications.sound-category-cron",

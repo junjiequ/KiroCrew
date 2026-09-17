@@ -11,6 +11,7 @@ import json
 import logging
 import random
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -21,9 +22,15 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew import name_grant
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.credential_errors import is_credential_propagation_delay
-from kiro_crew.hooks import _EDIT_TOOL_KIND, fire_tool_hooks, get_global_hook_store
+from kiro_crew.hooks import (
+    _EDIT_TOOL_KIND,
+    fire_tool_hooks,
+    get_global_hook_store,
+    hook_gate_kwargs,
+)
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
     edit_target_candidates,
@@ -42,10 +49,11 @@ from kiro_crew.security import (
     MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
-    is_sensitive_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
     redact_credentials,
     redact_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel as _sel
 
@@ -450,8 +458,19 @@ def next_fallback_candidate(
     list fails OPEN (candidates accepted): entitlement unknown is not
     entitlement denied, matching ``model_is_unusable``'s stance, and the
     substitute ``set_model`` path re-validates against the live list anyway.
+
+    A persisted chain entry can carry a stale ``<namespace>::<bare-id>``
+    qualifier from the catalog that advertised it (the catalog/session
+    spelling-mismatch class)
+    while the session advertises the bare id, so membership is judged through
+    :func:`resolve_pin_spelling` (the shared fold) rather than literally — an
+    entry absent under BOTH spellings is still skipped, and the active-model
+    skip applies to the folded spelling too. The CHAIN's own spelling is what
+    is returned (``FallbackState.next_candidate`` locates the applied
+    candidate with ``remaining.index``); wire-facing consumers re-fold it via
+    :func:`_fallback_wire_spelling`.
     """
-    adv = {a.strip().lower() for a in (advertised or []) if isinstance(a, str) and a.strip()}
+    adv = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
     act = (active_model or "").strip().lower()
     for cand in chain:
         if not isinstance(cand, str):
@@ -459,11 +478,35 @@ def next_fallback_candidate(
         low = cand.strip().lower()
         if not low or low == act:
             continue
-        if adv and low not in adv:
-            logger.debug("model fallback: skipping %r (not advertised)", cand)
-            continue
+        if adv:
+            served = resolve_pin_spelling(cand, adv)
+            if not served:
+                logger.debug("model fallback: skipping %r (not advertised)", cand)
+                continue
+            if served.strip().lower() == act:
+                # Post-fold active skip: a qualified entry that resolves to
+                # the currently-failing model cannot help.
+                continue
         return cand
     return None
+
+
+def _fallback_wire_spelling(candidate: str, advertised: Sequence[str] | None) -> str:
+    """The spelling of *candidate* to send on the wire and keep in records.
+
+    A chain entry stays in its OWN spelling for ``FallbackState`` bookkeeping
+    (``remaining.index``), but everything later compared against SERVED models
+    — the substitute ``set_model`` call, the swap witness, the sticky
+    :data:`TURN_FALLBACK_ATTR` marker the restore probe reads, and the
+    active/walked records — must carry the ADVERTISED spelling: a
+    ``<namespace>::``-qualified spelling there is one the backend never
+    advertised (``AcpClient.set_model``'s explicit-pick guard would raise) and
+    desynchronizes the restore probe from the session it watches. Falls back
+    to the candidate's own spelling when the advertised set cannot resolve it
+    (empty/unknown fails open, matching :func:`next_fallback_candidate`).
+    """
+    ids = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
+    return (resolve_pin_spelling(candidate, ids) if ids else "") or candidate
 
 
 @dataclass
@@ -545,9 +588,13 @@ async def advance_fallback_candidate(
     chain skipping the primary, unadvertised ids, and the currently-active
     (failing) candidate; applies the first candidate whose substitute
     ``set_model`` lands; publishes the sticky marker
-    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning.
-    Returns the applied candidate, or ``None`` when the chain is exhausted or
-    the provider exposes no ``set_model`` seam — the caller then surfaces the
+    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning. A
+    ``<namespace>::``-qualified chain entry is applied AND recorded under its
+    advertised spelling (:func:`_fallback_wire_spelling`) — the wire, the
+    marker, and the walked/active records must agree with the served model
+    the restore probe later compares against. Returns the applied candidate
+    (advertised spelling), or ``None`` when the chain is exhausted or the
+    provider exposes no ``set_model`` seam — the caller then surfaces the
     original error exactly as before this feature existed.
     """
     advertised = provider_advertised_ids(provider)
@@ -573,18 +620,21 @@ async def advance_fallback_candidate(
         cand = fb_state.next_candidate(fb_state.primary or active, advertised)
         if cand is None:
             return None
-        if cand.strip().lower() == (active or "").strip().lower():
+        # The chain's own spelling drove the walk bookkeeping; the wire and
+        # every served-model comparison below use the advertised spelling.
+        wire = _fallback_wire_spelling(cand, advertised)
+        if wire.strip().lower() == (active or "").strip().lower():
             # With a marker-seeded primary, the chain can still name the
             # CURRENTLY-failing fallback the session sits on — retrying it is
             # what this walk exists to escape.
             continue
         _raw_before = provider_raw_model(provider)
         try:
-            await set_model_fn(cand)
+            await set_model_fn(wire)
         except Exception:
             logger.debug(
                 "model fallback: set_model(%r) failed; skipping candidate",
-                cand,
+                wire,
                 exc_info=True,
             )
             continue
@@ -599,30 +649,110 @@ async def advance_fallback_candidate(
         if (
             _raw_before
             and _raw_after == _raw_before
-            and _raw_after.strip().lower() != cand.strip().lower()
+            and _raw_after.strip().lower() != wire.strip().lower()
         ):
             logger.debug(
                 "model fallback: set_model(%r) was a silent no-op (model still %r); "
                 "skipping candidate",
-                cand,
+                wire,
                 _raw_after,
             )
             continue
-        fb_state.active = cand
+        fb_state.active = wire
         fb_state.attempts = 1
-        fb_state.walked.append(cand)
+        fb_state.walked.append(wire)
         try:
-            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, cand))
+            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, wire))
         except Exception:
             logger.debug("publishing fallback marker failed", exc_info=True)
         logger.warning(
             "model fallback: %s -> %s (reason=throttle-exhaustion, surface=%s%s)",
             fb_state.primary or "?",
-            cand,
+            wire,
             surface,
             log_suffix,
         )
-        return cand
+        return wire
+
+
+def pick_epoch_host(provider: Any) -> Any:
+    """The one object the explicit-pick epoch lives on for this session.
+
+    A pick and a refusal-fallback restore can hold DIFFERENT layers of the
+    same session — the model handler holds the ``AcpProvider`` wrapper while
+    the chat runner's acquisition can hand the wrapped client — so both must
+    resolve the SAME host or the writer stamps an object the reader never
+    sees. The innermost wrapped client wins, following the same unwrap order
+    as :func:`resolve_substitute_set_model`; a bare test client resolves to
+    itself.
+    """
+    for attr in ("client", "_client"):
+        try:
+            inner = getattr(provider, attr, None)
+        except Exception:  # pragma: no cover - exotic property getters
+            inner = None
+        if inner is not None and not callable(inner):
+            return inner
+    return provider
+
+
+_slot_switch_session_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def slot_switch_session_lock(session_key: str) -> asyncio.Lock:
+    """The per-session lock every explicit model switch runs under.
+
+    Serializes model switches for aliases of ONE session — a channel-born
+    slot and its dashboard twin drive one wire session through disjoint slot
+    objects, so per-slot locks cannot order their switches. The switch
+    handlers in ``chat_handlers`` acquire it between ``slot._lock`` and
+    ``slot._model_pick_lock`` (the lock-order contract is documented at
+    their acquisition site); the chat runner's refusal-fallback restore
+    acquires it before the pick lock, so a restore's ``set_model(primary)``
+    await cannot interleave with an alias pick and silently overwrite the
+    user's selection. Lives here rather than in
+    ``chat_handlers`` because ``chat_handlers`` imports from the runner —
+    the runner could not import it back without a cycle.
+
+    A ``WeakValueDictionary`` so a session's lock is collected once no
+    request holds it; unrelated sessions resolve different keys and so take
+    different locks.
+
+    An ``asyncio.Lock`` binds to the loop it is first contended on and
+    raises ``RuntimeError`` when awaited from any other loop. A cached lock
+    that is still alive when a different loop asks for the same key (a test
+    holding a reference past its per-test loop, an embedder that runs the
+    gateway on a fresh loop) is therefore unusable to the caller, so it is
+    replaced rather than returned. Holders on the old loop keep their lock;
+    the two loops cannot contend with each other in any case.
+    """
+    lock = _slot_switch_session_locks.get(session_key)
+    if lock is not None and _bound_to_other_loop(lock):
+        lock = None
+    if lock is None:
+        lock = asyncio.Lock()
+        _slot_switch_session_locks[session_key] = lock
+    return lock
+
+
+def _bound_to_other_loop(lock: asyncio.Lock) -> bool:
+    """Whether ``lock`` is bound to a loop other than the running one.
+
+    ``asyncio.Lock`` records its loop in ``_loop`` on first contention and
+    leaves it ``None`` before that; an unbound lock is usable from any loop.
+    With no running loop the caller is synchronous setup code and the lock
+    is handed back unchanged.
+    """
+    bound = getattr(lock, "_loop", None)
+    if bound is None:
+        return False
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return bound is not running
 
 
 def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[None]] | None:
@@ -999,7 +1129,12 @@ def _title_denial(
     place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
     ``"regex"``; the reasons are the exact strings the on-loop checks produced.
     """
-    if is_sensitive_path(title):
+    path_refusal = sensitive_path_refusal(title)
+    if path_refusal:
+        # A stall is passed through as worded (recognised by its fixed prefix, which
+        # the deny guidance classifies by); a match keeps this producer's wording.
+        if is_unverifiable_path_refusal(path_refusal):
+            return ("path", path_refusal)
         return ("path", f"Blocked: sensitive path: {title}")
     bash_reason = is_sensitive_bash_command(title)
     if bash_reason:
@@ -1114,7 +1249,10 @@ def _first_tool_input_denial(
                 ),
                 s[:64],
             )
-        if is_sensitive_path(s):
+        path_refusal = sensitive_path_refusal(s)
+        if path_refusal:
+            if is_unverifiable_path_refusal(path_refusal):
+                return ("path", path_refusal, s)
             return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
         _input_bash = is_sensitive_bash_command(s)
         if _input_bash:
@@ -2477,14 +2615,7 @@ async def _resolve_permission(
             session_key=session_key,
             agent=agent,
             app=app,
-            tool_kind=event.tool_kind,
-            raw_params=event.raw_tool_params,
-            diff_path=event.diff_path,
-            command=event.shell_command,
-            is_shell=event.is_shell,
-            mcp_server_name=event.mcp_server_name,
-            mcp_tool_name=event.tool_name,
-            mcp_identity_trusted=event.mcp_identity_trusted,
+            **hook_gate_kwargs(event),
             # READ_ONLY asks for the classifier's verdict alone: the gate skips
             # its grant tiers (`auto_approve_tools`, app-own-server), which vouch
             # for the caller rather than for the call's effect, so a grant that

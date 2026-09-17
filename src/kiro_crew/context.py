@@ -13,7 +13,7 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +23,8 @@ from kiro_crew import model_registry
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
+from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
@@ -62,6 +64,7 @@ from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.skills import SkillsLoader
 
 if TYPE_CHECKING:
+    from kiro_crew.agent_sdk import ContextPromptProvider
     from kiro_crew.channel_history import ChannelHistory
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
@@ -389,10 +392,13 @@ async def session_store_for_turn(ctx_builder: object, session_key: str) -> str:
     part that is easy to get wrong, and the store a caller resolves is the store its
     vectors must be prepared for.
     """
+
     store = await asyncio.to_thread(
         store_of_session, getattr(ctx_builder, "conversation_log", None), session_key
     )
-    await prepare_store_vectors(ctx_builder, store, session_key=session_key)
+    modes = getattr(ctx_builder, "_session_memory_modes", None)
+    if not isinstance(modes, dict) or modes.get(session_key) != "temporary":
+        await prepare_store_vectors(ctx_builder, store, session_key=session_key)
     return store
 
 
@@ -405,6 +411,24 @@ async def inherit_session_memory(
     from kiro_crew.memory_stores import UnknownMemoryStore, memory_store_version
 
     log = getattr(ctx_builder, "conversation_log", None)
+    modes = getattr(ctx_builder, "_session_memory_modes", None)
+    if isinstance(modes, dict):
+        from kiro_crew.messaging.privacy_mode import strictest
+
+        resolver = getattr(ctx_builder, "memory_mode_for_session", None)
+        mode = await resolver(parent_session_key) if resolver is not None else "persistent"
+        if mode not in {"persistent", "incognito", "temporary"}:
+            raise ValueError("The originating session's memory mode is unavailable")
+        mode = strictest((mode, modes.get(session_key, "persistent"))) or "persistent"
+        if resolver is not None:
+            from kiro_crew.subagent_persistence import bind_session_memory_mode
+            from kiro_crew.workflows.registry import _await_owned
+
+            publication = asyncio.create_task(
+                asyncio.to_thread(bind_session_memory_mode, session_key, mode)
+            )
+            mode = await _await_owned(publication)
+        modes[session_key] = strictest((mode, modes.get(session_key, "persistent"))) or "persistent"
     store = await asyncio.to_thread(store_of_session, log, parent_session_key)
     if store:
         private = await asyncio.to_thread(memory_store_version, store) == 2
@@ -419,6 +443,14 @@ async def inherit_session_memory(
         # Named V1 stores have no protected registry record, but their child must
         # still retain the parent's recorded store rather than widening to Global.
         await asyncio.to_thread(log.update_metadata, session_key, {"memory_store": store})
+    if (
+        isinstance(modes, dict)
+        and log is not None
+        and modes.get(session_key) in {"incognito", "temporary"}
+    ):
+        await asyncio.to_thread(
+            log.update_metadata, session_key, {"memory_mode": modes[session_key]}
+        )
     return await session_store_for_turn(ctx_builder, session_key)
 
 
@@ -605,6 +637,10 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     _REPLY_FORMAT_RULES_RE,
     re.compile(r"\[\s*CRITICAL\s*RULES\s*[-]{1,2}", re.IGNORECASE),
     re.compile(r"\[\s*CURRENT\s*USER\s*REQUEST\s*[-]{1,2}", re.IGNORECASE),
+    # Forging this opener escalates attacker text above agent-prompt style rules,
+    # so the genuine frame is minted only after the untrusted-context scrub.
+    re.compile(r"\[\s*RESPONSE\s*PREFERENCES\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*RESPONSE\s*PREFERENCES\s*\]", re.IGNORECASE),
     # Post-compaction skills re-injection boundary. Unlike the ``[SESSION
     # CONTEXT …]`` OPEN marker (omitted above because forging it only opens a
     # "background, do not act on this" block), forging THIS open marker is an
@@ -830,14 +866,24 @@ def _marker_spans(
         # actually matches.
         norm: list[str] = []
         origin: list[int] = []
-        for idx, ch in enumerate(text):
-            for compatible in unicodedata.normalize("NFKC", ch):
+        cursor = 0
+        # ASCII is unchanged by every normalization below. Copy entire runs in
+        # C instead of paying the Unicode pipeline per character whenever one
+        # non-ASCII character appears anywhere in a large prompt.
+        for match in re.finditer(r"[^\x00-\x7f]", text):
+            idx = match.start()
+            norm.append(text[cursor:idx])
+            origin.extend(range(cursor, idx))
+            cursor = idx + 1
+            for compatible in unicodedata.normalize("NFKC", match.group()):
                 if _is_marker_ignorable(compatible):
                     continue
                 folded = compatible.translate(_MULTIBYTE_TABLE)
                 for candidate in folded:
                     norm.append("-" if unicodedata.category(candidate) == "Pd" else candidate)
                     origin.append(idx)
+        norm.append(text[cursor:])
+        origin.extend(range(cursor, len(text)))
 
         norm_str = "".join(norm)
         raw = []
@@ -925,6 +971,31 @@ def _neutralize_reply_format_markers(text: str) -> str:
     """
     spans = _marker_spans(text, (_REPLY_FORMAT_RULES_RE,))
     return _apply_marker_spans(text, spans)
+
+
+def _board_safe_tag_name(raw: object) -> str:
+    """Admit one board tag handle onto the trusted [BOARD] context line.
+
+    ALLOWLIST, not sanitize-then-screen — the terminal form of this guard.
+    The board line carries tag IDS (machine handles, the same strings
+    ``chat_tag`` consumes); prose was never legitimate here. The admitted
+    grammar is the CLOSED set of ids a grant can exist for at all
+    (``is_grantable_tag_id``): a 12-hex id the dashboard minted, or one of the
+    code-level default workflow states. That grammar has no room for words —
+    an instruction cannot be spelled in twelve hex digits, and the defaults
+    are five known constants — so an agent-authored id planted in
+    agent-writable ``tags.json`` can neither acquire a grant (the PATCH mint
+    refuses it) nor be rendered here even if a row for it somehow existed.
+    Nothing is rewritten, so no strip can reconstruct a payload. The
+    injection heuristic below is kept as a redundant second screen, not as
+    the defense. Rejected handles are dropped by the caller.
+    """
+    value = raw if isinstance(raw, str) else ""
+    if not is_grantable_tag_id(value):
+        return ""
+    if contains_injection(re.sub(r"[-_./]", " ", value)):
+        return ""
+    return value
 
 
 # kiro-cli task_executor slices strings at fixed byte offsets (e.g. 4096).
@@ -1754,6 +1825,186 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     )
 
 
+_RESPONSE_PREFERENCES_HEADER = "[RESPONSE PREFERENCES — MANDATORY]"
+_RESPONSE_PREFERENCES_FOOTER = "[END RESPONSE PREFERENCES]"
+
+
+def _reply_style_rules(level: str) -> str:
+    """Return the rule text for one ``dashboard.verbosity`` level.
+
+    ``""`` for ``default`` and for any value the enum does not know, so a
+    config edited by hand to an unrecognised level injects nothing rather
+    than a half-formed block.
+    """
+    if level == "ultra":
+        return (
+            "## Reply style: Ultra-Brief (ADHD reader)\n\n"
+            "Before responding, simulate the reader: they will read the "
+            "first 2 sentences, scan for bold text and code blocks, then "
+            "close the tab. Anything they won't reach is wasted tokens. "
+            "Structure for THAT reader, not an attentive one.\n\n"
+            "You have a strong bias toward completeness. Override it. The "
+            "reader's time costs more than your thoroughness. An answer "
+            "that's 80% complete in 2 lines beats 100% complete in 20 "
+            "lines. Missing a caveat is acceptable. Missing an edge case "
+            "is acceptable.\n\n"
+            "Rules:\n"
+            "- Open with THE answer in 1–2 sentences. Bold the single most "
+            "critical point.\n"
+            "- Supporting bullets only if the reader would be STUCK without "
+            "them. Max 3. Each bullet is one short sentence.\n"
+            '- Take a position. Name your pick. Resolve "it depends" '
+            "immediately.\n"
+            "- Do NOT add: tables, headers, numbered lists > 3 items, "
+            '"common pitfalls", "also consider", multi-section layouts, '
+            'or any content that fails the test: "would the reader be '
+            'stuck without this line?"\n'
+            "- Code blocks and commands are the answer — never cut them.\n"
+            "- Stakes change what you must not omit, never the length: "
+            "security warnings and irreversible-action confirmations "
+            "always appear, each as one line naming the call, the risk, "
+            "and whether it can be undone; the mechanism and the failure "
+            "modes are not required. Ordered multi-step instructions "
+            "where a dropped step causes a mistake stay complete, and "
+            "code, commands, paths, identifiers and error strings stay "
+            "verbatim.\n"
+            "- When the user ASKS for something long (design doc, tutorial, "
+            "full implementation), ignore these constraints and deliver "
+            "what was asked.\n"
+            "- Required output formats are sacred and never cut: "
+            "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
+            "URLs, and any format the rendering surface "
+            "needs. These go in their required position regardless of "
+            "brevity.\n"
+            "- Preserve the user's language."
+        )
+    if level == "concise":
+        return (
+            "## Reply style: Concise\n\n"
+            "Concise mode is on. Reduce length without losing substance:\n"
+            "- Lead with the answer or result. Skip preamble, filler, and "
+            'pleasantries (e.g. "Sure!", "Great question", "I\'d be happy '
+            'to", "basically", "let me…").\n'
+            "- Keep progress signal brief, not absent: a short high-level note "
+            "of what you're doing or will do next is fine (it builds confidence "
+            "about what's happening underneath), but skip step-by-step "
+            "play-by-play and low-level detail that isn't needed for a quick "
+            "understanding. Favor the outcome; mention process only at a high "
+            "level.\n"
+            "- Prefer short sentences and fragments; cut hedging and "
+            "repetition; state each fact once.\n"
+            "- Structure over sprawl: tight bullets, surface the "
+            "recommendation, take a position instead of dumping every option.\n"
+            "- Don't paste long logs, file dumps, or command output unless "
+            "asked — quote the shortest decisive line.\n"
+            "- Keep code, commands, paths, identifiers, and error strings "
+            "verbatim and complete. Brevity is for prose, never correctness.\n"
+            "- Preserve the user's language; compress the style, not the "
+            "content.\n\n"
+            "Stakes change what concise mode must not omit, never how "
+            "long it may run: security warnings and irreversible-action "
+            "confirmations always appear, each as one line naming the "
+            "call, the risk, and whether it can be undone; the mechanism "
+            "and the failure modes are not required. Likewise, multi-step "
+            "instructions where order or omissions could cause a mistake "
+            "stay complete."
+        )
+    if level == "answer_only":
+        return (
+            "## Reply style: Answer Only\n\n"
+            "Say only the answer. Write for a five-year-old: the smallest "
+            "words that are still true, one idea per sentence, no term that "
+            "is not itself the fact. Short paragraphs. Break lines only where "
+            "structure needs it (list, step, heading) — never one sentence "
+            "per line.\n\n"
+            "Run three checks, in order, before you write:\n\n"
+            "1. Shape check. Does the answer have a shape — steps, "
+            "before/after, cases and verdicts, sizes? Then draw it. A "
+            "picture is payload, not prose: it replaces the words, never "
+            "repeats them. When your instructions carry an Inline Widgets "
+            "section, the picture IS an inline widget (an HTML artifact when "
+            "it is large) — never a plain table of sentences. On any other "
+            "surface (a chat channel, a CLI) a plain table — widget or HTML "
+            "markup lands there as raw text. A picture holds labels of one "
+            "to three words and numbers, never a sentence. If a sentence is "
+            "needed, it goes under the picture, once.\n"
+            "2. Word check. Each sentence: at most 12 words. Each word: one "
+            "the user has used, or one a child knows. A word that fails "
+            "both is replaced, or defined in three words.\n"
+            "3. Cut check. Delete: preamble, what you did, where you found "
+            "it, why, options you rejected, caveats, offers to help. Keep: "
+            "the answer; code, commands and paths the user asked for or "
+            "must run, verbatim; every step of an ordered procedure, in "
+            "order; any required format ([OPTIONS:], diffs, PR links); one "
+            "undo line for anything destructive; one risk line for anything "
+            "touching security, data or spend.\n\n"
+            "Asked why? Teach it, do not state it. One picture from daily "
+            "life: a dog, a door. Keep it to the end. An objection is a "
+            "character in it. The reasons, numbered, one short line each, "
+            "in the picture's words. End: what it is, one line. Word check "
+            "still runs. Cut check spares the picture and the reasons. This "
+            "reply may run long.\n"
+            'Not asked? Offer it in three words: "say why".\n'
+            'Asked for depth (a doc, a walkthrough, "in detail")? This '
+            "mode is off for that reply.\n\n"
+            "Reply in the user's language."
+        )
+    return ""
+
+
+def _response_preferences_apply(session_key: str, runtime_source: str | None = None) -> bool:
+    """Whether the reply-style block belongs in this session's context.
+
+    The rules describe how the PERSON wants to read replies, so they apply to
+    every session whose final message a person reads — dashboard, every
+    messaging channel, a cron digest. A ``subagent:`` session is the one kind
+    whose final message is read by its PARENT agent instead: the parent needs
+    the caveats and edge cases the ``ultra`` and ``answer_only`` levels tell
+    the writer to drop, so the block is withheld there. Resolved through the
+    same runtime-source seam as ``[RUNTIME]``, so a sub-agent is recognised the
+    way every other transport is.
+    """
+    return _resolve_runtime_source(session_key or "", runtime_source) != "subagent"
+
+
+def _build_response_preferences_section(cfg: "KiroCrewConfig") -> str:
+    """Build the [RESPONSE PREFERENCES] block from ``dashboard.verbosity``.
+
+    The setting describes how the PERSON wants replies to read, so it is
+    chrome for every person-facing agent — built-in, custom, and cron — rather
+    than a token an agent prompt has to opt into. Sub-agents are the exception:
+    their final message is read by a parent agent that needs full detail.
+
+    ``build_message`` must mint this trusted frame only after it scrubs session
+    context. Both frame markers are structural markers, so placing the genuine
+    frame inside the scrubbed context would neutralize it along with forgeries.
+    The earlier ``{{VERBOSITY_BLOCK}}`` token reached 7 of the 84 agent specs on
+    one real install; the 77 others ran with the setting silently ignored.
+
+    The wrapper is deliberately loud (a bracketed MANDATORY header, an explicit
+    precedence sentence) because the block competes with a long agent prompt
+    that carries its own style guidance; a bare ``##`` heading in the middle of
+    the context would have no stated rank against it.
+
+    Returns ``""`` when the level is ``default`` or unrecognised, so installs
+    that never touched the setting see byte-identical context.
+    """
+    level = getattr(getattr(cfg, "dashboard", None), "verbosity", "default")
+    rules = _reply_style_rules(level if isinstance(level, str) else "default")
+    if not rules:
+        return ""
+    return (
+        f"{_RESPONSE_PREFERENCES_HEADER}\n"
+        "The user chose how your replies must read. These rules bind EVERY "
+        "reply in this session, on every surface, for every agent, and they "
+        "OUTRANK any response-style guidance in your agent prompt. They shape "
+        "prose only: code, commands, paths, identifiers, error strings and any "
+        "required output format stay exactly as they are.\n\n"
+        f"{rules}\n"
+        f"{_RESPONSE_PREFERENCES_FOOTER}\n\n"
+    )
+
+
 def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
     """Admission gate for a steering document's RESOLVED path.
 
@@ -2008,7 +2259,7 @@ def _read_include_crew_context(agent: str) -> bool:
     directory error all default to injecting, reproducing the pre-opt-out behavior.
     """
     try:
-        candidates = kiro_agents_dir().glob("*.json")
+        candidates = iter_agent_spec_files(kiro_agents_dir(), ordered=False)
     except OSError:
         return True
     for f in candidates:
@@ -2025,7 +2276,7 @@ def _read_include_crew_context(agent: str) -> bool:
             # re-resolves, refuses a sensitive target, and opens O_NOFOLLOW —
             # closing the TOCTOU where the final path component is swapped to a
             # symlink into ~/.aws etc. AFTER the is_sensitive_path check above.
-            data = json.loads(safe_read_file(str(f)))
+            data = parse_agent_spec_text(safe_read_file(str(f)), f)
             if not isinstance(data, dict):
                 continue
             if data.get("name") == agent or f.stem == agent:
@@ -2764,6 +3015,8 @@ class ContextBuilder:
         self.lessons = lessons or LessonStore()
         self.conversation_log = conversation_log
         self.channel_history = channel_history
+        self.memory_mode_for_session: Callable[[str], Awaitable[str]] | None = None
+        self._session_memory_modes: dict[str, str] = {}
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -2818,115 +3071,12 @@ class ContextBuilder:
 
         cfg = KiroCrewConfig.load()
 
-        # Verbosity control — applies to ALL transports (dashboard, Slack, CLI).
-        # Resolved before the dashboard-only widget branch below so it reaches
-        # every session. When "default", nothing is injected (zero prompt bloat).
-        verbosity = getattr(cfg.dashboard, "verbosity", "default")
-        if verbosity == "ultra":
-            verbosity_block = (
-                "## Response Verbosity: Ultra-Brief (ADHD reader)\n\n"
-                "Before responding, simulate the reader: they will read the "
-                "first 2 sentences, scan for bold text and code blocks, then "
-                "close the tab. Anything they won't reach is wasted tokens. "
-                "Structure for THAT reader, not an attentive one.\n\n"
-                "You have a strong bias toward completeness. Override it. The "
-                "reader's time costs more than your thoroughness. An answer "
-                "that's 80% complete in 2 lines beats 100% complete in 20 "
-                "lines. Missing a caveat is acceptable. Missing an edge case "
-                "is acceptable.\n\n"
-                "Rules:\n"
-                "- Open with THE answer in 1–2 sentences. Bold the single most "
-                "critical point.\n"
-                "- Supporting bullets only if the reader would be STUCK without "
-                "them. Max 3. Each bullet is one short sentence.\n"
-                '- Take a position. Name your pick. Resolve "it depends" '
-                "immediately.\n"
-                "- Do NOT add: tables, headers, numbered lists > 3 items, "
-                '"common pitfalls", "also consider", multi-section layouts, '
-                'or any content that fails the test: "would the reader be '
-                'stuck without this line?"\n'
-                "- Code blocks and commands are the answer — never cut them.\n"
-                "- Stakes change what you must not omit, never the length: "
-                "security warnings and irreversible-action confirmations "
-                "always appear, each as one line naming the call, the risk, "
-                "and whether it can be undone; the mechanism and the failure "
-                "modes are not required. Ordered multi-step instructions "
-                "where a dropped step causes a mistake stay complete, and "
-                "code, commands, paths, identifiers and error strings stay "
-                "verbatim.\n"
-                "- When the user ASKS for something long (design doc, tutorial, "
-                "full implementation), ignore these constraints and deliver "
-                "what was asked.\n"
-                "- Required output formats are sacred and never cut: "
-                "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-                "URLs, and any format the rendering surface "
-                "needs. These go in their required position regardless of "
-                "brevity.\n"
-                "- Preserve the user's language."
-            )
-        elif verbosity == "concise":
-            verbosity_block = (
-                "## Response Verbosity: Concise\n\n"
-                "Concise mode is on. Reduce length without losing substance:\n"
-                "- Lead with the answer or result. Skip preamble, filler, and "
-                'pleasantries (e.g. "Sure!", "Great question", "I\'d be happy '
-                'to", "basically", "let me…").\n'
-                "- Keep progress signal brief, not absent: a short high-level note "
-                "of what you're doing or will do next is fine (it builds confidence "
-                "about what's happening underneath), but skip step-by-step "
-                "play-by-play and low-level detail that isn't needed for a quick "
-                "understanding. Favor the outcome; mention process only at a high "
-                "level.\n"
-                "- Prefer short sentences and fragments; cut hedging and "
-                "repetition; state each fact once.\n"
-                "- Structure over sprawl: tight bullets, surface the "
-                "recommendation, take a position instead of dumping every option.\n"
-                "- Don't paste long logs, file dumps, or command output unless "
-                "asked — quote the shortest decisive line.\n"
-                "- Keep code, commands, paths, identifiers, and error strings "
-                "verbatim and complete. Brevity is for prose, never correctness.\n"
-                "- Preserve the user's language; compress the style, not the "
-                "content.\n\n"
-                "Stakes change what concise mode must not omit, never how "
-                "long it may run: security warnings and irreversible-action "
-                "confirmations always appear, each as one line naming the "
-                "call, the risk, and whether it can be undone; the mechanism "
-                "and the failure modes are not required. Likewise, multi-step "
-                "instructions where order or omissions could cause a mistake "
-                "stay complete."
-            )
-        elif verbosity == "answer_only":
-            verbosity_block = (
-                "## Response Verbosity: Answer Only\n\n"
-                "Say only the answer. Small words. Short lines. One idea per "
-                "line.\n\n"
-                "Run three checks, in this order, before you write:\n\n"
-                "1. Shape check. Does the answer have a shape — steps, "
-                "before/after, cases and verdicts, sizes? Then draw it, in the "
-                "richest form this surface renders: a widget or a mermaid fence "
-                "when your instructions carry an Inline Widgets section, else a "
-                "plain table. A picture holds labels of one to three words and "
-                "numbers, never a sentence. If a sentence is needed, it goes "
-                "under the picture, once.\n"
-                "2. Word check. Each sentence: at most 12 words. Each word: one "
-                "the user has used, or one a child knows. A word that fails "
-                "both is replaced, or defined in three words.\n"
-                "3. Cut check. Delete: preamble, what you did, where you found "
-                "it, why, options you rejected, caveats, offers to help. Keep: "
-                "the answer; code, commands and paths the user asked for or "
-                "must run, verbatim; every step of an ordered procedure, in "
-                "order; any required format ([OPTIONS:], diffs, PR links); one "
-                "undo line for anything destructive; one risk line for anything "
-                "touching security, data or spend.\n\n"
-                "Asked why? Same three checks, plus the reason as one line per "
-                'point. Not asked? Offer it in three words: "say why".\n'
-                'Asked for depth (a doc, a walkthrough, "in detail")? This '
-                "mode is off for that reply.\n\n"
-                "Reply in the user's language."
-            )
-        else:
-            verbosity_block = ""
-        prompt = prompt.replace("{{VERBOSITY_BLOCK}}", verbosity_block)
+        # A copied agent spec may still carry the retired
+        # ``{{VERBOSITY_BLOCK}}`` token (it lived in every shipped prompt until
+        # the block moved into session context). Strip it so the literal
+        # never reaches the model; the preferences themselves arrive through
+        # ``_build_response_preferences_section``.
+        prompt = prompt.replace("{{VERBOSITY_BLOCK}}", "")
 
         # Widgets and artifacts need a chat window to render in, which is a
         # property of where the session is DISPLAYED, not where it started: a
@@ -2942,7 +3092,12 @@ class ContextBuilder:
                 "You can render rich HTML inline using "
                 '`<mcwidget title="Title">HTML</mcwidget>` tags. Load the `widgets` '
                 "skill for theme variables, format rules, interactive widgets, and "
-                "best practices when emitting one.\n\n"
+                "best practices when emitting one. The frame is themed: its body "
+                "already carries the active theme's background and text color, so "
+                "color every surface with the theme's CSS variables, never a fixed "
+                "palette (`bg-white`, `bg-green-50`, a literal hex), and always set "
+                "a background together with its text color. A half-set pair renders "
+                "unreadable in dark mode.\n\n"
                 "## Artifacts\n\n"
                 "Every widget auto-registers as an UNPINNED artifact as its "
                 "response segment finalizes — do not "
@@ -2958,7 +3113,9 @@ class ContextBuilder:
                 "## Inline Widgets\n\n"
                 "You can render rich HTML inline using `<mcwidget>` tags, but prefer "
                 "plain markdown by default. Load the `widgets` skill when a widget is "
-                "genuinely warranted.\n\n"
+                "genuinely warranted. The frame is themed: color every surface with "
+                "the theme's CSS variables, never a fixed palette, and set each "
+                "background together with its text color.\n\n"
                 "## Artifacts\n\n"
                 "Every widget auto-registers as an unpinned artifact, so do not "
                 "`@kirocrew-core/artifact_save` one you rendered. Load the "
@@ -3165,6 +3322,11 @@ class ContextBuilder:
         blocks_reads: bool = False,
         context_groups: frozenset[str] | None = None,
         profile_overrides: dict[str, str] | None = None,
+        native_documents: dict[str, str] | None = None,
+        native_envelope_out: list[str] | None = None,
+        execution_template: str = "",
+        conditional_index: bool = False,
+        trigger_text: str = "",
     ) -> str:
         """Refresh complete private-member anchors without a retrieval/model call."""
         from kiro_crew.member_essential_context import (
@@ -3183,9 +3345,29 @@ class ContextBuilder:
         documents = documents_for_member(
             template,
             project,
+            conditional_index=conditional_index,
+            context_settings=True,
+            trigger_text=trigger_text,
             include_project=not blocks_reads
             and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
         )
+        if execution_template and execution_template != template:
+            sources = dict(documents)
+            for source, body in documents_for_member(
+                execution_template,
+                project,
+                conditional_index=conditional_index,
+                context_settings=True,
+                trigger_text=trigger_text,
+                include_project=not blocks_reads
+                and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
+            ):
+                if source in sources and sources[source] != body:
+                    raise MemberEssentialContextError(
+                        f"Essential source {source}: changed during preparation"
+                    )
+                sources[source] = body
+            documents = list(sources.items())
         if reads:
             memory = self.get_memory_for(workspace, memory_store)
             for path, empty in (
@@ -3213,7 +3395,24 @@ class ContextBuilder:
                     "current conversation already answers the question.",
                 )
             )
-        return render_essentials(documents, identity=identity)
+        envelope = render_essentials(documents, identity=identity)
+        if native_envelope_out is not None:
+            native = native_documents or {}
+            native_envelope_out.append(
+                render_essentials(
+                    [
+                        (
+                            (source, "")
+                            if native.get(source) == body
+                            or native.get(f"template://{execution_template}#prompt") == body
+                            else (source, body)
+                        )
+                        for source, body in documents
+                    ],
+                    identity=identity,
+                )
+            )
+        return envelope
 
     def build_session_context(
         self,
@@ -3235,6 +3434,7 @@ class ContextBuilder:
         query_text: str = "",
         project: str | None = None,
         member: str = "",
+        _v2_essentials: str | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -3288,14 +3488,16 @@ class ContextBuilder:
         is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
-        essentials = self._build_v2_essentials(
-            memory_store,
-            member=member,
-            project=project,
-            workspace=workspace,
-            blocks_reads=blocks_reads,
-            context_groups=context_groups,
-        )
+        essentials = _v2_essentials
+        if essentials is None:
+            essentials = self._build_v2_essentials(
+                memory_store,
+                member=member,
+                project=project,
+                workspace=workspace,
+                blocks_reads=blocks_reads,
+                context_groups=context_groups,
+            )
 
         # Minimal V1 stays date/time + agent identity. Private V2 also carries
         # the complete essential envelope, including member-bound cron jobs.
@@ -3315,7 +3517,8 @@ class ContextBuilder:
             # reason [CURRENT AGENT]/[RUNTIME] do — it is chrome, not style.
             # ~40 tokens against the 30-50k this mode saves, and nothing at all
             # for installs on the default (auto) language.
-            parts.append(_build_ui_language_section(KiroCrewConfig.load()))
+            _min_cfg = KiroCrewConfig.load()
+            parts.append(_build_ui_language_section(_min_cfg))
             logger.debug(
                 "Minimal session context: agent=%s, %d chars",
                 agent_label,
@@ -3526,7 +3729,12 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        if (
+            not essentials
+            and not is_custom
+            and is_cc
+            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+        ):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -3892,11 +4100,13 @@ class ContextBuilder:
         exclude_last_n: int = 0,
         folder_path: str | None = None,
         model_window: int | None = None,
+        board_tags: list[tuple[str, str]] | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
         context_groups: frozenset[str] | None = None,
         member: str = "",
+        context_provider: "ContextPromptProvider | None" = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -3928,6 +4138,24 @@ class ContextBuilder:
         Returns:
             (full_message, hook_result) — hook_result may be a reply/modify/inject.
         """
+        from kiro_crew.agent_sdk import context_provider_of
+        from kiro_crew.essential_delivery import EssentialDelivery
+
+        delivery = None
+        blocks_reads = (
+            blocks_reads or self._session_memory_modes.get(session_key or "") == "temporary"
+        )
+        native_documents: dict[str, str] = {}
+        context_provider = context_provider_of(context_provider)
+        if context_provider is not None:
+            candidate_delivery = context_provider.essential_delivery
+            if isinstance(candidate_delivery, EssentialDelivery):
+                delivery = candidate_delivery
+                provider_type = context_provider.context_provider_type
+                if project is None:
+                    project = context_provider.cwd or None
+                if is_new_session and not resumed and not needs_reinjection:
+                    native_documents = context_provider.native_context_documents
         is_custom = agent and agent != "kirocrew"
         hook_result = self.hooks.on_message(text)
 
@@ -3961,23 +4189,39 @@ class ContextBuilder:
         #      its rules read keeps the gate).
         #   MINIMAL (V1 cron) -> no member section. Private V2 cron derives
         #      its owner from the validated memory binding above/below and
-        #      refreshes the complete essential envelope on every turn.
+        #      validates the complete envelope on every turn. Its provider
+        #      suppresses only snapshots already acknowledged by that conversation.
         # Missing file still reads as "" (the normal unbounded-by-choice
         # state); a bad slug degrades like the builder.
         from kiro_crew.member_essential_context import member_for_store
 
         _private_owner, _private_template = member_for_store(memory_store, member)
-        if _private_owner and not is_new_session:
-            parts.append(
-                self._build_v2_essentials(
-                    memory_store,
-                    member=member,
-                    project=project,
-                    workspace=workspace,
-                    blocks_reads=blocks_reads,
-                    context_groups=context_groups,
-                )
+        _native_envelopes: list[str] = []
+        _essentials = ""
+        if _private_owner:
+            if hook_result.action == HOOK_MODIFY:
+                _trigger_text = hook_result.text
+            elif user_text_range is not None:
+                _trigger_text = text[user_text_range[0] : user_text_range[1]]
+            else:
+                _trigger_text = text
+            _essentials = self._build_v2_essentials(
+                memory_store,
+                member=member,
+                project=project,
+                workspace=workspace,
+                blocks_reads=blocks_reads,
+                context_groups=context_groups,
+                native_documents=native_documents,
+                native_envelope_out=_native_envelopes,
+                execution_template=agent or "kirocrew",
+                trigger_text=_trigger_text,
+                conditional_index=context_provider is not None
+                and delivery is not None
+                and not context_provider.native_steering,
             )
+        if _essentials and not is_new_session:
+            parts.append(_essentials)
         _member_turn = member_turn_context(
             "" if _private_owner else member,
             member_lifecycle(
@@ -4017,7 +4261,7 @@ class ContextBuilder:
             # so the LLM treats it as its identity, not background info.
             if slim_resume:
                 agent_prompt = ""
-            elif is_cc:
+            elif is_cc and (not is_custom or not _private_owner):
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -4034,7 +4278,7 @@ class ContextBuilder:
                     agent_prompt = ""
             elif is_custom:
                 agent_prompt = self._load_agent_prompt(
-                    agent or "", project, owner_template=_private_template
+                    agent or "", project, owner_template=(agent or "") if _private_owner else ""
                 )
             else:
 
@@ -4068,6 +4312,7 @@ class ContextBuilder:
                 query_text=text,
                 project=project,
                 member=member,
+                _v2_essentials=_essentials,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -4147,6 +4392,14 @@ class ContextBuilder:
                         + session_ctx
                         + "[END OF SESSION CONTEXT]\n\n"
                     )
+            # Mint trusted reply-style framing only after the session-context
+            # payload has been scrubbed. Its own markers are intentionally in the
+            # scrub set, so placing it inside ``session_ctx`` would erase it.
+            if _response_preferences_apply(session_key or "", runtime_source):
+                _prefs = _build_response_preferences_section(KiroCrewConfig.load())
+                if _prefs:
+                    parts.append(_prefs)
+
             # Session replay: inject OUTSIDE the capped session context so it
             # doesn't get truncated at 165K. This is the full conversation
             # history from KiroCrew's conversation_log — provider-agnostic.
@@ -4220,6 +4473,18 @@ class ContextBuilder:
                         + _neutralize_structural_markers(skills_ctx)
                         + "\n[END REINJECTED]\n\n"
                     )
+            # The reply-style block is session-start context too, and unlike
+            # the skills index its loss is invisible: the model simply drifts
+            # back to default-length prose. Re-read the CURRENT setting so a
+            # level changed mid-session lands here as well. Trusted framing
+            # (config enum, no user text), so no payload scrub is needed.
+            _prefs = (
+                _build_response_preferences_section(KiroCrewConfig.load())
+                if _response_preferences_apply(session_key or "", runtime_source)
+                else ""
+            )
+            if _prefs:
+                parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _prefs)
             # Member identity is session-start context too, so a compaction
             # dropped it along with the skills index: without this, the next
             # turn of a member DM thread runs with no identity, no working
@@ -4360,6 +4625,40 @@ class ContextBuilder:
                 "this directory. Prefer files and patterns from this project "
                 "when answering questions.\n\n"
             )
+
+        # Board state — the session's dashboard board tags, so the agent knows
+        # its own workflow lane and which tags it is allowed to change with
+        # chat_tag. One line, omitted entirely when the slot carries no tags.
+        # ``board_tags`` is a pre-resolved [(tag_id, policy)] list from the
+        # caller (chat_runner), which owns the live vocabulary. Canonical IDs,
+        # never the free-form ``name`` field: names are agent-writable prose,
+        # and an instruction-shaped name must never land on the trusted rail;
+        # ids are also the handles chat_tag consumes.
+        # agent-writable = policy is not "none".
+        if board_tags:
+            # Even ids are read from agent-writable tags.json, and this line
+            # lands on the model's TRUSTED context rail — the same channel as
+            # [PROJECT] and [RUNTIME]. ``_board_safe_tag_name`` stays as
+            # defense in depth: it neutralizes structural markers, control
+            # characters and newlines, and caps length, so a hostile id
+            # hand-written into tags.json cannot smuggle instructions or fake
+            # a context header. Ids that sanitize to empty are dropped.
+            _safe_names = [
+                n for n in (_board_safe_tag_name(name) for name, _policy in board_tags) if n
+            ]
+            _safe_writable = [
+                n
+                for n in (
+                    _board_safe_tag_name(name) for name, policy in board_tags if policy != "none"
+                )
+                if n
+            ]
+            if _safe_names:
+                _tag_names = ", ".join(_safe_names)
+                _writable = ", ".join(_safe_writable)
+                parts.append(
+                    f"[BOARD] tags: {_tag_names} · agent-writable: " f"{_writable or '(none)'}\n\n"
+                )
 
         # Resource pressure — inject a compact advisory ONLY when host memory is
         # tight/critical, so the model can choose the lighter path for heavy work
@@ -4690,4 +4989,36 @@ class ContextBuilder:
             start = head + len(seg[: _user_bounds[0]].translate(_MULTIBYTE_TABLE))
             end = head + len(seg[: _user_bounds[1]].translate(_MULTIBYTE_TABLE))
             user_span_out.extend((start, end))
+        if delivery is not None and _essentials and context_provider is not None:
+            lifecycle = member_lifecycle(
+                is_new_session=is_new_session,
+                resumed=resumed,
+                minimal_context=minimal_context,
+                needs_reinjection=needs_reinjection,
+            )
+            delivery.bind(
+                _essentials.translate(_MULTIBYTE_TABLE),
+                scope=(
+                    session_key,
+                    _private_owner,
+                    memory_store,
+                    workspace,
+                    project,
+                    agent,
+                    _private_template,
+                    provider_type,
+                    context_provider.served_model,
+                    mode,
+                    blocks_reads,
+                    None if context_groups is None else sorted(context_groups),
+                    minimal_context,
+                    model_window,
+                    _agent_includes_crew_context(agent),
+                ),
+                force=lifecycle is not MemberLifecycle.WARM,
+                incarnation=context_provider.context_incarnation,
+                native_envelope=(
+                    _native_envelopes[0].translate(_MULTIBYTE_TABLE) if native_documents else None
+                ),
+            )
         return final, hook_result

@@ -275,6 +275,20 @@ class TestCronCommandMode:
         assert job.id in orch._running_script_ids
 
     @pytest.mark.asyncio
+    async def test_closed_gateway_admission_defers_command(self):
+        orch = _make_orchestrator()
+        orch.sessions = SimpleNamespace(admission_closed=True)
+        job = _job(command="echo hi")
+
+        async with _cron_cb(orch, command_result={"status": "ok", "output": "hi"}) as cb:
+            assert await cb(job) is None
+
+        assert job.id not in orch._running_script_ids
+        assert job.last_status == "error"
+        assert job.last_error == "gateway admission is closed"
+        assert job.run_never_started is True
+
+    @pytest.mark.asyncio
     async def test_fire_time_denial_keeps_job_and_audits(self):
         """Governance denial marks the run failed without counting a failure."""
         orch = _make_orchestrator()
@@ -367,6 +381,20 @@ class TestCronCommandMode:
 
 class TestCronScriptMode:
     """``_cron_callback``'s ``job.script`` arm and its dispositions."""
+
+    @pytest.mark.asyncio
+    async def test_closed_gateway_admission_defers_script(self):
+        orch = _make_orchestrator()
+        orch.sessions = SimpleNamespace(admission_closed=True)
+        job = _job(script="probes.py:check")
+
+        async with _cron_cb(orch, script_result={"status": "ok"}) as cb:
+            assert await cb(job) is None
+
+        assert job.id not in orch._running_script_ids
+        assert job.last_status == "error"
+        assert job.last_error == "gateway admission is closed"
+        assert job.run_never_started is True
 
     @pytest.mark.asyncio
     async def test_fire_time_denial_keeps_job(self):
@@ -1505,6 +1533,7 @@ async def _cron_message_cb(
     orch.ctx_builder.hooks = MagicMock()
     orch.subagent_mgr = MagicMock()
     orch.subagent_mgr.has_pending_work_for = MagicMock(return_value=False)
+    orch.subagent_mgr.has_pending_work_for_async = AsyncMock(return_value=False)
     _turn = (
         AsyncMock(side_effect=error)
         if error is not None

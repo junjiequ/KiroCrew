@@ -6,6 +6,7 @@ import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
 import RejectDropdown from './RejectDropdown'
 import { usePointerDrag } from '../hooks/usePointerDrag'
+import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
@@ -25,8 +26,11 @@ import { shallowEqual } from 'react-redux'
 import { motion, AnimatePresence } from 'framer-motion'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
+import { useComposerSpellcheck } from '../hooks/useComposerSpellcheck'
+import { useComposerSendMode } from '../hooks/useComposerSendMode'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { pickToolLabel } from '../utils/toolLabel'
+import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { toApiDecision } from '../utils/approvalDecision'
 import TrustDropdown from './TrustDropdown'
 import type { AutomationRecord } from '../monitoring/automation'
@@ -111,7 +115,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -142,6 +146,7 @@ import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
+import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -355,6 +360,7 @@ function applyHeight(
   manualHeight: number | null,
   prefillHint?: boolean,
   parked?: boolean,
+  caretFollow?: boolean,
 ) {
   if (parked) {
     // Clipped out of layout — there is nothing valid to measure. Drop the memo
@@ -389,9 +395,18 @@ function applyHeight(
     markComposerResize()
   }
   // When typing at the end of overflowing content, snap to the bottom so the caret
-  // stays visible.
+  // stays visible. `caretFollow` is false for exactly one caller: the value
+  // effect re-measuring a value the PARENT set -- a hand-off prefill, a slot's
+  // draft restore. Snapping there yanked the view to the LAST line of a seeded
+  // prompt (an error hand-off landed showing only the closing fence of its
+  // report, with the sentence that says what broke scrolled out of sight), and
+  // the caret was not at risk: it only moves when the user edits, and a real
+  // edit comes through the `input` event, which follows it. A re-measure at an
+  // UNCHANGED value -- the cap change when the prefill hint expires, unparking,
+  // a width change -- is a viewport change under a caret the user placed, so it
+  // still follows.
   const caretAtEnd = el.selectionStart === el.value.length && el.selectionEnd === el.value.length
-  if (document.activeElement === el && el.scrollHeight > el.clientHeight && caretAtEnd) {
+  if (caretFollow && document.activeElement === el && el.scrollHeight > el.clientHeight && caretAtEnd) {
     el.scrollTop = el.scrollHeight
   }
 }
@@ -587,7 +602,8 @@ interface ChatInputProps {
   automationSnapshotFailed?: boolean
   /** Session routing mode; crew/member cannot host direct monitor turns. */
   sessionMode?: string
-  /** Send-key mode. Default 'enter'. */
+  /** Send-key mode. Omitted means the user's stored Settings -> Chat ->
+   *  Composer preference; pass it only to override that (e.g. mobile). */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
   followUpOptions?: string[]
@@ -934,7 +950,7 @@ function ChatInput({
   automationCreationReady,
   automationSnapshotFailed,
   sessionMode,
-  sendOnEnter = 'enter',
+  sendOnEnter: sendOnEnterProp,
   followUpOptions,
   followUpPicked,
   onFollowUpSelect,
@@ -1080,6 +1096,14 @@ function ChatInput({
    *    not this session (see `approvalSource` above). */
   const approvalTrustGrantable = !!activeSlot && !approvalIsUnattended
   const simplified = useSimplifiedToolNames()
+  // Read the composer-spellcheck preference here rather than as a prop, so every
+  // render site of this component honours it and none can forget to pass it.
+  const spellCheck = useComposerSpellcheck()
+  // Same for the send-key mode: the stored preference is the fallback, not a
+  // hardcoded 'enter'. A host omitting the prop (session-grid pane, side panel)
+  // would otherwise send on plain Enter for a user who chose Ctrl/Cmd+Enter.
+  const storedSendMode = useComposerSendMode()
+  const sendOnEnter = sendOnEnterProp ?? storedSendMode
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
 
@@ -1094,7 +1118,21 @@ function ChatInput({
   const approvalPurpose = approvalToolEntry?.purpose || ''
   const approvalTs = approvalToolEntry?.ts || 0
 
-  const approvalLabel = pickToolLabel({ simplified, purpose: approvalPurpose, rawLabel: approvalLabelRaw, uiLang })
+  // The same label rule as the tool pill (ToolCallLine): simplified mode shows
+  // the purpose, else the argument-derived title; raw mode keeps the verbatim
+  // title unless it is a stub. The permission meta carries `tool_kind` /
+  // `is_shell` / `tool_name` / `mcp_server` for exactly this derivation, and the
+  // verbatim command stays in the ToolDetails payload below — the human vets
+  // the bytes, the title only says what they do.
+  const approvalDerived = deriveToolCallTitle({
+    title: approvalLabelRaw,
+    kind: (approvalMeta?.tool_kind as string) || '',
+    rawInput: approvalMeta?.tool_input,
+    isShell: approvalMeta?.is_shell === '1' || approvalMeta?.is_shell === true,
+    toolName: (approvalMeta?.tool_name as string) || '',
+    mcpServer: (approvalMeta?.mcp_server as string) || '',
+  })
+  const approvalLabel = pickToolLabel({ simplified, purpose: approvalPurpose, rawLabel: approvalLabelRaw, derivedTitle: approvalDerived.title, uiLang })
 
   // Subscribe to the inline pill's viewport visibility. While the pill is in
   // view, the bar collapses to just the always-visible button row; the moment
@@ -1136,7 +1174,7 @@ function ChatInput({
     setApprovalSubmitting(true)
     setApprovalNotice(null)
     const finish = () => {
-      dispatch(resolveByApprovalId({ id: approvalId, decision }))
+      dispatch(resolveByApprovalId({ id: approvalId, slot: activeSlot || undefined, decision }))
       setApprovalSubmitting(false)
       // B2: tally manual one-shot approvals per slot. Only 'approved' counts —
       // a trust grant already reduces future prompts, and a rejection is not
@@ -1161,7 +1199,7 @@ function ChatInput({
       // orphan: leaving it up makes every button look broken, so clear it and
       // say why instead of only logging to the console.
       if (err instanceof ApiError && err.status === 404) {
-        dispatch(resolveByApprovalId({ id: approvalId, decision: 'stale' }))
+        dispatch(resolveByApprovalId({ id: approvalId, slot: activeSlot || undefined, decision: 'stale' }))
         // Say WHOSE turn expired. Unattended sources deny-fast on a short
         // window (minutes), so by the time a human reads the card the job has
         // usually already been denied and moved on — "expired" alone reads as
@@ -1217,16 +1255,15 @@ function ChatInput({
     if (!a.approval_id || a.approving) return
     dispatch(markSubagentApproving({ id: a.id, approving: true }))
     api.resolveApproval(a.approval_id, action).then(() => {
-      // Terminate a rejected card here, because nothing else will. The backend's
-      // `approval_resolved` frame carries only {id, approved} — no slot — so the
-      // useWebSocket handler that would dispatch sseSubagentDone is skipped
-      // (it requires data.slot to avoid misattributing cards across sessions).
-      // An APPROVED spawn still converges: it runs and emits its own
-      // spawn/chunk/done stream, each frame carrying a slot. A REJECTED spawn
-      // never runs and emits nothing further, so without this the card stays
-      // pending+approving and the banner sticks on "Resolving…" indefinitely.
+      // Terminate a rejected card optimistically so the banner does not depend
+      // on a WebSocket round trip. The slot-scoped `approval_resolved` frame
+      // converges this state idempotently when it arrives. An approved spawn
+      // also converges through its spawn/chunk/done stream, while a rejected
+      // spawn emits no lifecycle events beyond the resolution frame. The card
+      // renders this value verbatim under its error label, so it carries the
+      // same catalog sentence the WS retire path uses, not the raw token.
       if (action === 'reject' && slotId) {
-        dispatch(sseSubagentDone({ slot: slotId, id: a.id, elapsed: 0, error: 'rejected' }))
+        dispatch(sseSubagentDone({ slot: slotId, id: a.id, elapsed: 0, error: i18nT('hooks.useWebSocket.approval_rejected') }))
       }
     }).catch(() => dispatch(markSubagentApproving({ id: a.id, approving: false })))
   }, [dispatch, slotId])
@@ -1493,8 +1530,14 @@ function ChatInput({
     document.addEventListener('mousedown', h)
     return () => document.removeEventListener('mousedown', h)
   }, [plusOpen])
+  const measurePlus = useCallback(() => {
+    if (plusBtnRef.current) setPlusRect(plusBtnRef.current.getBoundingClientRect())
+  }, [])
+  // Keeps the portaled "+" menu anchored while the trigger moves under it --
+  // notably when the mobile keyboard closes (visualViewport-only signal).
+  useAnchorRemeasure(plusOpen, measurePlus)
   const togglePlus = () => {
-    if (!plusOpen && plusBtnRef.current) setPlusRect(plusBtnRef.current.getBoundingClientRect())
+    if (!plusOpen) measurePlus()
     setPlusOpen(o => !o)
   }
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
@@ -2084,8 +2127,7 @@ function ChatInput({
     const control = composerControl()
     if (!control) return
     prevAutoFocusKeyRef.current = autoFocusKey
-    const ae = document.activeElement as HTMLElement | null
-    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return
+    if (activeElementIsEditable()) return
     control.focus()
   }, [autoFocusKey, disabled, isMobile, composerControl, lexicalControlRevision])
 
@@ -2097,8 +2139,7 @@ function ChatInput({
     if (!typedCommandMenus) return
     const onSlashFocus = (e: KeyboardEvent) => {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      if (isEditableTarget(e)) return
       e.preventDefault()
       // `/` is an explicit "I want to type" gesture, so it outranks the collapse
       // and brings the box back (expandComposer focuses it on the next frame).
@@ -2323,7 +2364,8 @@ function ChatInput({
   }, [value, autoFocusKey, composerControl])
 
   const handleInput = useCallback((e: React.FormEvent<HTMLTextAreaElement>) => {
-    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint, parkedRef.current)
+    // This IS the user's edit, so the caret is followed.
+    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint, parkedRef.current, true)
   }, [manualHeight, prefillHint])
 
   const setTextUndoable = useCallback((text: string) => {
@@ -3258,9 +3300,35 @@ function ChatInput({
 
   // Auto-resize textarea to fit content. Moved down here from the other composer
   // effects so it can name `textareaParked` — see the note at that site.
+  const lastMeasuredValueRef = useRef(value)
   useEffect(() => {
-    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked)
+    // A changed value here was set by the parent (the user's own edits already
+    // followed the caret in handleInput); an unchanged one means the cap, the
+    // parking or the manual height moved under text the user placed the caret
+    // in. See `applyHeight` for why only the former must not follow the caret.
+    const valueChanged = lastMeasuredValueRef.current !== value
+    lastMeasuredValueRef.current = value
+    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked, !valueChanged)
   }, [value, prefillHint, manualHeight, textareaParked])
+
+  // A pre-filled prompt is read from its first line. When the seed REPLACES what
+  // the box held, a box that was scrolled for the previous text keeps that
+  // offset across the value swap, so the new prompt's first line can start above
+  // the fold: reset once, when the hint arrives with the seed. When the seed was
+  // APPENDED to a draft the user was writing (the widget send path), the new
+  // text is the tail and the offset they had is the right one, so leave it. The
+  // caret stays at the end either way, so typing still appends. The DOM value is
+  // read rather than the prop so the effect keys on the hint alone.
+  const valueBeforeHintRef = useRef(value)
+  useEffect(() => {
+    const el = inputRef.current
+    if (!prefillHint || !el) return
+    // The append path joins on a trimmed draft, so compare against that form.
+    const prev = valueBeforeHintRef.current.trimEnd()
+    const appended = prev.trim().length > 0 && el.value.startsWith(prev)
+    if (!appended) el.scrollTop = 0
+  }, [prefillHint])
+  useEffect(() => { valueBeforeHintRef.current = value }, [value])
 
   // Re-measure when the textarea's WIDTH changes at an unchanged value: a window
   // resize, a sibling column folding, the side panel docking. The wrapped
@@ -3280,7 +3348,7 @@ function ChatInput({
       const width = el.clientWidth
       if (width === lastWidth) return
       lastWidth = width
-      if (!dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current)
+      if (!dragging.current) applyHeight(el, manualHeight, prefillHint, parkedRef.current, true)
     })
     ro.observe(el)
     return () => ro.disconnect()
@@ -3973,6 +4041,7 @@ function ChatInput({
                 disabled={disabled}
                 readOnly={optimizing}
                 sendOnEnter={sendOnEnter}
+                spellCheck={spellCheck}
                 className={manualHeight !== null ? 'flex-1 min-h-0' : ''}
               />
             </Suspense>
@@ -3983,6 +4052,7 @@ function ChatInput({
           ref={setTextareaRef}
           aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
           data-composer-input=""
+          spellCheck={spellCheck}
           aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
           className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}

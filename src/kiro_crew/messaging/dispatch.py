@@ -34,11 +34,21 @@ from typing import Any, Awaitable, Callable, Optional
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, event_is_spawn_run
+from kiro_crew.hooks import (
+    HOOK_REPLY,
+    TOOL_AUTO_APPROVE,
+    TOOL_DENY,
+    event_is_spawn_run,
+    hook_gate_kwargs,
+)
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
-from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
+from kiro_crew.messaging.inbound_spool import (
+    InboundRoute,
+    spool_refused_turn,
+    spool_refused_turn_sync,
+)
 from kiro_crew.messaging.link import (
     DM_SCOPE_UNIFIED,
     ChannelLink,
@@ -62,6 +72,104 @@ from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
 
 logger = logging.getLogger(__name__)
+
+
+async def admit_inbound_callback(
+    sessions: Any,
+    *,
+    channel_type: str,
+    route: InboundRoute | None,
+    restricted: bool | Callable[[], Awaitable[bool]] = False,
+) -> bool:
+    """Reserve one handler task or durably refuse it before pre-turn effects.
+
+    A callable restriction is resolved only after admission refuses the task.
+    Resume-capable channels use that form because their effective session takes
+    an awaited routing decision to determine. The upstream client handler task
+    remains census-visible during that decision, while the happy path keeps the
+    synchronous reserve-before-effects boundary and pays no routing lookup.
+    """
+    reserve = getattr(sessions, "reserve_inbound_callback", None)
+    if not callable(reserve):
+        # Compatibility for focused embedders/test doubles that are not a
+        # SessionManager. Production channel dispatch always receives the real
+        # facade, whose structural contract requires this method.
+        return True
+    reservation = reserve()
+    if reservation is None:
+        try:
+            refusal_restricted = bool(await restricted()) if callable(restricted) else restricted
+        except Exception:
+            logger.warning(
+                "%s: could not resolve refused callback privacy; suppressing durable spool",
+                channel_type,
+                exc_info=True,
+            )
+            refusal_restricted = True
+        if not refusal_restricted:
+            if getattr(sessions, "update_restart_fenced", False):
+                spool_refused_turn_sync(channel_type=channel_type, route=route)
+            else:
+                await spool_refused_turn(channel_type=channel_type, route=route)
+        return False
+    task = asyncio.current_task()
+    if task is None:
+        reservation.release()
+        raise RuntimeError("inbound callback has no owning asyncio task")
+    task.add_done_callback(lambda _done: reservation.release())
+    return True
+
+
+class _InboundCallbackAdmission:
+    """Explicit callback lease for dispatchers running on a long-lived task."""
+
+    def __init__(
+        self,
+        sessions: Any,
+        *,
+        channel_type: str,
+        route: InboundRoute | None,
+        restricted: bool,
+    ) -> None:
+        self._sessions = sessions
+        self._channel_type = channel_type
+        self._route = route
+        self._restricted = restricted
+        self._reservation: Any = None
+
+    async def __aenter__(self) -> bool:
+        reserve = getattr(self._sessions, "reserve_inbound_callback", None)
+        if not callable(reserve):
+            return True
+        self._reservation = reserve()
+        if self._reservation is not None:
+            return True
+        if not self._restricted:
+            if getattr(self._sessions, "update_restart_fenced", False):
+                spool_refused_turn_sync(channel_type=self._channel_type, route=self._route)
+            else:
+                await spool_refused_turn(channel_type=self._channel_type, route=self._route)
+        return False
+
+    async def __aexit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        if self._reservation is not None:
+            self._reservation.release()
+
+
+def hold_inbound_callback(
+    sessions: Any,
+    *,
+    channel_type: str,
+    route: InboundRoute | None,
+    restricted: bool = False,
+) -> _InboundCallbackAdmission:
+    """Hold callback census ownership only for the surrounding async scope."""
+    return _InboundCallbackAdmission(
+        sessions,
+        channel_type=channel_type,
+        route=route,
+        restricted=restricted,
+    )
 
 
 @dataclass
@@ -229,6 +337,14 @@ class ChannelTurn:
     the spool and its refusal path is byte-identical to before.
     """
 
+    inbound_restricted: bool = False
+    """Suppress durable refusal spooling for an incognito/temporary session.
+
+    The dispatcher resolves this against the final session key before entering
+    the shared turn pipeline. It covers the later ``SessionClosingError`` race,
+    after callback admission succeeded but before the provider turn opened.
+    """
+
 
 #: Every spelling a channel accepts for "abort the running turn". The union of
 #: the per-channel command tables (``/stop`` and ``/cancel`` everywhere, plus
@@ -315,14 +431,7 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
             getattr(event, "title", "") or "",
             session_key=session_key,
             agent=agent,
-            tool_kind=getattr(event, "tool_kind", "") or "",
-            raw_params=getattr(event, "raw_tool_params", None),
-            diff_path=getattr(event, "diff_path", "") or "",
-            command=getattr(event, "shell_command", None),
-            is_shell=bool(getattr(event, "is_shell", False)),
-            mcp_server_name=getattr(event, "mcp_server_name", "") or "",
-            mcp_tool_name=getattr(event, "tool_name", "") or "",
-            mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
+            **hook_gate_kwargs(event),
         )
         if result.action == TOOL_DENY:
             return "deny"
@@ -663,6 +772,11 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # exposure, and one that forgot would silently read the operator's memory.
         # The member tier was prepared before provider acquisition; unavailable
         # private memory refuses the turn instead of substituting global memory.
+        # A compaction drops session-start context. Read-and-clear the one-shot
+        # flag so this turn re-injects that context exactly once.
+        consume = getattr(sessions, "consume_needs_reinjection", None)
+        needs_reinjection = bool(consume(session_key)) if callable(consume) else False
+
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             ctx_builder.build_message,
@@ -673,8 +787,10 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             agent=turn.agent,
             memory_store=memory_store,
             resumed=resumed,
+            needs_reinjection=needs_reinjection,
             minimal_context=turn.minimal_context,
             runtime_source=turn.channel_type,
+            context_provider=provider,
         )
 
         driver = TurnDriver(
@@ -797,7 +913,8 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # quote those rules back into the group in the restart notice. A route
         # whose text is empty is a media-only entry (or nothing), not a cue to
         # reach for the prompt.
-        await spool_refused_turn(channel_type=turn.channel_type, route=turn.inbound_route)
+        if not turn.inbound_restricted:
+            await spool_refused_turn(channel_type=turn.channel_type, route=turn.inbound_route)
     except UnknownMemoryStore as exc:
         logger.warning("%s member memory unavailable: %s", turn.channel_type, exc)
         try:

@@ -356,6 +356,23 @@ def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
     assert sessions.successes == 0
 
 
+def test_a_restricted_shutdown_refusal_never_spools(monkeypatch) -> None:
+    """A resolved temporary/incognito turn leaves no durable refusal record."""
+    _patch_pipeline(monkeypatch)
+    spool = AsyncMock(return_value=True)
+    monkeypatch.setattr(D, "spool_refused_turn", spool)
+    sessions = _Sessions(closing=True)
+    renderer = _Renderer()
+    turn = _turn(renderer)
+    turn.inbound_route = D.InboundRoute(conversation_id="conv", text="secret", user_id="u")
+    turn.inbound_restricted = True
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    spool.assert_not_awaited()
+    assert sessions.released == 1
+
+
 def test_a_compaction_failed_terminal_resets_the_session(monkeypatch) -> None:
     """A COMPACTION_FAILED terminal is synthetic — the backend abandoned the
     turn after a failed auto-compaction and never sent end_turn, so it still
@@ -659,15 +676,27 @@ class _RecordingCtxBuilder:
     """Captures the kwargs the pipeline hands ``build_message``.
 
     The signature is spelled out rather than swallowed into ``**kw`` for
-    ``minimal_context``, so a pipeline that stops forwarding it fails here
-    instead of quietly falling back to the builder's own default.
+    ``minimal_context`` and ``needs_reinjection``, so a pipeline that stops
+    forwarding either fails here instead of quietly falling back to the
+    builder's own default.
     """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def build_message(self, text, is_new, session_key, *, minimal_context=False, **kw):
-        self.calls.append({"minimal_context": minimal_context, **kw})
+    def build_message(
+        self,
+        text,
+        is_new,
+        session_key,
+        *,
+        minimal_context=False,
+        needs_reinjection,
+        **kw,
+    ):
+        self.calls.append(
+            {"minimal_context": minimal_context, "needs_reinjection": needs_reinjection, **kw}
+        )
         return text, None
 
 
@@ -729,6 +758,47 @@ def test_the_default_turn_still_gets_full_context(monkeypatch) -> None:
     )
 
     assert ctx.calls[0]["minimal_context"] is False
+
+
+def test_compaction_reinjection_reaches_build_message(monkeypatch) -> None:
+    """A channel turn consumes and forwards its one-shot reinjection marker."""
+
+    class _ReinjectingSessions(_Sessions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.consumed_keys: list[str] = []
+
+        def consume_needs_reinjection(self, key: str) -> bool:
+            self.consumed_keys.append(key)
+            return True
+
+    _patch_pipeline(monkeypatch)
+    sessions = _ReinjectingSessions()
+    ctx = _RecordingCtxBuilder()
+    turn = _turn(_Renderer())
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=ctx))
+
+    assert sessions.consumed_keys == [turn.session_key]
+    assert ctx.calls[0]["needs_reinjection"] is True
+
+
+def test_missing_reinjection_consumer_keeps_turn_running(monkeypatch) -> None:
+    """A session stand-in without the new method gets the safe false default."""
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+    ctx = _RecordingCtxBuilder()
+
+    asyncio.run(
+        drive_turn(
+            _turn(_Renderer()),
+            sessions=sessions,
+            ctx_builder=ctx,
+        )
+    )
+
+    assert ctx.calls[0]["needs_reinjection"] is False
+    assert sessions.successes == 1
 
 
 class _GovernanceStub:

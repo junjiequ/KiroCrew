@@ -109,6 +109,9 @@ from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_disconnect,
     api_connections_mint,
     api_connections_mint_state,
+    api_connections_oauth_client_delete,
+    api_connections_oauth_client_put,
+    api_connections_oauth_clients,
     api_connections_premint,
     api_connections_status,
     api_connections_test,
@@ -156,6 +159,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_dashboard_config,
     api_file_diff,
     api_file_download,
+    api_file_grep,
     api_file_office_preview,
     api_file_raw,
     api_file_read,
@@ -492,6 +496,39 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_update_plan,
     api_taskrunner_update_task,
 )
+
+
+# ── Durable task queue + capacity view (handlers/tasks.py) ──
+async def api_task_action(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_action as handler
+
+    return await handler(request)
+
+
+async def api_task_cancel(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_cancel as handler
+
+    return await handler(request)
+
+
+async def api_task_detail(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_detail as handler
+
+    return await handler(request)
+
+
+async def api_tasks_list(request):
+    from kiro_crew.dashboard.handlers.tasks import api_tasks_list as handler
+
+    return await handler(request)
+
+
+async def api_tasks_summary(request):
+    from kiro_crew.dashboard.handlers.tasks import api_tasks_summary as handler
+
+    return await handler(request)
+
+
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
     api_collection_status,

@@ -31,7 +31,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from kiro_crew.history import (
     is_incognito_transcript,
@@ -133,6 +133,31 @@ def persisted_session_agent(conv_log: Any | None, session_key: str) -> str:
     return session_agent_from_metadata(meta)
 
 
+def session_title_of(conv_log: Any | None, session_key: str, channel: str = "") -> str:
+    """The stored title for *session_key*, or the bare key as a stable fallback.
+
+    Discord, Teams and Telegram each grew their own copy of this read, so a fix
+    to the unwrap or the fallback landed in one and missed the others. The read
+    shape lives here for the same reason ``persisted_session_agent`` does: the
+    three adapters differ in addressing and wording, not in how they name a
+    resumed conversation.
+
+    Metadata access is blocking; async callers run this helper off the event loop
+    (see ``persisted_session_agent``). *channel* only names the caller in its
+    debug line, so a channel's log attribution survives the consolidation.
+    """
+    title = ""
+    if conv_log is not None:
+        try:
+            meta = conv_log.get_metadata(session_key)
+            title = str((meta or {}).get("title") or "")
+        except Exception:
+            logger.debug("%s resume: title lookup failed", channel or "session", exc_info=True)
+    # The picker's fallback for an untitled session, so a bootstrapped record
+    # names the conversation the way the user saw it listed.
+    return title or session_key.removeprefix("dashboard:")
+
+
 class ResumeReleaseError(RuntimeError):
     """A resumed binding removal could not be made durable."""
 
@@ -174,6 +199,47 @@ class RoutingDecision:
     observed: InboundResolution | None = None
     adopt_key: str = ""
     adopt_title: str = ""
+
+
+async def refused_resume_is_restricted(
+    native_session_key: str,
+    *,
+    resolve: Callable[[], Awaitable[RoutingDecision]],
+    is_restricted: Callable[[str], Awaitable[bool]],
+) -> bool:
+    """Resolve every possible resume target before persisting a refused message.
+
+    A routing refusal can carry the expected, observed, or adopted session even
+    when ``resumed_key`` is empty. Check all of them plus the native key so an
+    update-pause spool cannot persist content belonging to a temporary or
+    incognito conversation. Any resolution failure denies persistence: losing
+    one restart notice is reversible, while writing restricted content is not.
+    """
+    try:
+        decision = await resolve()
+        if decision.observed is not None and decision.observed.ambiguous:
+            return True
+        candidates = (
+            native_session_key,
+            decision.resumed_key,
+            decision.adopt_key,
+            decision.described.key if decision.described is not None else None,
+            decision.observed.key if decision.observed is not None else None,
+        )
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if await is_restricted(candidate):
+                return True
+    except Exception:
+        logger.warning(
+            "resume: could not resolve refused callback privacy; denying persistence",
+            exc_info=True,
+        )
+        return True
+    return False
 
 
 @dataclass(frozen=True)

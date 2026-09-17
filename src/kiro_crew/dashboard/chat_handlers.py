@@ -99,12 +99,24 @@ from kiro_crew.dashboard.chat_utils import (
     _redact_meta_for_role,
     _remove_queued_by_id,
     _sync_dashboard_slots,
+    chat_done_payload,
     effective_session_key,
     history_corpus_unreadable,
     slot_history_key,
-    subagents_attached,
+    subagents_attached_async,
 )
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.remote_adopt import (
+    ADOPT_PEER_MODE_UNKNOWN,
+    ADOPT_TARGET_UNKNOWN,
+    AdoptBackfill,
+    AdoptTargetUnknown,
+    adopted_slot_for,
+    apply_adopted_backfill,
+    fetch_adopted_backfill,
+    peer_row_metadata,
+    resolve_adopt_target,
+)
 from kiro_crew.dashboard.remote_relay import (
     RemoteTurnError,
     create_peer_slot,
@@ -140,6 +152,7 @@ from kiro_crew.dashboard.state import (
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 from kiro_crew.history import carry_provenance, is_incognito_transcript, transcript_stems
+from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
@@ -319,6 +332,22 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                     },
                     status=409,
                 )
+
+    # `relay=1` is the OWNER gateway asking this peer to run a turn in a slot
+    # that already exists here. It is never a slot-creation request. Letting it
+    # fall through to `get_or_create_slot` resurrects a peer session that closed
+    # after adoption as an EMPTY ordinary slot under the same key; the owner then
+    # receives a plausible reply with none of the inherited transcript context.
+    # Check immediately before creation, with no await between this lookup and
+    # `get_or_create_slot`, so a same-loop removal cannot land in the gap.
+    relay_requested = request.query.get("relay") == "1"
+    if relay_requested:
+        relay_key = _normalize_slot_key(slot_name) if slot_name else ""
+        # App tokens get one uniform not-found answer for the entire relay space.
+        # Relaying spends the owner's peer tunnel and is not an app capability;
+        # distinguishing an existing key here would also be a slot oracle.
+        if request.get("app", "") or not relay_key or relay_key not in state._slots:
+            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
     created_in_send = slot_name is None or _normalize_slot_key(slot_name) not in state._slots
     try:
@@ -949,7 +978,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             )
         )
         # Use Python-controlled stage loop instead of _run_chat
-        task = asyncio.create_task(_stage_loop(state, slot, auto_run=_is_auto))
+        task = asyncio.create_task(
+            _stage_loop(state, slot, auto_run=_is_auto),
+            name=f"dashboard-stage:{slot.key}",
+        )
         slot.task = task
         slot._recovery_retrigger_count = 0
         state._background_tasks.add(task)
@@ -985,7 +1017,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                     t.cancel()
         stop_msg = "🛑 [SYSTEM] Orchestration stopped by user."
         append_and_surface(state, slot, "assistant", stop_msg, "msg msg-a")
-        state.broadcast_ws("chat_done", {"slot": slot.key})
+        state.broadcast_ws("chat_done", await chat_done_payload(state, slot))
         return web.json_response({"ok": True, "stopped": True})
 
     # ── Reset rounds after user guidance (not a stop) ───────────────
@@ -1053,6 +1085,25 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # static guard that every dispatch carries a CHAT_TURN_TIMEOUT ceiling.
     # Both arms are wrapped identically: a hung peer must hit the same wall a hung
     # local turn does.
+    # The attachment ids this handler just accepted, so the ledger names the file
+    # instead of leaving the turn's input unexplained. Passed only when there ARE
+    # some: an ordinary send then calls `_run_chat` with exactly the arguments it
+    # always did, which is what keeps the many test doubles of it valid.
+    _accepted_attachment_meta = attachment_meta(user_meta)
+    _accepted_attachments = [path for paths in _accepted_attachment_meta.values() for path in paths]
+    # ``request_app`` is stamped by the app-token auth middleware, not read from
+    # the request body, so it is a fact about the caller a person cannot write --
+    # which is what lets the turn's actor come from it. Passing it is what keeps
+    # an app-authored send out of the ledger's ``user`` bucket: the actor
+    # resolver's fallback is ``user``, so a site that observes an app and stays
+    # silent records a person who never typed anything.
+    _turn_kwargs: dict = {"_directive_user_origin": not bool(request_app)}
+    if request_app:
+        _turn_kwargs["_turn_actor"] = "app"
+    if _accepted_attachments:
+        _turn_kwargs["_attachments"] = _accepted_attachments
+        # Typed form for the refusal replay: keeps ``dirs`` entries as folders.
+        _turn_kwargs["_attachment_meta"] = _accepted_attachment_meta
     task = spawn_guarded_turn(
         state,
         slot,
@@ -1061,12 +1112,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             (
                 relay_remote_turn(state, slot, message)
                 if slot.is_remote
-                else _run_chat(
-                    state,
-                    slot,
-                    message,
-                    _directive_user_origin=not bool(request_app),
-                )
+                else _run_chat(state, slot, message, **_turn_kwargs)
             ),
         ),
     )
@@ -2385,6 +2431,24 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # the owner's tunnel credential — a request that is going to be refused must
     # not have already created a session over there.
     instance_id = str(body.get("instance_id") or "")
+    # ADOPT: bind this new local slot to a peer session that ALREADY EXISTS,
+    # instead of minting a fresh one over there. The caller supplies the peer's own
+    # slot key (a `key` from GET /api/instances/{id}/chat-slots), which names the
+    # crew that owns it — so without an `instance_id` there is nothing to resolve
+    # the key against and no peer to route the turn to.
+    #
+    # Refused BEFORE the binding gates below, which all sit inside `if instance_id`
+    # and therefore do not run for this shape at all. It discloses nothing: the
+    # request named no crew, so there is no existence to leak.
+    adopt_remote_slot = str(body.get("adopt_remote_slot") or "")
+    if adopt_remote_slot and not instance_id:
+        return web.json_response(
+            {
+                "error": "adopting a crew session needs the crew it belongs to",
+                "code": "adopt_needs_instance",
+            },
+            status=400,
+        )
     request_app = request.get("app", "")
     if instance_id:
         # (1) Binding a session to a crew is a human act: it comes from the
@@ -2518,7 +2582,117 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 status=400,
             )
     remote_slot_key = ""
-    if instance_id:
+    # Metadata the adopted session inherits from the peer, and its prepared
+    # history. Both empty on the mint path, which is why every use below is
+    # guarded rather than branched on `adopt_remote_slot` a second time.
+    peer_meta: dict[str, str] = {}
+    backfill = AdoptBackfill([], "")
+    if instance_id and adopt_remote_slot:
+        # IDEMPOTENCY, first of two. This one runs before the peer is read at all,
+        # so the common case — a double click on the same peer row — is answered
+        # without a tunnel round-trip or a second transcript copy. It is NOT the
+        # one that closes the concurrent-POST race: the awaits below mean two
+        # requests can clear this together, which is what the recheck immediately
+        # before `get_or_create_slot` exists for.
+        #
+        # Two local slots driving one peer session is not just a duplicate row:
+        # each accumulates its own turns, so the transcripts diverge, and
+        # `read_peer_slots` filters the peer's row on whichever binding it sees.
+        # Returning the existing slot is also what makes the frontend's
+        # `switchSlot(resp.key)` correct on a retry.
+        #
+        # Reachable only by an owner dashboard caller: the app and owner gates
+        # above already refused everyone else, so this is not a read-back oracle.
+        already = adopted_slot_for(state, instance_id, adopt_remote_slot)
+        if already is not None:
+            return web.json_response(state.serialize_slot(already))
+        # The key is CALLER-supplied, so it is validated against the peer's live
+        # session list — the same read the merged sidebar renders. That makes the
+        # check free of new policy: a key absent from that view is forged, closed,
+        # or a slot this hub already drives, and none of the three is adoptable.
+        try:
+            adopt_row = await resolve_adopt_target(state, instance_id, adopt_remote_slot)
+        except AdoptTargetUnknown as exc:
+            # "Not in the peer's list" has TWO causes, and only one is an error.
+            # `read_peer_slots` drops the rows this hub already drives, so the
+            # moment a concurrent adopt of this same pair stamps its binding, the
+            # row this request came to adopt disappears from the very listing used
+            # to validate it. Two tabs on one peer row therefore ended with the
+            # winner opening the session and the LOSER getting a 404 for a session
+            # that exists and is now reachable locally.
+            #
+            # So before treating absence as forgery, ask the one question that
+            # tells the two apart: does a local slot already bind this pair? If it
+            # does, absence is the expected consequence of the adopt having already
+            # happened, and the honest answer is that slot -- the same answer the
+            # early check and the pre-create recheck give. This is why all three
+            # sites go through `adopted_slot_for` rather than each deciding for
+            # itself.
+            raced = adopted_slot_for(state, instance_id, adopt_remote_slot)
+            if raced is not None:
+                return web.json_response(state.serialize_slot(raced))
+            return web.json_response({"error": str(exc), "code": ADOPT_TARGET_UNKNOWN}, status=404)
+        except RemoteTurnError as exc:
+            return web.json_response({"error": str(exc), "code": "remote_bind_failed"}, status=502)
+        remote_slot_key = adopt_remote_slot
+        peer_meta = peer_row_metadata(adopt_row)
+        # The peer's mode is REQUIRED, not preferred. It is the user's privacy
+        # boundary and the peer session already has one, so a session opened as
+        # `incognito` over there must not start writing memory the moment it is
+        # opened on this machine.
+        #
+        # Absent means REFUSE, because the alternative is silent and wrong in the
+        # dangerous direction. `peer_row_metadata` omits the key for a row that
+        # never carried a mode and for one whose value is outside the allowlist,
+        # so falling back to the request's mode would resolve the least
+        # trustworthy case -- a peer whose row we could not read a boundary from
+        # -- to this machine's default of `persistent`. Version skew alone
+        # reaches it: a crew whose slot rows predate the field would hand over
+        # every incognito session as a persistent local one. Refusing costs an
+        # adopt that a newer peer can retry; guessing costs the boundary.
+        peer_mode = peer_meta.get("memory_mode", "")
+        if not peer_mode:
+            return web.json_response(
+                {
+                    "error": (
+                        "the crew did not report this session's memory mode, so it "
+                        "cannot be opened here without guessing its privacy boundary"
+                    ),
+                    "code": ADOPT_PEER_MODE_UNKNOWN,
+                },
+                status=502,
+            )
+        memory_mode = peer_mode
+        # The peer's agent wins too, for the same reason as the mode above and
+        # because this module's contract is that nothing the caller sends decides
+        # what the adopted session claims to be. Unconditional, with no `or agent`
+        # fallback: a peer row carrying no agent means the peer session runs on ITS
+        # default, and resolving that to the REQUEST's agent would open the peer's
+        # conversation under an agent that has never answered in it. Empty here is
+        # the right answer -- the local slot then falls to this machine's own
+        # default the same way any agent-less session does. Stored VERBATIM: the
+        # surrounding resolve/normalize steps are skipped for every peer-bound
+        # create precisely because they answer from THIS machine's roster.
+        agent = peer_meta.get("agent", "")
+        # Read the history BEFORE `get_or_create_slot`, so the peer round-trip
+        # happens outside the `suspend_slots_push` block below. That suspension is
+        # process-wide: holding it across a transcript read would defer every other
+        # client's slot updates for the length of it. Never raises — an adopted
+        # slot with no history is usable, so a failed copy is a notice in the
+        # transcript rather than a refused create.
+        try:
+            backfill = await fetch_adopted_backfill(state, instance_id, adopt_remote_slot)
+        except AdoptTargetUnknown as exc:
+            # The slot was present in the live list but its detail endpoint says
+            # it is gone. Abort BEFORE `get_or_create_slot`; a local binding to
+            # nothing is not a history-copy failure. Keep the same external 404
+            # as the earlier list check — both mean "this peer key is not
+            # adoptable now", and a caller must not learn which read observed it.
+            raced = adopted_slot_for(state, instance_id, adopt_remote_slot)
+            if raced is not None:
+                return web.json_response(state.serialize_slot(raced))
+            return web.json_response({"error": str(exc), "code": ADOPT_TARGET_UNKNOWN}, status=404)
+    elif instance_id:
         try:
             # The picks ride the create rather than following it: a second
             # round-trip could fail after the peer session existed, leaving a
@@ -2633,6 +2807,23 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     _requested_key = _normalize_slot_key(str(name)) if name else ""
     is_new_slot = not _requested_key or _requested_key not in state._slots
 
+    if remote_slot_key and adopt_remote_slot:
+        # The DECIDING idempotency check for an adopt. The one at the top of the
+        # adopt branch runs before `resolve_adopt_target` and
+        # `fetch_adopted_backfill`, and both of those suspend — so two concurrent
+        # identical POSTs clear it together and would each mint a slot bound to one
+        # peer session. Re-asked here, after every await and with nothing awaiting
+        # between this and `get_or_create_slot` below, which is what makes
+        # check-and-create atomic on asyncio's single thread.
+        #
+        # The loser discards the history it just read rather than applying it: the
+        # winner copied the same transcript from the same peer slot, so the work is
+        # redundant, not lost. Returning the winner's slot is also what keeps the
+        # frontend's `switchSlot(resp.key)` correct for whichever request lost.
+        raced = adopted_slot_for(state, instance_id, adopt_remote_slot)
+        if raced is not None:
+            return web.json_response(state.serialize_slot(raced))
+
     # Coalesce every push inside into ONE broadcast at exit, so the first frame
     # any client sees already carries the folder, title, artifact binding and
     # project. Otherwise each of those is a separate post-create correction the
@@ -2717,16 +2908,36 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
         # Pin title if explicitly provided (prevents auto-title from overwriting)
         title = (body.get("title") or "").strip()[:200] if isinstance(body, dict) else ""
+        # An adopted session takes the PEER's title, ahead of anything the caller
+        # sent. It is the label the user just clicked in the merged list, so
+        # opening it under a different one — or under a local auto-title generated
+        # from a backfilled history — renames their session out from under them.
+        # Ahead of the caller's, not merely a fallback: the same contract that puts
+        # the peer in charge of `agent` and `memory_mode` puts it in charge of the
+        # name, and the adopt path sends no title of its own, so a caller-supplied
+        # one could only contradict the session being adopted. Pinned below like a
+        # caller-explicit title for the same reason: the background refresh must
+        # not rewrite a name the peer owns. (There is no "peer" title origin;
+        # "user" is the closest true statement, in that a human named it and no
+        # local model may replace it.)
+        title = peer_meta.get("title", "") if adopt_remote_slot else title
         if title:
             title, _ = redact_exfiltration_urls(title)
             title, _ = redact_credentials(title)
             slot.title = title
-            slot._titled = True
+        # On an adopt the name is pinned EVEN WHEN the peer's title is empty: the
+        # peer owns it, so an unnamed peer session is one whose name is "none yet",
+        # and leaving it unpinned would let the local auto-titler invent one -- the
+        # same divergence a caller-supplied title would have caused. An ordinary
+        # mint keeps the old rule, pinning only a title the caller actually gave,
+        # so an untitled new session is still free to be auto-titled.
+        if title or adopt_remote_slot:
             # A pinned title is caller-explicit: record origin "user" so the
             # background title refresh never rewrites it (this endpoint can
             # address an ALREADY-auto-titled slot whose origin would otherwise
             # stay "auto"), and bump the epoch so an in-flight background
             # attempt stands down instead of clobbering the pin.
+            slot._titled = True
             slot._title_origin = "user"
             slot._title_epoch += 1
         # Bind to an artifact if provided (companion chat). Validate
@@ -2861,6 +3072,17 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                             status=409,
                         )
                     slot.memory_store = assigned_store
+        # The adopted session's history, appended before the first frame and before
+        # the persist below — list appends only, the read and the redaction pass
+        # already happened outside this suspension. Placed after the app-ownership
+        # check above so a request that is about to 404 never copies a transcript,
+        # and after the folder/title work so the coalesced push carries the whole
+        # session in one frame. It also trails the member-assignment block above,
+        # which can still answer 409 `session_rebound`: a create that is about to
+        # be refused must not copy the peer's transcript either.
+        if backfill.rows or backfill.notice:
+            applied = apply_adopted_backfill(slot, backfill)
+            logger.info("Adopted %s into %s with %d rows", remote_slot_key, slot.key, applied)
         _sync_dashboard_slots(state)
         # Persist INSIDE the suspension, ahead of the coalesced broadcast, the
         # same ordering `session_control.py`'s create span uses ("the whole
@@ -3190,7 +3412,7 @@ def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
         logger.info("Stop: cancelled %d pending question(s) on slot %s", cancelled, slot.key)
 
 
-def _subagents_attached_response(
+async def _subagents_attached_response(
     state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
 ) -> web.Response | None:
     """409 while sub-agent children are attached to *session_key*, else None.
@@ -3199,14 +3421,15 @@ def _subagents_attached_response(
     dispatching a new turn (continue) interleaves with their writes, and a
     session teardown (reload) kills the shared runtime they run on.
 
-    The probes themselves live in :func:`chat_utils.subagents_attached`, shared
+    The probes themselves live in :func:`chat_utils.subagents_attached_async`
+    (a coroutine because the queued probe reads the task store), shared
     with the deferred consume in ``chat_runner`` that applies a queued
     conversation discard. That teardown reaches the same runtime without passing
     through any endpoint, so it must apply the same policy — and two copies of
     the probe block is how the two would diverge. This wrapper only shapes the
     refusal.
     """
-    if subagents_attached(state, slot, session_key, operation):
+    if await subagents_attached_async(state, slot, session_key, operation):
         return web.json_response(
             {"error": "sub-agents are running", "code": "slot_subagents_running"},
             status=409,
@@ -4189,7 +4412,7 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # `f"dashboard:{slot.key}"`: a channel-born slot's children register
         # under the channel key, and the dashboard-prefixed form silently
         # matches nothing — `_history_key_for`'s own docstring says as much.
-        denied_409 = _subagents_attached_response(
+        denied_409 = await _subagents_attached_response(
             state, slot, effective_session_key(slot), "continue"
         )
         if denied_409 is not None:
@@ -4953,7 +5176,7 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     # sub-agent runtime the parent's children run on. ``slot.running`` is False
     # while they keep going — the parent turn ends first — so nothing above
     # catches it, and the same guard the reload route uses is what does.
-    attached = _subagents_attached_response(state, slot, key, "slot_reset_conversation")
+    attached = await _subagents_attached_response(state, slot, key, "slot_reset_conversation")
     if attached is not None:
         return attached
 
@@ -5919,17 +6142,53 @@ class _CommitToken(str):
 # CONSTRUCTION, so there is no window to guard and no new decision point to
 # get wrong. The ExitStack is what lets a lock be acquired mid-block without
 # nesting the whole remaining transaction one level deeper.
-_slot_switch_session_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
-    weakref.WeakValueDictionary()
-)
+#
+# The lock itself lives in ``kiro_crew.llm_helpers``
+# (``slot_switch_session_lock``) so the chat runner's refusal-fallback
+# restore can take the SAME lock — this module imports from the runner, so
+# the runner cannot import it from here without a cycle. The local name is
+# kept for the acquisition sites below.
+_slot_switch_session_lock = slot_switch_session_lock
 
 
-def _slot_switch_session_lock(session_key: str) -> asyncio.Lock:
-    lock = _slot_switch_session_locks.get(session_key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _slot_switch_session_locks[session_key] = lock
-    return lock
+def _slot_replaced_while_queued(
+    state: DashboardState, slot: _ChatSlot, name: str, request: web.Request, operation: str
+) -> bool:
+    """Whether ``name`` registers a different object than *slot* -- checked after a lock await.
+
+    Every switch handler (and reload) reads ``state._slots.get(name)`` before
+    its first await, then queues on ``slot._lock``, the session-keyed switch
+    lock and, on the model paths, ``slot._model_pick_lock``. Slot removal and
+    same-name re-registration take NONE of those locks (a client reconnecting,
+    or a different app claiming the name), so by the time a queued request
+    resumes, ``name`` can belong to a different slot object. Everything the
+    handler does next -- the app-isolation check, the busy probe, the reset --
+    reads the STALE object, and an unlinked replacement resolves to the very
+    same ``dashboard:<name>`` session key, so the stale request's authorization
+    lands its teardown on the replacement's session. Same cross-slot-identity
+    gap ``chat_tags.py`` and ``_reauthorize_after_await`` close with this exact
+    ``is not slot`` test; reload and its five switch siblings share it here.
+
+    Call it immediately after EVERY lock-acquisition await and before any
+    read of ``slot`` that feeds an authorization or a teardown -- not once at
+    the end, because each await is its own window. A mismatch is audited as an
+    ``api_access`` denial (an app caller's under ``app_isolation``, a dashboard
+    caller's like the tags handler's) and the caller answers the same 404 a
+    missing slot gets, so a denial cannot be told from a name that never
+    existed (``_slot_not_found``).
+    """
+    if state._slots.get(name) is slot:
+        return False
+    request_app = request.get("app", "")
+    sel().log_api_access(
+        caller=request_app or "dashboard",
+        operation=operation,
+        outcome="denied",
+        source="app_isolation" if request_app else "dashboard",
+        resources=f"slot={name}",
+        error="slot was replaced while the request queued on the switch locks",
+    )
+    return True
 
 
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
@@ -5981,6 +6240,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # any earlier read could leave this holding the wrong session lock.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
+        # Re-authorize after the await above (see _slot_replaced_while_queued):
+        # ``name`` can be recreated for a different app while this request
+        # queued, and every read of ``slot`` below would be of the stale one.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_agent"):
+            return _slot_not_found()
         # The session the switch resets — ``effective_session_key``, never
         # ``_history_key_for`` (see api_chat_slot_model): a channel- or
         # cron-born slot runs its turns under its linked key, and the
@@ -5996,6 +6260,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # a binding landed while this request waited on slot._lock (see
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # Second lock-acquisition await, second re-check: a same-name
+        # recreate lands during this wait just as easily as during the first.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_agent"):
+            return _slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel routes'
         # policy): slot ownership does not imply ownership of a linked
         # channel session, so an app caller may not switch the agent a
@@ -6320,7 +6588,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # Children guard, shared with reload/model: the reset tears down the
         # runtime attached sub-agents run on, so a parent that is idle but
         # still has children must refuse rather than discard their work.
-        children_409 = _subagents_attached_response(state, slot, session_key, "slot_agent")
+        children_409 = await _subagents_attached_response(state, slot, session_key, "slot_agent")
         if children_409 is not None:
             _rollback_switch()
             return children_409
@@ -6477,12 +6745,80 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # metadata and internal callers are not private-memory authority.
         from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 
-        if (
+        owner_pick = (
             slot.agent is committed_agent
             and assignment_resolved
             and is_owner_dashboard_request(request)
-        ):
+        )
+        if owner_pick:
             slot._memory_assignment_from_history = False
+
+        # Menu grants are for an EMPTY plain dashboard chat only. Channel,
+        # cron and workflow alias tabs are excluded: an injector can set their
+        # linked_session_key without the slot lock, and they carry native
+        # context the pin helper refuses. With this gate, pin_key is the slot's
+        # own transcript key, which nothing rebinds. The helper verifies the
+        # transcript is empty before issuing a private grant; V1 picks pass
+        # through without a grant.
+        if (
+            owner_pick
+            and agent_name
+            and not slot.messages
+            and not slot.linked_session_key
+            and not slot.channel_origin
+        ):
+            pin_key = session_key
+
+            async def _unwind_pin_failure() -> None:
+                # The error tells the caller nothing changed, so slot state and
+                # transcript metadata must agree. Restore slot.agent rather than
+                # prior_agent to preserve a concurrent writer's binding.
+                _rollback_switch()
+                if state.conversation_log:
+                    try:
+                        await asyncio.to_thread(
+                            state.conversation_log.update_metadata,
+                            _history_key_for(name),
+                            {"agent": str(slot.agent)},
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to restore agent metadata for slot %s", name, exc_info=True
+                        )
+                state.push_slots_update()
+
+            if (
+                state._slots.get(slot.key) is slot
+                and slot.agent is committed_agent
+                and effective_session_key(slot) == pin_key
+                and not slot.messages
+            ):
+                try:
+                    # Off the loop: the create path loads it the same way, and
+                    # the in-handler load above is not guaranteed to have run.
+                    pin_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+                    assigned_store = await pin_private_agent_store(
+                        state, pin_key, agent_name, pin_cfg
+                    )
+                except Exception as exc:
+                    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+
+                    await _unwind_pin_failure()
+                    return _store_unavailable_response(slot.memory_store, exc)
+                # Agent committed: a raced message uses the new agent and confirms its grant.
+                if assigned_store and (
+                    state._slots.get(slot.key) is not slot or slot.agent is not committed_agent
+                ):
+                    # No unwind: the owner's grant on this slot's own key is valid and immutable.
+                    return web.json_response(
+                        {
+                            "error": "slot changed during member assignment",
+                            "code": "session_rebound",
+                        },
+                        status=409,
+                    )
+                if assigned_store and slot.memory_store != assigned_store:
+                    slot.memory_store = assigned_store
 
         # Snapshot the response's workspace LAST, immediately before leaving
         # the lock: the metadata await above yields the event loop, so a
@@ -6664,6 +7000,25 @@ async def _try_live_model_switch(
             exc,
         )
         return False
+    # Client-scoped explicit-pick epoch. The pick GENERATION above is
+    # slot-local, but two slots can drive one wire session (a channel-born
+    # slot and its dashboard alias share `effective_session_key`), and the
+    # refusal-fallback restore guard on another slot cannot see this slot's
+    # generation. The shared CLIENT is the one object every alias holds, so
+    # an explicit pick that lands on the live session stamps it here and the
+    # restore compares against its swap-time snapshot. pick_epoch_host
+    # resolves the SAME innermost object on both ends — this handler holds
+    # the AcpProvider wrapper while the runner can hold the wrapped client.
+    # Stamped IMMEDIATELY after set_model lands and BEFORE the effort
+    # reapply: the wire session serves the picked model from this point, so
+    # a sibling slot's refusal restore can already observe the pick live. If
+    # the reapply below fails (reset fallback), a missing stamp would let
+    # that restore treat the landed pick as its own swap and overwrite it.
+    try:
+        _host = pick_epoch_host(provider)
+        _host._explicit_pick_epoch = getattr(_host, "_explicit_pick_epoch", 0) + 1
+    except Exception:  # pragma: no cover - a frozen/slotted stub client
+        pass
     if not await _reapply_effort_after_live_switch(name, slot, provider):
         return False
     logger.info("Slot %s model switched live to %r (session preserved)", name, wire)
@@ -6756,6 +7111,11 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     # rolled back.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
+        # Re-authorize after the await above (see _slot_replaced_while_queued):
+        # ``name`` can be recreated for a different app while this request
+        # queued, and every read of ``slot`` below would be of the stale one.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_model"):
+            return _slot_not_found()
         # The session the switch will probe and, on the reset path, tear
         # down. ``effective_session_key``, never ``_history_key_for`` (the
         # reload handler's rule): a channel- or cron-born slot runs its turns
@@ -6775,6 +7135,10 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
         await _stack.enter_async_context(slot._model_pick_lock)
+        # Two more lock-acquisition awaits, one re-check: nothing reads
+        # ``slot`` between them, so a check after the last one covers both.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_model"):
+            return _slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel
         # routes' policy): slot ownership does not imply ownership of a
         # linked channel session, so an app caller may not switch the model
@@ -6785,7 +7149,11 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         # Checked INSIDE the locks only: a serialized predecessor targeting the
         # same model may have committed while this request waited, and acting
         # again would tear down the session that predecessor just set up.
-        if slot.model == model_name and not slot._active_fallback_model:
+        if (
+            slot.model == model_name
+            and not slot._active_fallback_model
+            and not slot._refusal_fallback_primary
+        ):
             # Same-value pick: nothing to switch, but the user's EXPLICIT
             # affirmation of this model must still be recorded — the fallback
             # restore probe reads the pick generation, and without the bump a user
@@ -6802,6 +7170,20 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # pick-the-fallback-itself case also flows through the live path,
             # where the switch is a harmless same-model set and the pick-gen bump
             # still protects the choice from the restore probe.
+            # The slot-local bump alone is invisible ACROSS aliases: two slots
+            # can drive one wire session, and the other slot's refusal-fallback
+            # restore compares the shared CLIENT's epoch, not this slot's
+            # generation. A same-value pick is still an explicit pick, so stamp
+            # the shared epoch exactly as the live-switch success path does —
+            # otherwise an alias pinned to the fallback candidate re-picks it,
+            # takes this shortcut, and the originating slot's restore silently
+            # undoes the choice.
+            _provider = state.sessions.get_provider(session_key)
+            try:
+                _host = pick_epoch_host(_provider)
+                _host._explicit_pick_epoch = getattr(_host, "_explicit_pick_epoch", 0) + 1
+            except Exception:  # pragma: no cover - a frozen/slotted stub client
+                pass
             slot._model_pick_gen += 1
             return web.json_response({"ok": True, "model": model_name})
         provider = state.sessions.get_provider(session_key)
@@ -6970,7 +7352,9 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # completion event in flight) must refuse rather than discard
             # their work. Same probe block as api_chat_slot_reload; only the
             # rollback is added here because this handler committed first.
-            children_409 = _subagents_attached_response(state, slot, session_key, "slot_model")
+            children_409 = await _subagents_attached_response(
+                state, slot, session_key, "slot_model"
+            )
             if children_409 is not None:
                 _rollback_pick()
                 return children_409
@@ -7416,6 +7800,15 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
         # alias could reset this same session concurrently.
         async with contextlib.AsyncExitStack() as _stack:
             await _stack.enter_async_context(slot._lock)
+            # Re-authorize after the await above (see
+            # _slot_replaced_while_queued): the ownership check ran on the
+            # snapshot's object, and ``name`` may now register a different
+            # slot -- another app's, or a reconnect. Reported like the
+            # rebound case below: skipped, so the caller retries against
+            # whatever the name resolves to now, never switched or failed.
+            if _slot_replaced_while_queued(state, slot, name, request, "chat.slots_model"):
+                skipped_running.append(name)
+                continue
             # The session this slot's turns run on — effective_session_key,
             # never _history_key_for (see api_chat_slot_model), resolved
             # INSIDE the lock so a binding that lands while this iteration
@@ -7429,6 +7822,11 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             # re-entering the same lock.
             await _stack.enter_async_context(_slot_switch_session_lock(session_key))
             await _stack.enter_async_context(slot._model_pick_lock)
+            # Two more lock-acquisition awaits, one re-check: nothing reads
+            # ``slot`` between them, so a check after the last one covers both.
+            if _slot_replaced_while_queued(state, slot, name, request, "chat.slots_model"):
+                skipped_running.append(name)
+                continue
             if not is_dashboard_user and session_key != _history_key_for(name):
                 # Slot ownership does not imply ownership of a linked channel
                 # session (the cancel routes' second condition): an app caller
@@ -7458,7 +7856,7 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             # running, queued, or mid-delivery is skipped rather than have
             # their work discarded — regardless of skip_running, which speaks
             # to the parent's own turn, not to its children.
-            if subagents_attached(state, slot, session_key, "slots_model"):
+            if await subagents_attached_async(state, slot, session_key, "slots_model"):
                 skipped_running.append(name)
                 continue
             # Reset before flipping the model and isolate per-slot failures: if
@@ -7609,6 +8007,11 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     # any earlier read could leave this holding the wrong session lock.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
+        # Re-authorize after the await above (see _slot_replaced_while_queued):
+        # ``name`` can be recreated for a different app while this request
+        # queued, and every read of ``slot`` below would be of the stale one.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reasoning_effort"):
+            return _slot_not_found()
         # The session the switch will probe and, on the fallback path, reset —
         # ``effective_session_key``, never ``_history_key_for`` (see
         # api_chat_slot_model): a channel- or cron-born slot runs its turns
@@ -7625,6 +8028,10 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
         # a binding landed while this request waited on slot._lock (see
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # Second lock-acquisition await, second re-check: a same-name
+        # recreate lands during this wait just as easily as during the first.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reasoning_effort"):
+            return _slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel routes'
         # policy), BEFORE the same-value fast path so the denial is
         # indistinguishable from a missing slot for every request shape.
@@ -7724,7 +8131,7 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # Children guard, shared with reload/model: the reset tears down
             # the runtime attached sub-agents run on. Nothing is committed
             # yet, so a refusal here changes nothing.
-            children_409 = _subagents_attached_response(
+            children_409 = await _subagents_attached_response(
                 state, slot, session_key, "slot_reasoning_effort"
             )
             if children_409 is not None:
@@ -7902,8 +8309,8 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # cross-slot-identity gap the tags/folders/regenerate handlers close
         # with this exact re-check (e.g. chat_tags.py's ``is not slot`` guard).
         # A mismatch here is indistinguishable from a missing slot.
-        if state._slots.get(name) is not slot:
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+            return _slot_not_found()
         # The session the reload will tear down. ``effective_session_key``,
         # never ``_history_key_for``: a channel- or cron-born slot runs its
         # turns under its linked key, and the dashboard-prefixed spelling
@@ -7925,8 +8332,8 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # above. Without this, the 7396 check would guard only the first
         # await and leave the exact gap it exists to close open on the
         # second.
-        if state._slots.get(name) is not slot:
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+            return _slot_not_found()
         # Re-derive rather than trust the captured session_key: it names a
         # MUTABLE attribute (slot.linked_session_key), so a cron/channel
         # rebind landing on the SAME slot object during the session-lock wait
@@ -7953,7 +8360,7 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # Children guard, shared with api_chat_slot_continue: RUNNING children
         # die with the parent runtime, and _subagents_attached_response
         # documents why queued children and in-flight deliveries count too.
-        denied_409 = _subagents_attached_response(state, slot, session_key, "reload")
+        denied_409 = await _subagents_attached_response(state, slot, session_key, "reload")
         if denied_409 is not None:
             return denied_409
         if _test_interleave is not None:
@@ -8004,8 +8411,8 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
         # cross-slot-identity gap the two earlier checks close, just moved to
         # this last await. Same response as those checks: a mismatch here is
         # indistinguishable from a missing slot.
-        if state._slots.get(name) is not slot:
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_reload"):
+            return _slot_not_found()
         if effective_session_key(slot) != session_key:
             return web.json_response(
                 {"error": "slot session was rebound during the switch", "code": "session_rebound"},
@@ -8081,6 +8488,11 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
     # any earlier read could leave this holding the wrong session lock.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
+        # Re-authorize after the await above (see _slot_replaced_while_queued):
+        # ``name`` can be recreated for a different app while this request
+        # queued, and every read of ``slot`` below would be of the stale one.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_workspace"):
+            return _slot_not_found()
         # The session the reset tears down — effective_session_key, never
         # _history_key_for (see api_chat_slot_model), resolved INSIDE the lock
         # so a binding that lands while this request waits on it is what the
@@ -8094,6 +8506,10 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
         # a binding landed while this request waited on slot._lock (see
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # Second lock-acquisition await, second re-check: a same-name
+        # recreate lands during this wait just as easily as during the first.
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_workspace"):
+            return _slot_not_found()
         denied = _app_cancel_denied(request, slot, "chat.slot_workspace", session_key)
         if denied is not None:
             return denied
@@ -8121,7 +8537,9 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
         # below tears down, so refuse rather than discard their work -- the
         # same probe every sibling switch (agent, model, effort, reload)
         # applies. Before the commit, so no rollback is needed.
-        children_409 = _subagents_attached_response(state, slot, session_key, "slot_workspace")
+        children_409 = await _subagents_attached_response(
+            state, slot, session_key, "slot_workspace"
+        )
         if children_409 is not None:
             return children_409
         # Never tear down an in-flight turn: the model handler's early
@@ -8946,6 +9364,535 @@ async def _live_slot_resume_response(
     return None
 
 
+# Bound for normalising the non-string ``content`` a legacy or hand-edited
+# transcript row can carry (nested dict/list of multi-part content). We do NOT
+# redact-in-place and keep the structure: two independent problems make that
+# unsafe. (1) Redacting only string LEAVES leaves dict KEYS unscrubbed, so a
+# credential sitting in a key reaches the broadcaster. (2) The downstream
+# persistence/display paths (``_build_message_entry_uncached``, ``_prepare_messages``)
+# call the string-only redactors on ``content`` directly and raise ``TypeError``
+# on a non-string, so a structured row the slot accepted cannot be saved -- the
+# crash the parent revision had is only moved, not removed. Instead we NORMALISE
+# such content to a single JSON string and redact THAT, which scrubs keys and
+# values alike and yields a row every downstream path can serialise. Bounded so
+# a corrupt/hostile row cannot blow the stack: ``json.dumps`` with a depth-safe
+# default; on any failure we fall back to a fixed placeholder rather than raise.
+# Cap on the serialised size of a normalised structured-content row. A single
+# legitimate transcript row is far below this; a serialisation larger than the
+# transfer-bounds ceiling is a malformed/hostile row and is dropped to the
+# placeholder rather than run through the GIL-held redactors.
+_STRUCTURED_CONTENT_MAX_CHARS = 20_000_000
+_STRUCTURED_CONTENT_PLACEHOLDER = "[unsupported structured content removed]"
+
+
+def _normalise_structured_content(value: object) -> str:
+    """Return a redacted STRING for a non-string ``content`` value.
+
+    Serialises the value to JSON (so nested dict keys AND values are captured as
+    text), then runs the same exfil-URL + credential redaction applied to a
+    plain string ``content``. Never raises and never returns a non-string: a
+    value that cannot be serialised (or is unexpectedly huge) collapses to a
+    fixed placeholder, which is fail-closed (no unredacted bytes escape) and
+    keeps the row serialisable by every downstream path.
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        # Must never raise: ``default=str`` invokes ``str()``/``__repr__`` on
+        # unknown objects, which a hostile/corrupt row can make raise anything
+        # (not just TypeError/ValueError). Any failure collapses to the
+        # placeholder -- fail-closed, no unredacted bytes escape.
+        return _STRUCTURED_CONTENT_PLACEHOLDER
+    # A pathologically large serialisation is dropped rather than run through the
+    # GIL-held redactors: the row is malformed either way, and a placeholder is
+    # the safe, cheap result.
+    if len(text) > _STRUCTURED_CONTENT_MAX_CHARS:
+        return _STRUCTURED_CONTENT_PLACEHOLDER
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    return text
+
+
+def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -> list[dict]:
+    """Content-redact non-user rows BEFORE construction, returning new rows.
+
+    Redaction is regex-heavy and holds the GIL, so it must run where a yield
+    corrupts nothing -- BEFORE any slot exists -- and it must be bounded by the
+    rows that actually enter the live window, not the whole transcript.
+
+    ``window_limit`` mirrors the materialiser's own windowing: only the newest
+    ``window_limit`` rows become the live window that is re-serialized on the next
+    save, so only those need redacting here. The older prefix is the FROZEN
+    prefix -- already redacted at the write boundary, left verbatim on disk, and
+    used only for ``_disk_older_count`` accounting (its content is never
+    re-serialized) -- so redacting it would be transcript-sized GIL work on the
+    loop for bytes that are never rewritten. Resume passes 500, so its cost is
+    bounded by the window regardless of transcript length; import passes ``None``
+    (every row enters the window and is persisted by its own save), and runs this
+    off the loop (``asyncio.to_thread``) so its larger pass yields freely.
+
+    Read-side redaction is DEFENSE-IN-DEPTH, not the primary protection: non-user
+    content is redacted at the write boundary (``chat_runner``), so this covers
+    rows written before a redaction rule existed, a hand-edited or legacy JSONL,
+    or any write path that bypassed the boundary. It must not be dropped.
+
+    User rows are left untouched (matching the write boundary, which redacts
+    non-user text). A non-string ``content`` (legacy/corrupt JSONL, or nested
+    multi-part content) is NORMALISED to a single redacted string by
+    ``_normalise_structured_content`` rather than being passed through
+    unredacted or kept as structure: resume is reachable for such rows precisely
+    because this pass is defense-in-depth for transcripts a write-time rule never
+    covered, so leaving a non-string row unscrubbed would let a credential in
+    nested content (a value OR a dict key) reach a broadcaster, and keeping the
+    structure would crash the downstream save/display paths that redact
+    ``content`` as a string. Row dicts in the redacted window are shallow-copied so the
+    caller's input is not mutated; a normalised structured row replaces only the
+    top-level ``content`` on the copy, so no shared nested object is touched
+    either. Prefix rows are returned as-is.
+    """
+    if window_limit is None or len(rows) <= window_limit:
+        prefix: list[dict] = []
+        window = rows
+    else:
+        prefix = rows[:-window_limit]
+        window = rows[-window_limit:]
+    out: list[dict] = list(prefix)
+    for m in window:
+        if m.get("role", "assistant") != "user":
+            content = m.get("content", "")
+            if isinstance(content, str):
+                content, _ = redact_exfiltration_urls(content)
+                content, _ = redact_credentials(content)
+                m = {**m, "content": content}
+            else:
+                # Legacy/corrupt or nested multi-part content: normalise it to a
+                # single redacted STRING (scrubbing dict keys and values alike)
+                # rather than passing the structure through. Keeping the structure
+                # would (a) leave dict keys unredacted and (b) crash the downstream
+                # save/display paths, which call the string-only redactors on
+                # ``content``. See ``_normalise_structured_content``.
+                m = {**m, "content": _normalise_structured_content(content)}
+        out.append(m)
+    return out
+
+
+def _materialise_slot_from_history(
+    state: DashboardState,
+    *,
+    name: str | None,
+    history_key: str,
+    meta: dict,
+    all_messages: list[dict],
+    app: str = "",
+    request_title: str = "",
+    member_binding: dict | None = None,
+    folder_unhidden: bool = True,
+    folder_checked_id: str = "",
+    window_limit: int | None = 500,
+    disk_meta_observed: bool = True,
+    broadcast_rows: bool = True,
+    mint_missing_mids: bool = False,
+) -> _ChatSlot:
+    """Build and hydrate a slot from a persisted history snapshot, UNPUBLISHED.
+
+    This is the single materialisation path shared by two callers: the History
+    resume endpoint (:func:`api_chat_slot_resume`) and the transfer importer
+    (:func:`~kiro_crew.dashboard.session_transfer.api_chat_slot_import`). Install
+    lands the transcript, metadata line and Layer B on disk and then routes
+    through here, so "install a session" and "pull a stale session up off disk"
+    are the SAME operation rather than two slot-construction paths that drift.
+
+    The inputs are exactly the intersection the two callers share: a resolved
+    slot key, the transcript key, a validated metadata snapshot, and the loaded
+    transcript rows. It reads nothing from the request, and — this is the
+    load-bearing constraint of the fold (RFC section 7.1b) — it applies exactly
+    the metadata field set resume applies and DOES NOT apply
+    ``executor`` / ``instance_id`` / ``remote_slot``. A session bound to a remote
+    instance therefore comes back LOCAL when materialised here, which is the
+    behaviour to preserve: rehydrating the remote binding is the startup restore
+    path's job (``_rehydrate_slot_from_history`` in chat_persistence), not this
+    one. Do not add remote-binding application here "for consistency" — that is
+    the prohibited change, and it is pinned by a test.
+
+    ``member_binding`` / ``folder_unhidden`` / ``folder_checked_id`` are verdicts
+    the RESUME guards produce; import passes their no-op defaults (no member key,
+    no folder to unhide). ``request_title`` is resume's client-supplied name,
+    used only when the persisted metadata carries no title; import writes its
+    marked title into the metadata line and passes ``""`` here.
+
+    ``window_limit`` and ``disk_meta_observed`` are facts about the DATA, not
+    caller switches. ``window_limit`` is how many newest rows to surface as the
+    live window given that earlier rows are already durable elsewhere: resume's
+    rows are a window onto a longer on-disk transcript (cap 500, the rest frozen
+    on disk), import's rows exist only in memory and are ALL persisted by its own
+    save (``None`` = surface every row, ``_disk_older_count`` falls out as 0).
+    ``disk_meta_observed`` is whether this hydration read an existing transcript
+    off disk: resume did (True), import synthesised its metadata (False), and it
+    gates the delete-won disk-identity bookkeeping that only means something for a
+    real disk read.
+
+    ``broadcast_rows`` and ``mint_missing_mids`` are likewise facts about the
+    rows. ``broadcast_rows`` is whether hydrating a row should emit a live
+    ``chat_message`` SSE event: resume is an interactive open (True), import is a
+    silent replay of a bundle onto a slot that stays REGISTERED and under
+    construction throughout its (synchronous) hydration and is retracted from
+    ``_slots`` only afterwards, for the async finalization tail; import passes
+    False (matching the tunnel importer and the ``append`` docstring's
+    list of replay callers) — broadcasting would push an under-construction
+    slot's peer content to every client and retire live question cards. ``mint_missing_mids``
+    is whether these rows need message ids minted: resume's disk rows already
+    carry mids (False), import's bundle rows have none, so it passes True or the
+    imported rows land permanently id-less and drop out of mid-keyed features.
+
+    Loads NOTHING itself: ``all_messages`` is handed in ALREADY CONTENT-REDACTED
+    by the caller's pre-construction pass (``_redact_history_rows``), because the
+    two callers answer "where do the bytes come from" differently — resume reads
+    the disk transcript under its own TOCTOU ordering, import redacts and lands
+    the bundle. It returns the slot built and hydrated but NOT yet published: it
+    stays REGISTERED in ``state._slots`` (so a concurrent same-key resume resolves
+    it and dedups) and is held under ``begin_slot_construction``, which keeps it
+    out of the serialized payload. Each caller owns its own admission accounting
+    and must, at its own tail, call ``end_slot_construction(slot.key)`` and
+    ``push_slots_update()`` exactly once to make it visible.
+
+    SYNCHRONOUS. Construction contains no ``await``: content redaction (the only
+    regex-heavy, GIL-holding, content-scaling work) runs in the caller's
+    pre-construction pass, BEFORE any slot exists, where a yield can corrupt
+    nothing. The remaining loop is append + provenance + variant attach, measured
+    at single-digit milliseconds even at the transfer bounds (5,000 rows / 20M
+    chars) — far under the loop-stall watchdog. Being synchronous is what makes
+    the slot unobservable mid-build: no acquirer, serializer or persister runs
+    between ``begin_slot_construction`` and ``end_slot_construction`` on the loop,
+    and construction is loop-affine (threaded persistence snapshots the window on
+    the loop first), so no half-hydrated window is ever seen — no guard needed.
+    """
+    # Create the slot and mark it under construction inside ONE synchronous
+    # ``suspend_slots_push`` block. ``get_or_create_slot`` registers the slot and
+    # fires a leading-edge ``push_slots_update()`` before it returns; deferring
+    # that push until ``begin_slot_construction`` has run means the single
+    # coalesced broadcast at block exit serializes the slot as already under
+    # construction, so ``serialize_slots`` hides it. Both statements are
+    # synchronous — no ``await`` inside — so the process-global suspend counter is
+    # never held across a yield (holding it across the hydrate loop's yields would
+    # swallow every other slot mutation on the gateway for the duration).
+    # Rollback-protected region covers creation, the construction mark, AND the
+    # ``suspend_slots_push`` block exit: that exit flushes the deferred
+    # ``push_slots_update()``, which can raise on a pre-existing poisoned slot
+    # (a non-serializable field) BEFORE hydration begins. If any of it raises,
+    # the except path releases the construction count and drops the slot, so a
+    # failed materialisation never leaks a hidden-but-registered slot that
+    # consumes capacity for the process lifetime. ``slot`` may be unbound if
+    # ``get_or_create_slot`` itself raised (e.g. the under-construction create
+    # guard), so the rollback is conditional on it existing.
+    slot = None
+    try:
+        with state.suspend_slots_push():
+            slot = state.get_or_create_slot(
+                name,
+                app=app,
+                # The BINDING is the pin's authority on a member key — not the
+                # transcript's own metadata (the guard above verified identity
+                # structurally; metadata lives in the same operator-editable file it
+                # would otherwise re-pin from). Passing mode="member" here is also
+                # what admits the key through the constructor's reservation.
+                agent=(member_binding or {}).get("member", ""),
+                mode=members_mod.DM_SLOT_MODE if member_binding is not None else "",
+                # Resuming an existing channel transcript from History is an adoption
+                # of that conversation, so the tab is channel-origin even when the
+                # session map cannot name its session.
+                channel_origin=is_channel_session_key(history_key),
+                origin=str(meta.get("origin", "")),
+            )
+            # Keep the slot REGISTERED in ``state._slots`` throughout hydration, and
+            # mark it under construction BEFORE the block's coalesced push flushes.
+            # Registration is what gives F1: a concurrent resume of the same key
+            # resolves THIS slot and hits the idempotency guard, rather than minting a
+            # second slot that would receive this one's transcript. Visibility is
+            # handled at the payload, not by removing the slot: ``serialize_slots``
+            # omits a slot whose key is in ``_slots_under_construction``, so no frame
+            # — not even the creation frame deferred to this block's exit — advertises
+            # a tab that resolves to nothing. The builder ends construction and pushes
+            # once when the session is genuinely ready (for import, after Layer B is
+            # joined), and the first frame any client sees shows a hydrated session.
+            state.begin_slot_construction(slot.key)
+        # The whole fallible body (the block above's exit flush, plus redaction
+        # over up to the transfer bounds of peer content and metadata application)
+        # runs under this try: a raise would otherwise leak the reservation
+        # permanently and inflate the live-slot cap for the process lifetime.
+        _hydrate_slot_from_history(
+            state,
+            slot,
+            meta=meta,
+            all_messages=all_messages,
+            request_title=request_title,
+            member_binding=member_binding,
+            folder_unhidden=folder_unhidden,
+            folder_checked_id=folder_checked_id,
+            window_limit=window_limit,
+            disk_meta_observed=disk_meta_observed,
+            broadcast_rows=broadcast_rows,
+            mint_missing_mids=mint_missing_mids,
+        )
+    except BaseException:
+        # ``slot`` is None if ``get_or_create_slot`` itself raised (nothing was
+        # reserved). Otherwise release the construction count, drop the slot from
+        # ``_slots`` so a half-built registration does not linger, and discard any
+        # ``_restricted_keys`` marker hydration added (non-persistent session) —
+        # else a later session at this key is left incorrectly blocked from memory
+        # operations. Discard is the full undo: the key belongs to this
+        # freshly-constructed slot, so nothing else owns its membership.
+        if slot is not None:
+            state.end_slot_construction(slot.key)
+            state._slots.pop(slot.key, None)
+            state._restricted_keys.discard(f"dashboard:{slot.key}")
+        raise
+    # DELIBERATELY does NOT end construction on success -- the caller ends it at
+    # its own tail, after its finalization (import awaits Layer B write/join + a
+    # durable save with the slot RETRACTED from ``_slots``). This asymmetry is
+    # load-bearing, not an oversight: the create-path guard in
+    # ``get_or_create_slot`` refuses a mint whose key is in
+    # ``_slots_under_construction``, which is the ONLY thing stopping a named
+    # create on the predictable minted key from hijacking the retracted slot's
+    # Layer B session during that window. Adding ``end_slot_construction`` here
+    # would clear the mark before the tail and silently disable that security
+    # guard while every happy-path test still passes. Do not.
+    return slot
+
+
+def _hydrate_slot_from_history(
+    state: DashboardState,
+    slot: _ChatSlot,
+    *,
+    meta: dict,
+    all_messages: list[dict],
+    request_title: str = "",
+    member_binding: dict | None = None,
+    folder_unhidden: bool = True,
+    folder_checked_id: str = "",
+    window_limit: int | None = 500,
+    disk_meta_observed: bool = True,
+    broadcast_rows: bool = True,
+    mint_missing_mids: bool = False,
+) -> None:
+    """Apply persisted metadata to *slot* and hydrate its message window.
+
+    The fallible half of :func:`_materialise_slot_from_history`, split out so the
+    caller can wrap it in the construction-count try/except above. Sets the same
+    metadata field set resume has always applied and never the remote binding
+    (RFC 7.1b); see the parameter docs on the public function.
+    """
+    # PERSISTED METADATA IS AUTHORITATIVE for the title. The sidebar's resume
+    # call always sends a ``title`` (see website/src/api/client.ts
+    # resumeChatSlot: ``title: title || key``), and that value is client
+    # chrome — often a STALE echo of an older name (a notification deep link,
+    # a sidebar row rendered before a background refresh landed). Classifying
+    # request titles (echo vs override) is unwinnable against staleness: a
+    # stale echo is indistinguishable from a deliberate override. So the
+    # request title is used ONLY when no persisted title exists; otherwise the
+    # persisted title and its provenance are restored exactly like the
+    # chat_persistence loaders (resume is the THIRD hydration path).
+    # Reuse the SNAPSHOT the guard above validated. A second get_metadata here
+    # would re-read the file, and a write between the two reads would hydrate
+    # values the guard never saw (validate-A / hydrate-B).
+    raw_persisted_title = meta.get("title")
+    # Accept the persisted title only when it is a string: a legacy or
+    # hand-corrupted JSONL could carry a non-string here, and redacting it
+    # would raise TypeError and 500 the resume. Non-string == absent.
+    persisted_title = raw_persisted_title if isinstance(raw_persisted_title, str) else ""
+    title = request_title
+    if persisted_title:
+        _rehydrate_slot_title(
+            slot,
+            persisted_title,
+            titled=True,
+            metadata=meta,
+        )
+    elif title:
+        # Never-titled session with a caller-supplied name: apply it, with
+        # conservative "user" provenance (unknown origin — the background
+        # refresh must never rewrite it) and an epoch bump so any in-flight
+        # background attempt stands down.
+        slot.title = title
+        slot._titled = True
+        slot._title_origin = "user"
+        slot._title_epoch += 1
+    # else: untitled on disk and no caller name — leave the slot untitled
+    # (mirrors _rehydrate_slot_from_history: ``_titled = bool(meta title)``),
+    # so the auto-titler can still name it on the next turn.
+    if meta.get("created_at"):
+        slot.created_at = meta["created_at"]
+    # Disk-identity bookkeeping for the delete-won guard in
+    # ``_save_slot_to_history``: it recognises a transcript recreated by another
+    # writer after a permanent delete, which is only meaningful when this
+    # hydration READ an existing on-disk transcript. Resume did
+    # (``disk_meta_observed=True``); import synthesised its metadata in memory
+    # and has no pre-existing file, so it passes ``False`` and the guard stays
+    # dormant rather than comparing against a disk read that never happened. The
+    # observed bit also records that a read occurred even when the metadata
+    # carried no ``created_at`` (legacy files), so the guard's evidence gate does
+    # not treat a real resume as never-hydrated.
+    slot._disk_meta_created_at = str(meta.get("created_at") or "") if disk_meta_observed else ""
+    slot._disk_meta_observed = disk_meta_observed and bool(meta)
+    # This slot's memory assignment comes from restored history, not a fresh
+    # private assignment -- true for every hydration-from-a-persisted-transcript
+    # path (resume, the persistence loaders, channel/member/cron restores) and
+    # equally for an import, which materialises from a bundle transcript. The
+    # runner reads it when selecting the memory binding; the flag is not
+    # persisted in the transcript, so it must be set on each hydration.
+    slot._memory_assignment_from_history = True
+    # On a member key the pin came from the BINDING at slot creation above and
+    # metadata may not override it (same tamperable file the guard refused to
+    # trust). On an ordinary key, mode="member" may not ride in either — the
+    # guard already 409s that shape, so this arm only defends a same-request
+    # inconsistency.
+    if member_binding is None:
+        if meta.get("agent"):
+            slot.agent = meta["agent"]
+        # Same fold as the two persistence loaders: a retired mode (``crew``)
+        # comes back as plain chat, so the ``surface`` this handler returns is
+        # one the chat page can render rather than a value it dropped.
+        _mode = _restored_mode(meta.get("mode"))
+        if _mode and _mode != members_mod.DM_SLOT_MODE:
+            slot.mode = _mode
+    if meta.get("workspace"):
+        slot.workspace = meta["workspace"]
+    if meta.get("project"):
+        slot.project = meta["project"]
+    if meta.get("channel_folder_filed"):
+        # Resuming from History must carry the filing marker forward, or the
+        # next save of this slot drops it and the conversation is re-filed.
+        slot._channel_folder_filed = True
+    if meta.get("folder_id"):
+        slot.folder_id = meta["folder_id"]
+        # Re-engaging a hidden empty folder (Model B) un-hides it so it stays
+        # visible until the user hides it again. A folder deleted since this
+        # session was last saved leaves the stored id dangling; drop it so the
+        # resumed session is plainly unfiled instead of pointing at nothing.
+        #
+        # Only when the verdict is ABOUT this folder. ``_unhide_folder`` reports
+        # existence from inside the folder-store lock precisely because a check
+        # made outside it can go stale, so re-deriving one here against
+        # ``state._folders`` is the race its own docstring warns about; and it
+        # cannot simply be re-run, because a second await here would reopen the
+        # publish-to-hydrate window this ordering exists to close. Holding no
+        # verdict for a newly filed id, we KEEP it: a dangling id is visible and
+        # self-corrects on the next folder operation, whereas erasing a live
+        # filing is silent and indistinguishable from the user unfiling the
+        # session -- and the dirty-slot flush would then persist that erasure.
+        if not folder_unhidden and meta["folder_id"] == folder_checked_id:
+            slot.folder_id = ""
+    if meta.get("pinned"):
+        slot.pinned = True
+    if meta.get("color_index") is not None:
+        slot.color_index = meta["color_index"]
+    _ch = meta.get("color_hex")
+    if isinstance(_ch, str) and COLOR_HEX_RE.match(_ch):
+        slot.color_hex = _ch.lower()
+    if meta.get("color_theme"):
+        slot.color_theme = meta["color_theme"]
+        slot.theme_consent = meta.get("theme_consent") is True
+        # Restore from history metadata: re-run the same fail-closed normalizer
+        # so a tampered/legacy JSONL can't seed a malformed sha that later
+        # crashes the compare.
+        slot.theme_consent_sha = normalize_theme_consent_sha(meta.get("theme_consent_sha"))
+    if meta.get("autocompact_pct") is not None:
+        # Restore the per-session compaction threshold, mirroring the
+        # persistence loaders: without this, a resumed slot's field stays None
+        # and the next save overwrites the persisted override with null, while
+        # the live gate silently falls back to the global.
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
+    # Restore tags + the auto-tag once-flag (mirrors the persistence loaders).
+    # Without the flag, resuming a session whose auto-tag the user removed
+    # would re-run maybe_auto_tag on the next message and silently re-add it.
+    raw_tags = meta.get("tags")
+    if isinstance(raw_tags, list):
+        slot.tags = [str(t) for t in raw_tags if isinstance(t, str) and t]
+        # Prune ids missing from the vocabulary (crash-atomic delete leaves
+        # dangling ids on disk; see api_chat_tag_delete). FAIL-OPEN only when
+        # the vocabulary is UNKNOWN (tags.json parse/I/O failure) — pruning
+        # then would wipe every assignment. A legitimately-empty vocabulary
+        # is authoritative and must prune dangling ids.
+        if getattr(state, "_tags_authoritative", True):
+            known = {t.get("id") for t in state._tags}
+            slot.tags = [t for t in slot.tags if t in known]
+        # Bump the tags revision so the first published frame advertises a fresh
+        # revision for the tags just applied (invariant: tags change => revision
+        # change). Pure counter rotation, no broadcast -- safe under construction;
+        # the single push at the caller's tail carries the bumped revision.
+        _bump_slot_tags_revision(slot)
+    if meta.get("auto_tagged"):
+        slot._auto_tagged = True
+    mm = meta.get("memory_mode", "persistent")
+    slot.memory_mode = mm
+    # ``slot.key``, not the ``name`` parameter: import mints its key inside
+    # ``get_or_create_slot`` (name=None), so only ``slot.key`` names the slot
+    # after creation. For resume the two are identical (resume passes the
+    # resolved key), so this changes nothing there.
+    if mm != "persistent":
+        state._restricted_keys.add(f"dashboard:{slot.key}")
+    else:
+        state._restricted_keys.discard(f"dashboard:{slot.key}")
+    if meta.get("forked_from") is not None:
+        slot.forked_from = meta["forked_from"]
+    disk_total = len(all_messages)
+    # ``window_limit`` is a fact about the data, not a caller switch: how many of
+    # the newest rows to surface as the live window, given that any rows before
+    # it are ALREADY DURABLE somewhere the next save will not rewrite. Resume's
+    # rows are a window onto a longer on-disk transcript, so it caps at 500 and
+    # the earlier rows stay frozen on disk. Import's rows exist only in memory
+    # and are ALL persisted by the caller's save below, so nothing is "older on
+    # disk": it passes ``None`` (surface every row) and ``_disk_older_count``
+    # falls out as 0. Applying resume's cap to import would drop every row past
+    # the last 500 and claim a frozen prefix of rows that were never written.
+    if window_limit is None or disk_total <= window_limit:
+        messages = all_messages
+    else:
+        messages = all_messages[-window_limit:]
+    # Stable count of messages older than what we loaded into memory
+    slot._disk_older_count = max(0, disk_total - len(messages))
+    # Durable-only view of the same prefix, recomputed from the on-disk rows —
+    # the base absolute message positions are built over. ``islice`` avoids
+    # copying the whole prefix on the event loop. See _ChatSlot.__init__.
+    slot._disk_older_durable_count = durable_row_count(islice(all_messages, slot._disk_older_count))
+    # Synchronous construction: rows arrive already content-redacted from the
+    # caller's pre-construction pass (resume redacts its window, import redacts
+    # its bundle before any slot exists), so this loop does only append,
+    # provenance and variant attach and holds the loop for single-digit
+    # milliseconds even at the transfer bounds. No slot is observable mid-build
+    # because there is no await between begin- and end-construction, so no
+    # acquirer, serializer or persister can see a half-hydrated window. Content
+    # arrives pre-redacted; ``_redact_meta_for_role`` still runs here (bounded by
+    # meta, not content) and ``_attach_variants`` redacts variant content (bounded
+    # by variant count).
+    for m in messages:
+        role = m.get("role", "assistant")
+        cls = "msg msg-u" if role == "user" else "msg msg-a"
+        content = m.get("content", "")
+        slot.append(
+            role,
+            content,
+            cls,
+            ts=m.get("ts", ""),
+            broadcast=broadcast_rows,
+            meta=(
+                _redact_meta_for_role(role, m["meta"]) if isinstance(m.get("meta"), dict) else None
+            ),
+            mint_mid=mint_missing_mids,
+        )
+        # See the equivalent call in _rehydrate_slot_from_history: resume loads
+        # the window that the next save re-serializes.
+        carry_provenance(slot.messages[-1], m)
+        _attach_variants(slot, m)
+    slot.drain()
+    slot._resumed_count = len(slot.messages)
+    # Loaded window is the on-disk window region; older lines (in
+    # _disk_older_count above) are the frozen prefix saves never rewrite,
+    # so older on-disk turns are preserved.
+    slot._disk_window_len = len(slot.messages)
+
+
 async def api_chat_slot_resume(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/resume — load a history session into a slot."""
     state: DashboardState = request.app["state"]
@@ -9320,201 +10267,32 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             status=409,
         )
 
-    slot = state.get_or_create_slot(
-        name,
+    # Redact only the newest 500 rows -- the live window the next save
+    # re-serializes -- before construction. The older frozen prefix is already
+    # redacted on disk and only counted, never rewritten, so redacting it would
+    # put transcript-sized GIL regex on the loop for bytes that never change.
+    # Bounded by the window, so a long transcript costs the same as a short one.
+    all_messages = _redact_history_rows(all_messages, window_limit=500)
+    slot = _materialise_slot_from_history(
+        state,
+        name=name,
+        history_key=history_key,
+        meta=meta,
+        all_messages=all_messages,
         app=request.get("app", ""),
-        # The BINDING is the pin's authority on a member key — not the
-        # transcript's own metadata (the guard above verified identity
-        # structurally; metadata lives in the same operator-editable file it
-        # would otherwise re-pin from). Passing mode="member" here is also
-        # what admits the key through the constructor's reservation.
-        agent=(_member_binding or {}).get("member", ""),
-        mode=members_mod.DM_SLOT_MODE if _member_binding is not None else "",
-        # Resuming an existing channel transcript from History is an adoption of
-        # that conversation, so the tab is channel-origin even when the session
-        # map can no longer name its session.
-        channel_origin=is_channel_session_key(history_key),
-        origin=str(meta.get("origin", "")),
+        request_title=body.get("title", ""),
+        member_binding=_member_binding,
+        folder_unhidden=folder_unhidden,
+        folder_checked_id=folder_checked_id,
     )
-    # PERSISTED METADATA IS AUTHORITATIVE for the title. The sidebar's resume
-    # call always sends a ``title`` (see website/src/api/client.ts
-    # resumeChatSlot: ``title: title || key``), and that value is client
-    # chrome — often a STALE echo of an older name (a notification deep link,
-    # a sidebar row rendered before a background refresh landed). Classifying
-    # request titles (echo vs override) is unwinnable against staleness: a
-    # stale echo is indistinguishable from a deliberate override. So the
-    # request title is used ONLY when no persisted title exists; otherwise the
-    # persisted title and its provenance are restored exactly like the
-    # chat_persistence loaders (resume is the THIRD hydration path).
-    # Reuse the SNAPSHOT the guard above validated. A second get_metadata here
-    # would re-read the file, and a write between the two reads would hydrate
-    # values the guard never saw (validate-A / hydrate-B).
-    raw_persisted_title = meta.get("title")
-    # Accept the persisted title only when it is a string: a legacy or
-    # hand-corrupted JSONL could carry a non-string here, and redacting it
-    # would raise TypeError and 500 the resume. Non-string == absent.
-    persisted_title = raw_persisted_title if isinstance(raw_persisted_title, str) else ""
-    title = body.get("title", "")
-    if persisted_title:
-        _rehydrate_slot_title(
-            slot,
-            persisted_title,
-            titled=True,
-            metadata=meta,
-        )
-    elif title:
-        # Never-titled session with a caller-supplied name: apply it, with
-        # conservative "user" provenance (unknown origin — the background
-        # refresh must never rewrite it) and an epoch bump so any in-flight
-        # background attempt stands down.
-        slot.title = title
-        slot._titled = True
-        slot._title_origin = "user"
-        slot._title_epoch += 1
-    # else: untitled on disk and no caller name — leave the slot untitled
-    # (mirrors _rehydrate_slot_from_history: ``_titled = bool(meta title)``),
-    # so the auto-titler can still name it on the next turn.
-    if meta.get("created_at"):
-        slot.created_at = meta["created_at"]
-    # The identity of the transcript this resume read — lets a later save
-    # recognize a file recreated by another writer after a permanent delete
-    # (the delete-won guard in ``_save_slot_to_history``). The observed bit
-    # records that a hydration READ happened even when the metadata carries
-    # no created_at (legacy files): without it, the guard's evidence gate
-    # treats the slot as never-hydrated and skips the delete-won comparison.
-    slot._disk_meta_created_at = str(meta.get("created_at") or "")
-    slot._disk_meta_observed = bool(meta)
-    slot._memory_assignment_from_history = True
-    # On a member key the pin came from the BINDING at slot creation above and
-    # metadata may not override it (same tamperable file the guard refused to
-    # trust). On an ordinary key, mode="member" may not ride in either — the
-    # guard already 409s that shape, so this arm only defends a same-request
-    # inconsistency.
-    if _member_binding is None:
-        if meta.get("agent"):
-            slot.agent = meta["agent"]
-        # Same fold as the two persistence loaders: a retired mode (``crew``)
-        # comes back as plain chat, so the ``surface`` this handler returns is
-        # one the chat page can render rather than a value it dropped.
-        _mode = _restored_mode(meta.get("mode"))
-        if _mode and _mode != members_mod.DM_SLOT_MODE:
-            slot.mode = _mode
-    if meta.get("workspace"):
-        slot.workspace = meta["workspace"]
-    if meta.get("project"):
-        slot.project = meta["project"]
-    if meta.get("channel_folder_filed"):
-        # Resuming from History must carry the filing marker forward, or the
-        # next save of this slot drops it and the conversation is re-filed.
-        slot._channel_folder_filed = True
-    if meta.get("folder_id"):
-        slot.folder_id = meta["folder_id"]
-        # Re-engaging a hidden empty folder (Model B) un-hides it so it stays
-        # visible until the user hides it again. A folder deleted since this
-        # session was last saved leaves the stored id dangling; drop it so the
-        # resumed session is plainly unfiled instead of pointing at nothing.
-        #
-        # Only when the verdict is ABOUT this folder. ``_unhide_folder`` reports
-        # existence from inside the folder-store lock precisely because a check
-        # made outside it can go stale, so re-deriving one here against
-        # ``state._folders`` is the race its own docstring warns about; and it
-        # cannot simply be re-run, because a second await here would reopen the
-        # publish-to-hydrate window this ordering exists to close. Holding no
-        # verdict for a newly filed id, we KEEP it: a dangling id is visible and
-        # self-corrects on the next folder operation, whereas erasing a live
-        # filing is silent and indistinguishable from the user unfiling the
-        # session -- and the dirty-slot flush would then persist that erasure.
-        if not folder_unhidden and meta["folder_id"] == folder_checked_id:
-            slot.folder_id = ""
-    if meta.get("pinned"):
-        slot.pinned = True
-    if meta.get("color_index") is not None:
-        slot.color_index = meta["color_index"]
-    _ch = meta.get("color_hex")
-    if isinstance(_ch, str) and COLOR_HEX_RE.match(_ch):
-        slot.color_hex = _ch.lower()
-    if meta.get("color_theme"):
-        slot.color_theme = meta["color_theme"]
-        slot.theme_consent = meta.get("theme_consent") is True
-        # Restore from history metadata: re-run the same fail-closed normalizer
-        # so a tampered/legacy JSONL can't seed a malformed sha that later
-        # crashes the compare.
-        slot.theme_consent_sha = normalize_theme_consent_sha(meta.get("theme_consent_sha"))
-    if meta.get("autocompact_pct") is not None:
-        # Restore the per-session compaction threshold, mirroring the
-        # persistence loaders: without this, a resumed slot's field stays None
-        # and the next save overwrites the persisted override with null, while
-        # the live gate silently falls back to the global.
-        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
-        if slot.autocompact_pct is not None and state.sessions:
-            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
-    # Restore tags + the auto-tag once-flag (mirrors the persistence loaders).
-    # Without the flag, resuming a session whose auto-tag the user removed
-    # would re-run maybe_auto_tag on the next message and silently re-add it.
-    raw_tags = meta.get("tags")
-    if isinstance(raw_tags, list):
-        slot.tags = [str(t) for t in raw_tags if isinstance(t, str) and t]
-        # Prune ids missing from the vocabulary (crash-atomic delete leaves
-        # dangling ids on disk; see api_chat_tag_delete). FAIL-OPEN only when
-        # the vocabulary is UNKNOWN (tags.json parse/I/O failure) — pruning
-        # then would wipe every assignment. A legitimately-empty vocabulary
-        # is authoritative and must prune dangling ids.
-        if getattr(state, "_tags_authoritative", True):
-            known = {t.get("id") for t in state._tags}
-            slot.tags = [t for t in slot.tags if t in known]
-        # This slot is live and already broadcast: its tags just changed, so
-        # its revision must too (invariant "tags changed => revision changed"),
-        # or a client holding an accepted overlay keyed on the old revision
-        # would pin it until the next mutation.
-        _bump_slot_tags_revision(slot)
-    if meta.get("auto_tagged"):
-        slot._auto_tagged = True
-    mm = meta.get("memory_mode", "persistent")
-    slot.memory_mode = mm
-    if mm != "persistent":
-        state._restricted_keys.add(f"dashboard:{name}")
-    else:
-        state._restricted_keys.discard(f"dashboard:{name}")
-    if meta.get("forked_from") is not None:
-        slot.forked_from = meta["forked_from"]
-    disk_total = len(all_messages)
-    max_resume = 500
-    messages = all_messages[-max_resume:] if disk_total > max_resume else all_messages
-    # Stable count of messages older than what we loaded into memory
-    slot._disk_older_count = max(0, disk_total - len(messages))
-    # Durable-only view of the same prefix, recomputed from the on-disk rows —
-    # the base absolute message positions are built over. ``islice`` avoids
-    # copying the whole prefix on the event loop. See _ChatSlot.__init__.
-    slot._disk_older_durable_count = durable_row_count(islice(all_messages, slot._disk_older_count))
-    for m in messages:
-        role = m.get("role", "assistant")
-        cls = "msg msg-u" if role == "user" else "msg msg-a"
-        content = m.get("content", "")
-        if role != "user":
-            content, _ = redact_exfiltration_urls(content)
-            content, _ = redact_credentials(content)
-        slot.append(
-            role,
-            content,
-            cls,
-            ts=m.get("ts", ""),
-            meta=(
-                _redact_meta_for_role(role, m["meta"]) if isinstance(m.get("meta"), dict) else None
-            ),
-            mint_mid=False,
-        )
-        # See the equivalent call in _rehydrate_slot_from_history: resume loads
-        # the window that the next save re-serializes.
-        carry_provenance(slot.messages[-1], m)
-        _attach_variants(slot, m)
-    slot.drain()
-    slot._resumed_count = len(slot.messages)
-    # Loaded window is the on-disk window region; older lines (in
-    # _disk_older_count above) are the frozen prefix saves never rewrite,
-    # so older on-disk turns are preserved.
-    slot._disk_window_len = len(slot.messages)
-    total = disk_total
+    total = len(all_messages)
     recent = slot.messages[-200:] if len(slot.messages) > 200 else slot.messages
+    # The slot was registered throughout hydration (so a concurrent same-key
+    # resume resolved it and hit the idempotency guard) but hidden from the
+    # payload while under construction. End construction and push once: this is
+    # the first frame any client sees, and it shows a fully hydrated session.
+    # Nothing awaits between here and the response.
+    state.end_slot_construction(slot.key)
     _sync_dashboard_slots(state)
     state.push_slots_update()
     return web.json_response(

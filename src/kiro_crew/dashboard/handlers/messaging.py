@@ -16,6 +16,7 @@ from typing import Any, Callable, cast
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
@@ -206,6 +207,20 @@ async def _spawn_scope_refusal(
     return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
 
 
+async def _spawn_request_memory_mode(
+    state: DashboardState, request: web.Request, parent: str
+) -> str:
+    from kiro_crew.dashboard.handlers._shared import resolve_session_memory_mode
+    from kiro_crew.messaging.privacy_mode import strictest
+
+    parent_mode = await resolve_session_memory_mode(state, parent)
+    caller = request.headers.get("X-Session-Key", "")
+    caller_mode = (
+        parent_mode if caller == parent else await resolve_session_memory_mode(state, caller)
+    )
+    return strictest((parent_mode, caller_mode)) or "persistent"
+
+
 async def api_spawn(request: web.Request) -> web.Response:
     """POST /api/spawn — spawn a subagent.
 
@@ -258,6 +273,16 @@ async def api_spawn(request: web.Request) -> web.Response:
     )
     if refusal is not None:
         return refusal
+    try:
+        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
+    except (OSError, ValueError):
+        return web.json_response(
+            {
+                "error": "The originating session's memory mode is unavailable.",
+                "code": "memory_unavailable",
+            },
+            status=409,
+        )
     # approval_mode and silent are HTTP API parameters passed by the SDK,
     # NOT MCP tool arguments from the LLM.  The LLM's spawn_run tool
     # (mcp_core.py) does not expose these params — they are added by the
@@ -386,7 +411,8 @@ async def api_spawn(request: web.Request) -> web.Response:
     # on-loop, cache-only agent validation inside spawn() is a hit.
     if agent:
         await warm_project_agents_for_spawn(state, cwd)
-    info = state.subagents.spawn(
+    info = await _spawn_on_loop(
+        state,
         task,
         parent_session_key=parent_session,
         agent=agent,
@@ -403,6 +429,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         include_lessons=cleaned.get("include_lessons", True) is not False,
         include_project=cleaned.get("include_project", True) is not False,
         memory_store=child_memory_store,
+        _memory_mode=admitted_mode,
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -466,6 +493,54 @@ async def api_spawn(request: web.Request) -> web.Response:
     return web.json_response(resp)
 
 
+async def _spawn_on_loop(state: "DashboardState", task: str, **kwargs: Any) -> Any:
+    """Spawn from an async handler WITHOUT blocking the loop on the task store.
+
+    ``SubagentManager.spawn_async`` writes the durable row on the store's
+    writer thread and only then starts the run (write-before-ack, off-loop).
+    A manager without that entry -- a test double -- is spawned synchronously,
+    which is the pre-queue behaviour those doubles model.
+    """
+    import inspect
+
+    subagents = state.subagents
+    assert subagents is not None  # every caller checked ``state.subagents`` first
+    spawn_async = getattr(subagents, "spawn_async", None)
+    if inspect.iscoroutinefunction(spawn_async):
+        return await spawn_async(task, **kwargs)
+    return subagents.spawn(task, **kwargs)
+
+
+async def _continue_on_loop(state: "DashboardState", conv_id: str, task: str, **kwargs: Any) -> Any:
+    """:func:`_spawn_on_loop` for continuations: ``continue_conversation_async``
+    writes the durable row off-loop; a double without it continues synchronously."""
+    import inspect
+
+    subagents = state.subagents
+    assert subagents is not None
+    continue_async = getattr(subagents, "continue_conversation_async", None)
+    if inspect.iscoroutinefunction(continue_async):
+        return await continue_async(conv_id, task, **kwargs)
+    return subagents.continue_conversation(conv_id, task, **kwargs)
+
+
+def _native_child_refusal(state: "DashboardState", conversation_id: str) -> str | None:
+    """Typed reason when *conversation_id* is a harness-native child of a live
+    session (kiro-cli ``use_subagent`` / KAS subtask), else None."""
+    probe = getattr(state.subagents, "native_child_resume_refusal", None)
+    if not callable(probe):
+        return None
+    try:
+        reason = probe(conversation_id)
+    except Exception:  # noqa: BLE001 - advisory lookup
+        return None
+    # A typed refusal is a str with the known prefix; anything else (a test
+    # double's attribute, a stray object) is not a refusal.
+    if isinstance(reason, str) and reason.startswith(NATIVE_CHILD_NOT_RESUMABLE):
+        return reason
+    return None
+
+
 async def api_spawn_continue(request: web.Request) -> web.Response:
     """POST /api/spawn/{agent_id}/continue — follow-up turn on a conversation.
 
@@ -491,6 +566,16 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     refusal = await _spawn_scope_refusal(request, claimed_session=parent_session)
     if refusal is not None:
         return refusal
+    try:
+        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
+    except (OSError, ValueError):
+        return web.json_response(
+            {
+                "error": "The originating session's memory mode is unavailable.",
+                "code": "memory_unavailable",
+            },
+            status=409,
+        )
     agent = str(body.get("agent", "") or "")
     model = str(body.get("model", "") or "")
     try:
@@ -503,7 +588,8 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     # `continue_conversation` is synchronous. Doing it here keeps the gateway
     # responsive even when the recorded path lives on a stalled mount.
     resumed_cwd = await asyncio.to_thread(state.subagents.recorded_cwd, conv_id)
-    info = state.subagents.continue_conversation(
+    info = await _continue_on_loop(
+        state,
         conv_id,
         task,
         parent_session_key=parent_session,
@@ -511,6 +597,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         model=model or None,
         max_turns=max_turns,
         cwd=resumed_cwd,
+        _memory_mode=admitted_mode,
     )
     if not info:
         return web.json_response(
@@ -523,6 +610,12 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     if info.done and info.error:
         if info.error.startswith("conversation_busy"):
             return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
+        if info.error.startswith(NATIVE_CHILD_NOT_RESUMABLE):
+            # A harness-native child of a live session: the lever that exists
+            # is the parent, so the refusal is a conflict, not a lookup miss.
+            return web.json_response(
+                {"error": info.error, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
+            )
         if info.error.startswith("conversation_gone"):
             return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
         return web.json_response({"error": info.error, "code": _SPAWN_REJECTED_CODE}, status=400)
@@ -564,6 +657,11 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         ok, detail = await state.subagents.steer_run(agent_id, message)
     if not ok:
         if detail == "not_found":
+            native = _native_child_refusal(state, agent_id)
+            if native is not None:
+                return web.json_response(
+                    {"error": native, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
+                )
             return web.json_response({"error": detail, "code": "not_found"}, status=404)
         if detail.startswith("not_running"):
             return web.json_response({"error": detail, "code": "not_running"}, status=409)
@@ -947,7 +1045,8 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
     # current config before any discovery read.
     if old.agent:
         await warm_project_agents_for_spawn(state, old.cwd or "")
-    info = state.subagents.spawn(
+    info = await _spawn_on_loop(
+        state,
         old._raw_task or old.task,
         parent_session_key=old.parent_session_key,
         agent=old.agent,
@@ -2245,7 +2344,9 @@ async def api_send_message(request: web.Request) -> web.Response:
         )
 
     # Validate format first, then redact (#2)
-    if target_channel and not CHANNEL_ID_RE.match(target_channel):
+    if target_channel and (
+        len(target_channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(target_channel)
+    ):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     if target_user and not USER_ID_RE.match(target_user):
         return web.json_response({"error": "invalid user ID format"}, status=400)
@@ -2468,6 +2569,11 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 slot,
                                 wrapped,
                                 _directive_user_origin=False,
+                                # Structural provenance for the session ledger:
+                                # the queued twin above carries
+                                # CRON_NOTIFICATION_KIND, and this branch is the
+                                # same injector dispatching directly.
+                                _turn_actor="cron",
                             ),
                         )
                         slot.task = task
@@ -3562,19 +3668,31 @@ async def api_browser_install_start(request: web.Request) -> web.Response:
                     # operator with a bare "failed" -- which cannot tell a
                     # registry auth error apart from a blocked download, the two
                     # cases the panel renders this string to explain.
-                    # Redacted before it reaches the panel. npm failures routinely
-                    # quote the command's own environment back at you: a registry
-                    # line carrying `_authToken=`, or a proxy URL with inline
-                    # credentials. This string is rendered verbatim in Settings and
-                    # is the thing an operator screenshots into a bug report, so it
-                    # goes through the same two-pass redaction as every other
-                    # external surface.
+                    # Redacted before it reaches the panel. Step stderr is already
+                    # scrubbed at the source (browser_cli.install._step runs the
+                    # npm-aware redactor on it), but the `error` fallback and the
+                    # exception arm below are composed HERE and never pass through
+                    # _step. This call re-runs the same npm-aware redactor
+                    # (redact_install_output: the shared two-pass PLUS the npm
+                    # shapes such as a bare `_authToken=`) so all three carriers
+                    # get identical coverage -- the module-local _redact runs only
+                    # the shared pair and would let an npm registry line through.
                     detail = first.get("stderr") or first.get("error") or "failed"
-                    state._browser_install_error = _redact(
+                    state._browser_install_error = browser_cli_install.redact_install_output(
                         f"{first.get('name', 'install')}: {str(detail).strip()}"
                     )[:2000]
             except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-                state._browser_install_error = _redact(str(exc))[:2000]
+                # Redact the FULL text, then truncate: any pre-redaction cut can
+                # split a credential so its `@` anchor is gone, no pattern
+                # matches, and npm-line compression pulls the surviving fragment
+                # into the 2000-char display window. Pinned by
+                # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
+                # Unbounded input cannot reach this arm in practice: install._run
+                # reports subprocess failures as return codes rather than raising
+                # with output, and every raise site carries a short message.
+                state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
+                    :2000
+                ]
 
         state._browser_install_task = asyncio.create_task(_run())
     return await api_browser_install_get(request)
@@ -3634,12 +3752,16 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
             failed = [] if result.get("ok") or not steps else steps[-1:]
             if failed:
                 first = failed[0]
-                state._browser_install_error = _redact(
+                # npm-aware redactor, same reasoning as the CLI install above.
+                state._browser_install_error = browser_cli_install.redact_install_output(
                     f"{first.get('name', 'install-browser')}: "
                     f"{first.get('stderr') or first.get('error') or 'failed'}"
                 )[:2000]
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-            state._browser_install_error = _redact(str(exc))[:2000]
+            # Redact the full text, then truncate; see the CLI install above.
+            state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
+                :2000
+            ]
 
     state._browser_install_task = asyncio.create_task(_run())
     return await api_browser_install_get(request)

@@ -44,6 +44,10 @@ def _mock_sessions(resumed: bool = False) -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously after every turn; as AsyncMock children they
+    # would hand back coroutines nobody awaits.
+    provider.context_window_tokens = lambda: 0
+    provider.context_used_tokens = lambda: 0
 
     async def _empty_stream(*_args: object, **_kwargs: object):  # type: ignore[no-untyped-def]
         return
@@ -77,6 +81,23 @@ def _manager(sessions: MagicMock | None = None) -> SubagentManager:
     return SubagentManager(
         sessions=sessions or _mock_sessions(),
         ctx_builder=_mock_ctx_builder(),
+    )
+
+
+def _stop_reason(info: SubagentInfo) -> str:
+    """Every marker that says WHY a run stopped, for an assertion message.
+
+    A run cancelled from outside takes the auto-continue branch, which sets
+    neither ``error`` nor ``done``: without these markers in the message, "the
+    run was cancelled" is indistinguishable from "the run produced the wrong
+    answer" -- the reading that let a real loop stall be reported as a
+    memory-mode mismatch.
+    """
+    return (
+        f"error={info.error!r} done={info.done} user_stopped={info.user_stopped} "
+        f"reaped={info.reaped} cancel_retry_used={info._cancel_retry_used} "
+        f"recovering={info._recovering} mode_ready={info._memory_mode_ready} "
+        f"mode={info.memory_mode!r} turns={info.turns}"
     )
 
 
@@ -168,12 +189,13 @@ class TestKeepThreading:
 
     @pytest.mark.asyncio
     async def test_conversation_key_overrides_session_key(self) -> None:
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        create_agent_folder("origrun1", memory_mode="persistent")
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn(
-                "follow-up", keep=True, conversation_key="subagent:origrun1"
-            )
+            info = manager.spawn("follow-up", keep=True, conversation_key="subagent:origrun1")
             assert info is not None and not info.error
             await manager._tasks[info.id]
         # get_or_create must be called with the ORIGINAL conversation key.
@@ -198,8 +220,10 @@ class TestContinueConversation:
         sessions = _mock_sessions()
         sessions.resumable_sid = MagicMock(return_value=None)
         manager = _manager(sessions)
-        with patch("kiro_crew.subagent.sel"), \
-                patch("kiro_crew.subagent.read_state", return_value=None):
+        with (
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.read_state", return_value=None),
+        ):
             info = manager.continue_conversation("deadbeef", "more work")
         assert info is not None and info.done
         assert info.error.startswith("conversation_gone")
@@ -207,9 +231,12 @@ class TestContinueConversation:
     def test_promotion_write_failure_is_retryable(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
-        with patch(
-            "kiro_crew.subagent_persistence.promote_retention", side_effect=OSError("disk busy")
-        ), patch.object(manager, "spawn") as spawn:
+        with (
+            patch(
+                "kiro_crew.subagent_persistence.promote_retention", side_effect=OSError("disk busy")
+            ),
+            patch.object(manager, "spawn") as spawn,
+        ):
             info = manager.continue_conversation("retryrun", "follow-up")
         assert info.done
         assert info.error.startswith("conversation_busy")
@@ -220,9 +247,10 @@ class TestContinueConversation:
     def test_promotion_skipped_state_write_is_retryable(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
-        with patch("kiro_crew.subagent.update_state", return_value=False), patch.object(
-            manager, "spawn"
-        ) as spawn:
+        with (
+            patch("kiro_crew.subagent.update_state", return_value=False),
+            patch.object(manager, "spawn") as spawn,
+        ):
             info = manager.continue_conversation("skiprun", "follow-up")
         assert info.done
         assert info.error.startswith("conversation_busy")
@@ -236,10 +264,13 @@ class TestContinueConversation:
         sessions.is_continuable.return_value = True
         manager = _manager(sessions)
         manager._conversations["subagent:kept-run"] = 123.0
-        with patch(
-            "kiro_crew.subagent_persistence.promote_retention",
-            return_value=sp.RetentionPromotionResult.RETRYABLE,
-        ), patch.object(manager, "spawn") as spawn:
+        with (
+            patch(
+                "kiro_crew.subagent_persistence.promote_retention",
+                return_value=sp.RetentionPromotionResult.RETRYABLE,
+            ),
+            patch.object(manager, "spawn") as spawn,
+        ):
             info = manager.continue_conversation("kept-run", "follow-up")
         assert info.done
         assert info.error.startswith("conversation_busy")
@@ -259,9 +290,7 @@ class TestContinueConversation:
 
         def promote(agent_id: str) -> None:
             try:
-                results[agent_id] = manager._promote_conversation(
-                    agent_id, f"subagent:{agent_id}"
-                )
+                results[agent_id] = manager._promote_conversation(agent_id, f"subagent:{agent_id}")
             except BaseException as exc:
                 errors.append(exc)
 
@@ -293,9 +322,12 @@ class TestContinueConversation:
         sessions.resumable_sid = MagicMock(side_effect=[None, "sid-from-state"])
         manager = _manager(sessions)
         state = {"session_id": "sid-from-state", "provider": "acp", "cwd": "/tmp/x"}
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), \
-                patch("kiro_crew.subagent.read_state", return_value=state), \
-                patch.object(manager, "_promote_conversation", return_value=object()) as promote:
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.read_state", return_value=state),
+            patch.object(manager, "_promote_conversation", return_value=object()) as promote,
+        ):
             info = manager.continue_conversation("origrun2", "follow-up")
             assert info is not None and not info.error, info.error
             await manager._tasks[info.id]
@@ -310,18 +342,25 @@ class TestContinueConversation:
         sessions.resumable_sid = MagicMock(return_value=None)  # both checks fail
         manager = _manager(sessions)
         state = {"session_id": "sid-stale", "provider": "acp", "cwd": ""}
-        with patch("kiro_crew.subagent.sel"), \
-                patch("kiro_crew.subagent.read_state", return_value=state):
+        with (
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.read_state", return_value=state),
+        ):
             info = manager.continue_conversation("stalerun", "follow-up")
         assert info is not None and info.done
         assert info.error.startswith("conversation_gone")
 
     @pytest.mark.asyncio
     async def test_continue_dispatches_new_run_on_same_key(self) -> None:
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        create_agent_folder("origrun1", memory_mode="persistent")
         sessions = _mock_sessions(resumed=True)
         manager = _manager(sessions)
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch.object(
-            manager, "_promote_conversation", return_value=object()
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(manager, "_promote_conversation", return_value=object()),
         ):
             info = manager.continue_conversation("origrun1", "follow-up work")
             assert info is not None and not info.error, info.error
@@ -336,12 +375,17 @@ class TestContinueConversation:
     async def test_continuation_fails_closed_when_not_resumed(self) -> None:
         """session/load falling back to a fresh session must NOT execute the
         follow-up context-free — the run fails with a typed resume_failed."""
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        create_agent_folder("origrun9", memory_mode="persistent")
         sessions = _mock_sessions(resumed=False)
         provider = sessions.get_or_create.return_value[0]
         provider.session_id = "sid-resume-fresh"
         manager = _manager(sessions)
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch.object(
-            manager, "_promote_conversation", return_value=object()
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(manager, "_promote_conversation", return_value=object()),
         ):
             info = manager.continue_conversation("origrun9", "follow-up work")
             assert info is not None and not info.error, info.error
@@ -468,9 +512,7 @@ class TestReleaseAndSweep:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         manager._conversations["subagent:c1"] = time.time()
-        with patch(
-            "kiro_crew.subagent._cleanup_session_files_sync"
-        ) as cleanup:
+        with patch("kiro_crew.subagent._cleanup_session_files_sync") as cleanup:
             ok, detail = manager.release_conversation("c1")
         assert ok and detail == "released"
         cleanup.assert_called_once_with("sid-123", "acp")
@@ -490,9 +532,7 @@ class TestReleaseAndSweep:
         now = time.time()
         manager._conversations["subagent:old1"] = now - 7 * 3600  # expired
         manager._conversations["subagent:new1"] = now - 60  # fresh
-        with patch(
-            "kiro_crew.subagent._cleanup_session_files_sync"
-        ):
+        with patch("kiro_crew.subagent._cleanup_session_files_sync"):
             manager._sweep_conversations(now)
         assert "subagent:old1" not in manager._conversations
         assert "subagent:new1" in manager._conversations
@@ -596,52 +636,39 @@ class TestKeepTranscript:
         return h, sessions, files
 
     @pytest.mark.asyncio
-    async def test_destroy_deletes_transcript_when_terminate_is_cancelled(
-        self, tmp_path
-    ) -> None:
+    async def test_destroy_deletes_transcript_when_terminate_is_cancelled(self, tmp_path) -> None:
         """A cancelled teardown must still unlink; the cancellation must propagate."""
         h, sessions, files = self._handle_with_transcript(tmp_path)
         h._runtime.terminate_session = AsyncMock(side_effect=asyncio.CancelledError())
 
-        with patch(
-            "kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions
-        ):
+        with patch("kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions):
             with pytest.raises(asyncio.CancelledError):
                 await h.destroy()
 
         assert [f for f in files if f.exists()] == [], (
-            "a cancelled teardown leaked this session's transcript; nothing else "
-            "deletes it"
+            "a cancelled teardown leaked this session's transcript; nothing else " "deletes it"
         )
 
     @pytest.mark.asyncio
-    async def test_destroy_deletes_transcript_when_terminate_raises(
-        self, tmp_path
-    ) -> None:
+    async def test_destroy_deletes_transcript_when_terminate_raises(self, tmp_path) -> None:
         """Same for an ordinary exception escaping the runtime call."""
         h, sessions, files = self._handle_with_transcript(tmp_path, sid="sid-raise")
         h._runtime.terminate_session = AsyncMock(side_effect=RuntimeError("boom"))
 
-        with patch(
-            "kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions
-        ):
+        with patch("kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions):
             with pytest.raises(RuntimeError):
                 await h.destroy()
 
         assert [f for f in files if f.exists()] == []
 
     @pytest.mark.asyncio
-    async def test_cancelled_teardown_still_honours_keep_transcript(
-        self, tmp_path
-    ) -> None:
+    async def test_cancelled_teardown_still_honours_keep_transcript(self, tmp_path) -> None:
         """The `finally` must not override the subagent resume guard."""
         h, sessions, files = self._handle_with_transcript(tmp_path, sid="sid-keep")
         h.keep_transcript = True
         h._runtime.terminate_session = AsyncMock(side_effect=asyncio.CancelledError())
 
-        with patch(
-            "kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions
-        ):
+        with patch("kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions):
             with pytest.raises(asyncio.CancelledError):
                 await h.destroy()
 
@@ -678,9 +705,7 @@ class TestPersistenceGuards:
             keep=True,
             conversation_key=f"subagent:{owner_id}",
         )
-        sp.write_tombstone(
-            continuation_id, cause="delivered", recovery_action="none"
-        )
+        sp.write_tombstone(continuation_id, cause="delivered", recovery_action="none")
         d = sp._agent_dir(continuation_id)
         ts_path = d / "tombstone.json"
         ts = json.loads(ts_path.read_text())
@@ -703,8 +728,9 @@ class TestPersistenceGuards:
             result.append(manager.continue_conversation(owner_id, "follow-up"))
             continuation_done.set()
 
-        with patch.object(sp, "_should_defer_tombstone_cleanup", hold_after_false), patch.object(
-            sp, "_cleanup_session_files_sync"
+        with (
+            patch.object(sp, "_should_defer_tombstone_cleanup", hold_after_false),
+            patch.object(sp, "_cleanup_session_files_sync"),
         ):
             prune_thread = threading.Thread(
                 target=sp.prune_stale_tombstones,
@@ -785,14 +811,25 @@ class TestPersistenceGuards:
         holder = sp._lock_for_agent(agent_id)
         holder.lock.acquire()
         try:
-            started = time.monotonic()
             result = asyncio.run(self._promote_on_loop(sp, agent_id))
-            elapsed = time.monotonic() - started
         finally:
             holder.lock.release()
 
+        # RETRYABLE alone proves the loop did not queue behind the writer lock:
+        # every acquire on that path is non-blocking by construction
+        # (``_try_acquire_retention_lock`` then ``_try_acquire_state_lock``), and
+        # the branch returns before ``state_writer`` runs, so the promotion does
+        # no file I/O at all. A stopwatch around ``asyncio.run`` cannot add signal
+        # here -- the lock is held by the MEASURING thread, so a blocking-acquire
+        # regression self-deadlocks and hangs to the pytest timeout instead of
+        # reaching an elapsed assertion, while the number it would report is pure
+        # loop-construction and interpreter cost that coverage and a co-tenant
+        # runner inflate. The properly shaped version of that timing property --
+        # holder on a separate thread, bound DERIVED from the hold -- already
+        # exists as test_a_coroutine_does_not_wait_on_a_held_lock in
+        # test_subagent_state_write_serialization.py, whose own comment records a
+        # bare 0.5s bound false-redding at 0.515s on a loaded runner.
         assert result is sp.RetentionPromotionResult.RETRYABLE
-        assert elapsed < 0.5
         assert not (sp.read_state(agent_id) or {}).get("keep")
 
         result = asyncio.run(self._promote_on_loop(sp, agent_id))
@@ -809,9 +846,7 @@ class TestPersistenceGuards:
         sp.update_state(agent_id, session_id="sid-off-loop", provider="acp", keep=False)
         results: list[sp.RetentionPromotionResult] = []
 
-        worker = threading.Thread(
-            target=lambda: results.append(sp.promote_retention(agent_id))
-        )
+        worker = threading.Thread(target=lambda: results.append(sp.promote_retention(agent_id)))
         worker.start()
         worker.join(timeout=2)
 
@@ -864,9 +899,7 @@ class TestPersistenceGuards:
             path.write_text(json.dumps(tombstone))
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 2
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 2
 
         assert not sp._agent_dir(malformed_id).exists()
         assert not sp._agent_dir(valid_id).exists()
@@ -905,9 +938,7 @@ class TestPersistenceGuards:
         valid_path.write_text(json.dumps(valid_tombstone))
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
 
         assert sp._agent_dir(deep_id).exists()
         assert not sp._agent_dir(valid_id).exists()
@@ -948,9 +979,7 @@ class TestPersistenceGuards:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
 
         assert sp._agent_dir(corrupt_id).exists()
         assert corrupt_record.read_text() == "{malformed"
@@ -1006,9 +1035,7 @@ class TestPersistenceGuards:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
         assert not ts_path.exists()
         assert sp._cleanup_identities_path(agent_id).exists()
-        sp.write_tombstone(
-            agent_id, cause="gateway_restart", recovery_action="notified"
-        )
+        sp.write_tombstone(agent_id, cause="gateway_restart", recovery_action="notified")
         tombstone = json.loads(ts_path.read_text())
         assert "cleanup_identities" not in tombstone
         assert tombstone["session_id"] == "sid-state"
@@ -1016,9 +1043,7 @@ class TestPersistenceGuards:
         ts_path.write_text(json.dumps(tombstone))
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
 
         assert cleanup.call_args_list == [
             call("sid-1", "acp", cwd="/first"),
@@ -1059,18 +1084,14 @@ class TestPersistenceGuards:
         tombstone = json.loads(tombstone_path.read_text())
         tombstone["died"] = 1
         tombstone["session_id"] = victim_sid
-        tombstone["cleanup_identities"] = [
-            {"session_id": victim_sid, "provider": "acp"}
-        ]
+        tombstone["cleanup_identities"] = [{"session_id": victim_sid, "provider": "acp"}]
         tombstone_path.write_text(json.dumps(tombstone))
 
         # These are the identity files a subagent can write. Durable cleanup
         # authority lives under the protected trust root, so neither forged
         # spelling may add the victim SID to the provider-deletion set.
         (agent_dir / sp._CLEANUP_IDENTITIES_FILE).write_text(
-            json.dumps(
-                {"identities": [{"session_id": victim_sid, "provider": "acp"}]}
-            )
+            json.dumps({"identities": [{"session_id": victim_sid, "provider": "acp"}]})
         )
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
@@ -1080,9 +1101,7 @@ class TestPersistenceGuards:
         victim_file.write_text("victim")
 
         with patch.object(sp, "kiro_sessions_dir", return_value=sessions_dir):
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
 
         assert not own_file.exists()
         assert victim_file.read_text() == "victim"
@@ -1124,9 +1143,7 @@ class TestPersistenceGuards:
         # Once a provider cleanup implementation succeeds, the same record is
         # enough to complete prune and reap both surfaces.
         with patch.object(sp, "_cleanup_session_files_sync", return_value=True):
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
         assert not agent_dir.exists()
         assert not protected_path.exists()
 
@@ -1154,9 +1171,7 @@ class TestPersistenceGuards:
         tombstone_path.write_text(json.dumps(tombstone))
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 0
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 0
         assert agent_dir.exists()
         cleanup.assert_not_called()
 
@@ -1170,9 +1185,7 @@ class TestPersistenceGuards:
         with sp._CLEANUP_IDENTITY_LOCK:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
         with patch.object(sp, "_cleanup_session_files_sync", return_value=True):
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
         assert not agent_dir.exists()
 
     @pytest.mark.parametrize("trusted_generation", [False, True])
@@ -1205,9 +1218,7 @@ class TestPersistenceGuards:
         protected_path = sp._cleanup_identities_path(agent_id)
         tombstone_path = agent_dir / "tombstone.json"
         tombstone = json.loads(tombstone_path.read_text())
-        tombstone["died"] = (
-            time.time() - sp._UNRECLAIMABLE_LOOKUP_MAX_AGE_SECS - 1
-        )
+        tombstone["died"] = time.time() - sp._UNRECLAIMABLE_LOOKUP_MAX_AGE_SECS - 1
         tombstone_path.write_text(json.dumps(tombstone))
         with sp._CLEANUP_IDENTITY_LOCK:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
@@ -1247,9 +1258,7 @@ class TestPersistenceGuards:
         tombstone_path.write_text(json.dumps(tombstone))
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 0
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 0
         assert agent_dir.exists()
         cleanup.assert_not_called()
 
@@ -1257,9 +1266,7 @@ class TestPersistenceGuards:
         tombstone["died"] = 1
         tombstone_path.write_text(json.dumps(tombstone))
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
         cleanup.assert_called_once_with("sid-promoted", "acp", cwd="")
 
     def test_cleanup_store_restriction_failure_aborts_before_access(
@@ -1276,19 +1283,18 @@ class TestPersistenceGuards:
         original = json.dumps({"identities": [{"session_id": "sid-original"}]})
         protected_path.write_text(original)
 
-        with patch.object(
-            sp.platform_compat, "make_owner_only_dir"
-        ), patch.object(
-            sp.platform_compat,
-            "restrict_dir_to_owner",
-            side_effect=OSError("DACL refused"),
+        with (
+            patch.object(sp.platform_compat, "make_owner_only_dir"),
+            patch.object(
+                sp.platform_compat,
+                "restrict_dir_to_owner",
+                side_effect=OSError("DACL refused"),
+            ),
         ):
             with pytest.raises(OSError, match="DACL refused"):
                 sp._read_cleanup_identities_file(agent_id)
             with pytest.raises(OSError, match="DACL refused"):
-                sp.remember_live_cleanup_identity(
-                    agent_id, session_id="sid-forged", provider="acp"
-                )
+                sp.remember_live_cleanup_identity(agent_id, session_id="sid-forged", provider="acp")
 
         assert protected_path.read_text() == original
 
@@ -1347,9 +1353,7 @@ class TestPersistenceGuards:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 0
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 0
         assert agent_dir.exists()
         cleanup.assert_not_called()
 
@@ -1507,16 +1511,12 @@ class TestPersistenceGuards:
             sp._LIVE_CLEANUP_IDENTITIES.clear()
 
         with patch.object(sp, "_cleanup_session_files_sync") as cleanup:
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 0
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 0
             assert continuation_dir.exists()
             cleanup.assert_not_called()
 
             sp.update_state(owner_id, keep=False)
-            assert sp.prune_stale_tombstones(
-                max_age_days=0, delivered_ttl_secs=0
-            ) == 1
+            assert sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0) == 1
 
         assert not continuation_dir.exists()
         cleanup.assert_called_once_with("sid-continuation", "acp", cwd="")
@@ -1672,3 +1672,272 @@ class TestPersistenceGuards:
             pruned = sp.prune_stale_tombstones(max_age_days=0, delivered_ttl_secs=0)
         assert pruned >= 1
         cleanup.assert_called_once()
+
+
+class TestContinuationMemoryMode:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("original", ["persistent", "incognito", "temporary"])
+    @pytest.mark.parametrize("requested", ["persistent", "incognito", "temporary"])
+    async def test_fresh_manager_restores_and_tightens_original_mode(self, original, requested):
+        from kiro_crew.messaging.privacy_mode import strictest
+        from kiro_crew.subagent_persistence import create_agent_folder, read_run_memory_mode
+
+        conv_id = f"mode-{original}-{requested}"
+        create_agent_folder(conv_id, task="original", memory_mode=original)
+        manager = _manager(_mock_sessions(resumed=True))
+        manager._memory_mode_for_session = lambda key: requested
+        # The ASYNC entry, because this test body is a coroutine: the sync one
+        # takes the accept and the claim as BEGIN IMMEDIATE on this loop, and
+        # each waits on the lock the store's writer thread holds across a query
+        # (`_the_continuation_path_takes_no_store_call_on_the_loop`).
+        info = await manager.continue_conversation_async(conv_id, "follow up")
+        assert info is not None and not info.error
+        assert not info._memory_mode_ready
+        await asyncio.wait_for(manager._tasks[info.id], timeout=5)
+        expected = strictest((original, requested)) or "persistent"
+        assert not info.error, info.error
+        # A cancelled run publishes no mode, which the mode assertion below
+        # would report as a MISMATCH -- the reading that hid a real loop stall
+        # on the Windows shard. Name the cancellation and its stop reason first,
+        # and keep the two facts (WHICH mode, and whether it was published at
+        # all) as separate assertions.
+        assert not info._cancel_retry_used, f"run cancelled, not completed: {_stop_reason(info)}"
+        assert info._memory_mode_ready, f"mode publication never ran: {_stop_reason(info)}"
+        assert info.memory_mode == expected
+        assert read_run_memory_mode(conv_id) == expected
+        assert read_run_memory_mode(info.id) == expected
+        assert manager._ctx_builder.build_message.call_args.kwargs["blocks_reads"] == (
+            expected == "temporary"
+        )
+
+        restarted = _manager(_mock_sessions(resumed=True))
+        resumed = await restarted.continue_conversation_async(conv_id, "another turn")
+        assert resumed is not None and not resumed.error
+        await asyncio.wait_for(restarted._tasks[resumed.id], timeout=5)
+        assert not resumed.error, resumed.error
+        assert not resumed._cancel_retry_used, f"run cancelled: {_stop_reason(resumed)}"
+        assert resumed.memory_mode == expected
+
+    @pytest.mark.asyncio
+    async def test_missing_original_policy_never_allocates_provider(self):
+        from kiro_crew.subagent_persistence import _run_memory_identity_path, create_agent_folder
+
+        create_agent_folder("missing-resume-policy", memory_mode="incognito")
+        record = _run_memory_identity_path("missing-resume-policy")
+        import json
+
+        payload = json.loads(record.read_text(encoding="utf-8"))
+        del payload["memory_mode"]
+        record.write_text(json.dumps(payload), encoding="utf-8")
+        sessions = _mock_sessions(resumed=True)
+        manager = _manager(sessions)
+        # The ASYNC entry for the same reason as the sibling test above, and it
+        # matters here for the same 5s deadline: the sync one's two BEGIN
+        # IMMEDIATEs run on THIS loop, so the deadline is spent waiting on the
+        # store lock rather than on the refusal being reached.
+        info = await manager.continue_conversation_async("missing-resume-policy", "must not run")
+        assert info is not None
+        # ``.get``, not ``[...]``: this refusal is raised on the run's first
+        # steps, and the async entry's own awaits give it enough of the loop to
+        # finish -- and be popped from ``_tasks`` by its finally -- before the
+        # dispatch returns. A missing entry therefore means the terminal is
+        # already recorded on ``info``, which is what the assertions below read.
+        task = manager._tasks.get(info.id)
+        if task is not None:
+            await asyncio.wait_for(task, timeout=5)
+        # A cancelled run carries no error at all, so the membership check below
+        # would read "the refusal was worded differently" for a run that never
+        # reached the allocation boundary.
+        assert not info._cancel_retry_used, f"run cancelled, not refused: {_stop_reason(info)}"
+        assert "memory_unavailable" in info.error, _stop_reason(info)
+        assert str(record) not in info.error
+        assert "caused by" not in info.error
+        assert not info._memory_mode_ready
+        sessions.get_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_resume_drains_mode_publication_before_returning(monkeypatch):
+    from kiro_crew import subagent_persistence as persistence
+
+    persistence.create_agent_folder("cancel-mode-original", memory_mode="incognito")
+    persistence.create_agent_folder("cancel-mode-current", memory_mode="temporary")
+    entered, release = threading.Event(), threading.Event()
+    real = persistence.tighten_run_memory_mode
+
+    def held(agent_id, mode):
+        entered.set()
+        assert release.wait(5), "test did not release mode writer"
+        return real(agent_id, mode)
+
+    monkeypatch.setattr(persistence, "tighten_run_memory_mode", held)
+    sessions = _mock_sessions(resumed=True)
+    manager = _manager(sessions)
+    info = SubagentInfo(
+        id="cancel-mode-current",
+        task="test",
+        conversation_key="subagent:cancel-mode-original",
+        memory_mode="temporary",
+    )
+    info._memory_mode_ready = False
+    task = asyncio.create_task(manager._run_inner(info, info.conversation_key))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 3), timeout=4)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation escaped while the protected writer was active"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert persistence.read_run_memory_mode("cancel-mode-original") == "temporary"
+        assert persistence.read_run_memory_mode("cancel-mode-current") == "temporary"
+        sessions.get_or_create.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_the_continuation_path_takes_no_store_call_on_the_loop(monkeypatch) -> None:
+    """A continuation dispatched from the gateway loop reaches the task store
+    only on its writer thread -- dispatch, the run's mode publication, and the
+    terminal settle.
+
+    ``store.loop_thread_calls`` is what the claim rests on, not the guard alone:
+    ``OnLoopDBGuard.check`` raises, and most store call sites sit inside an
+    ``except Exception`` that swallows the raise, so a violation shows up as a
+    number and not as a failure. The guard is armed as well, for the sites that
+    do propagate. The counter also covers the SHAPE this pins against: both
+    writes the sync entry would take here (``taskq_accept``, ``taskq_claim``)
+    wait on ``TaskStore._lock``, and a 1s hold by the writer thread freezes a
+    coroutine caller's loop for the whole hold -- measured 0 of ~95 due 10ms
+    heartbeat ticks served through the sync entry against 91 through this one.
+    """
+    from kiro_crew.subagent_manager import admission as admission_mod
+    from kiro_crew.subagent_persistence import create_agent_folder
+    from kiro_crew.taskq import store as store_mod
+
+    monkeypatch.setattr(admission_mod.SpawnAdmissionCoordinator, "pump_off_loop", True)
+    create_agent_folder("no-loop-db", task="original", memory_mode="persistent")
+    manager = _manager(_mock_sessions(resumed=True))
+    await manager.wait_taskq_ready()
+    manager._spawn_stagger_secs = 0.0
+    store = manager._admission.taskq_store()
+    assert store is not None, "this pin needs the real durable store"
+    before = store.loop_thread_calls
+    monkeypatch.setenv(store_mod.STRICT_ON_LOOP_ENV, "1")
+    info = await manager.continue_conversation_async("no-loop-db", "follow up")
+    assert info is not None and not info.error, getattr(info, "error", None)
+    task = manager._tasks.get(info.id)
+    if task is not None:
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=20)
+    for _ in range(40):
+        await asyncio.sleep(0.01)  # let the posted writes land, still under the guard
+    assert store.loop_thread_calls == before  # the reads below are the test's own
+    monkeypatch.delenv(store_mod.STRICT_ON_LOOP_ENV)
+    # The run really ran: a refusal or a cancellation would take no store call
+    # either, and would pass an assertion that only counted.
+    #
+    # ``queued`` is checked FIRST and on its own, because it is the one
+    # never-started outcome the two markers below miss: a handle the claim
+    # refused carries ``_memory_mode_ready`` at its dataclass DEFAULT of True
+    # (only a registered run has it set from the conversation key), so a
+    # continuation that never left the queue passes the pair.
+    assert not info.queued and info.done, _stop_reason(info)
+    assert info._memory_mode_ready and not info._cancel_retry_used, _stop_reason(info)
+    assert store.get(info.id) is not None
+
+
+def test_a_stale_resume_entry_does_not_hold_a_conversation() -> None:
+    """A ``_resume_id`` window entry is a RESIDENT run asking for the lane slot
+    it yielded, not an unstarted spawn, so it never answers
+    ``_conversation_busy`` -- the same separation the pump's grant loop, the
+    refill census, the eviction and the child reserve make.
+
+    An entry whose run is still live is answered by the ``_agents`` scan first.
+    The case that reaches this branch is a run that ENDED with its request still
+    queued: the queued-stop path leaves the entry alone by design (dropping it
+    published a "never started" terminal over a live run) and only the bounded
+    waiter's give-up arm withdraws one, while the pump returns above its resume
+    loop whenever no slot is free. Counted, that entry refuses every
+    continuation and every release of the conversation with a
+    ``conversation_busy`` naming a run that is already done.
+    """
+    from kiro_crew.subagent_persistence import create_agent_folder
+
+    create_agent_folder("resume-held", task="original", memory_mode="persistent")
+    manager = _manager(_mock_sessions(resumed=True))
+    manager._agents["resume-held"] = SubagentInfo(
+        id="resume-held", task="original", done=True, user_stopped=True
+    )
+    manager._queue.append(
+        {
+            "_resume_id": "resume-held",
+            "_preassigned_id": "resume-held",
+            "parent_session_key": "web-1",
+            "batch_id": "",
+            "reason": "children finished",
+        }
+    )
+    assert manager._conversation_busy("subagent:resume-held") is None
+    ok, detail = manager.release_conversation("resume-held")
+    assert "conversation_busy" not in detail, detail
+    # An UNSTARTED entry for the same conversation still holds it.
+    manager._queue.append({"_preassigned_id": "resume-held"})
+    held = manager._conversation_busy("subagent:resume-held")
+    assert held is not None and held.queued and held.id == "resume-held"
+
+
+@pytest.mark.asyncio
+async def test_the_followup_watcher_dispatches_no_store_call_on_the_loop(monkeypatch) -> None:
+    """The follow-up watcher is the manager's OWN continuation caller
+    (``spawn_steer mode="follow_up"``), and it dispatches from a task on the
+    gateway loop -- so the entry it picks is what decides whether a queued
+    correction costs the loop two ``BEGIN IMMEDIATE`` waits.
+
+    Pinned separately from the dispatch pin because a counter over
+    ``continue_conversation_async`` says nothing about which entry
+    ``_deliver_followups`` calls: swapping that one line to the sync entry
+    leaves the other pin green.
+    """
+    from kiro_crew.subagent_manager import admission as admission_mod
+    from kiro_crew.subagent_persistence import create_agent_folder
+    from kiro_crew.taskq import store as store_mod
+
+    monkeypatch.setattr(admission_mod.SpawnAdmissionCoordinator, "pump_off_loop", True)
+    create_agent_folder("followup-conv", task="original", memory_mode="persistent")
+    manager = _manager(_mock_sessions(resumed=True))
+    await manager.wait_taskq_ready()
+    manager._spawn_stagger_secs = 0.0
+    store = manager._admission.taskq_store()
+    assert store is not None, "this pin needs the real durable store"
+    # A finished run whose task is already popped: what the watcher waits for
+    # before it dispatches the queue as ONE continuation.
+    done = SubagentInfo(
+        id="followup-conv",
+        task="original",
+        conversation_key="subagent:followup-conv",
+        done=True,
+    )
+    done.pending_followups = ["also fix the test"]
+    manager._agents["followup-conv"] = done
+    before = store.loop_thread_calls
+    monkeypatch.setenv(store_mod.STRICT_ON_LOOP_ENV, "1")
+    await asyncio.wait_for(manager._deliver_followups(done), timeout=20)
+    child = next((a for a in manager._agents.values() if a.id != "followup-conv"), None)
+    assert child is not None, "the watcher dispatched no continuation"
+    task = manager._tasks.get(child.id)
+    if task is not None:
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=20)
+    for _ in range(40):
+        await asyncio.sleep(0.01)  # let the posted writes land, still under the guard
+    assert store.loop_thread_calls == before  # the reads below are the test's own
+    monkeypatch.delenv(store_mod.STRICT_ON_LOOP_ENV)
+    # The dispatch really happened (a settled queue with no child would pass a
+    # count-only assertion), and it STARTED: a claim the store refused comes
+    # back queued and takes no on-loop call either.
+    assert done.pending_followups == []
+    assert not child.queued, _stop_reason(child)
+    assert store.get(child.id) is not None

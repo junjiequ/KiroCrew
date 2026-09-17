@@ -231,6 +231,28 @@ def coerce_fallback_model(raw: object) -> str:
     return model_registry.to_provider_id(s, "acp") or "auto"
 
 
+def coerce_refusal_fallback_model(raw: object) -> str:
+    """Normalize the content-filter fallback model (agent.refusal_fallback_model).
+
+    Same three shapes as :func:`coerce_fallback_model` but with the OPPOSITE
+    junk default: ``""`` (the default) disables the feature — a refusal then
+    surfaces exactly as it does today — so absent/junk input (``None``,
+    non-string) and an id the registry maps to ``""`` all collapse to ``""``
+    (off), never to a silently-enabled value. ``"auto"`` means "retry on the
+    model the provider's refusal envelope recommends, when it names one"; a
+    concrete id is normalized through :func:`model_registry.to_provider_id`
+    for the ``acp`` provider.
+    """
+    if raw is None or not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    if s.lower() == "auto":
+        return "auto"
+    return model_registry.to_provider_id(s, "acp") or ""
+
+
 def _safe_int(value: object, default: int, lo: int | None = None, hi: int | None = None) -> int:
     """Convert a legacy numeric config value or return *default* on failure.
 
@@ -863,6 +885,21 @@ class AgentConfig:
             "silent.",
         ),
     )
+    refusal_fallback_model: str = field(
+        default="",
+        metadata=_meta(
+            "Refusal fallback model",
+            "Model the current message is retried on ONCE when the active "
+            "model's content filter declines it (refusal / CONTENT_FILTERED). "
+            "Empty ('', the default) disables the retry: the refusal card "
+            "surfaces exactly as before. A concrete model id (as advertised "
+            "by the provider, e.g. 'claude-opus-4.8') retries that single "
+            "message on it and restores the primary model on the next turn; "
+            "'auto' retries on the model the provider's refusal envelope "
+            "recommends, when it names one. The retry is announced in chat — "
+            "never silent — and a refusal from the fallback too is terminal.",
+        ),
+    )
     reasoning_effort: str = field(
         default="",
         metadata=_meta(
@@ -1110,13 +1147,6 @@ class AgentConfig:
             "Custom name the bot identifies as in conversations. Leave empty for default.",
         ),
     )
-    conductor_skill: bool = field(
-        default=False,
-        metadata=_meta(
-            "Conductor Skill",
-            "Enable agent delegation — loads conductor skill with agent roster.",
-        ),
-    )
     tool_search: bool = field(
         default=True,
         metadata=_meta(
@@ -1217,11 +1247,232 @@ class AgentConfig:
         metadata=_meta(
             "Posture Admission Gate",
             "While available memory is at or below resource_critical_gb, defer "
-            "scheduled cron firings to the next tick and refuse new subagent "
-            "spawns until memory frees. Manually triggered cron runs, in-flight "
-            "subagents, and direct chat turns are never gated; an unreadable "
-            "probe admits (fail-open). Set false to make the critical posture "
-            "advisory-only.",
+            "scheduled cron firings to the next tick and defer new subagent "
+            "spawns (they stay queued in the task store and are re-checked "
+            "after admit_wait_secs) until memory frees. Manually triggered cron "
+            "runs, in-flight subagents, and direct chat turns are never gated; "
+            "an unreadable probe admits (fail-open). Set false to make the "
+            "critical posture advisory-only.",
+        ),
+    )
+    task_queue_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Durable Task Queue",
+            "Persist every accepted subagent spawn to $KIROCREW_HOME/tasks/tasks.db "
+            "before its id is returned, so accepted work survives a gateway crash "
+            "and memory pressure defers a spawn instead of refusing it. Set false "
+            "to fall back to the in-memory spawn queue for one release; tasks.db "
+            "is left in place and unread.",
+        ),
+    )
+    task_dispatch_window: int = field(
+        default=64,
+        metadata=_meta(
+            "Task Dispatch Window",
+            "Maximum number of queued spawns the gateway keeps in memory at once; "
+            "the rest wait as rows in tasks.db and are read in FIFO order as the "
+            "window drains. 2000 accepted tasks are 2000 rows and this many "
+            "Python objects. Clamped to 1..4096.",
+            restart=True,
+        ),
+    )
+    task_store_journal_mode: str = field(
+        default="auto",
+        metadata=_meta(
+            "Task Store Journal Mode",
+            "SQLite journal mode for tasks.db: 'auto' picks WAL only on a volume "
+            "DETECTED local, and DELETE both on a detected network filesystem and "
+            "when detection cannot tell -- WAL needs local shared memory, which "
+            "SMB/NFS does not provide, so an undecidable volume takes the slower "
+            "correct mode rather than risking the store. 'wal' or 'delete' force "
+            "one and skip the detection, so a local disk whose mount table is "
+            "unreadable keeps WAL by declaring it. Unknown values read as 'auto'.",
+            restart=True,
+        ),
+    )
+    admit_wait_secs: int = field(
+        default=30,
+        metadata=_meta(
+            "Admit Wait (seconds)",
+            "How long an admitted task may wait for its resources before it goes "
+            "back to queued, and how long a spawn deferred by the memory posture "
+            "gate waits before it is re-checked. Clamped to 1..3600.",
+            restart=True,
+        ),
+    )
+    start_collect_timeout_secs: int = field(
+        default=300,
+        metadata=_meta(
+            "Start Collect Timeout (seconds)",
+            "After a session start times out, how long the start collector keeps "
+            "the task in 'recovering' to adopt a late session/new response before "
+            "the start is retried. Reserved for the session-start gate; clamped "
+            "to 10..3600.",
+            restart=True,
+        ),
+    )
+    lane_weights: dict[str, int] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Lane Weights",
+            "Per-lane weight overrides for the task dispatcher, keyed by lane "
+            "(a root session key, or 'system'). Unlisted lanes weigh 1. Values "
+            "are clamped to 1..64. Weights shape the share of picks, never a hard cap: a "
+            "lane with nothing pending costs the others nothing.",
+        ),
+    )
+    child_reserve: int = field(
+        default=1,
+        metadata=_meta(
+            "Child Reserve",
+            "Execution slots a top-level (depth-0) task may never take while a "
+            "nested task is queued or a parent is waiting on its children. Only "
+            "children and resuming parents may use them, so a fleet of parents "
+            "can never hold every slot with no child able to start; while a "
+            "parent waits, an adaptive cap is also lifted to at least "
+            "adaptive_floor + child_reserve (never above max_subagents). 0 "
+            "disables the reserve. Clamped to 0..8.",
+        ),
+    )
+    recovery_backoff_base_secs: float = field(
+        default=2.0,
+        metadata=_meta(
+            "Recovery Backoff Base (seconds)",
+            "First retry delay of the shared recovery ladder (tool call, backend, "
+            "ACP runtime) and of a coordinated dependency wait; each further "
+            "attempt doubles it with jitter. One schedule for every layer, so "
+            "layers never retry in lock-step; snapshotted once at gateway start. "
+            "The gateway-daemon supervisor keeps its own pinned floor. "
+            "Clamped to 0.1..60.",
+            restart=True,
+        ),
+    )
+    recovery_backoff_max_secs: float = field(
+        default=120.0,
+        metadata=_meta(
+            "Recovery Backoff Cap (seconds)",
+            "Longest delay between two recovery attempts on the shared ladder or "
+            "a dependency wait; a server-stated retry hint is honoured up to this "
+            "cap. Snapshotted once at gateway start. Clamped to 1..3600 and never "
+            "below the base.",
+            restart=True,
+        ),
+    )
+    session_start_concurrency: int = field(
+        default=2,
+        metadata=_meta(
+            "Session Start Concurrency",
+            "How many ACP session/new requests may be outstanding at once per "
+            "gateway event loop (the SessionStartGate). session/new blocks while "
+            "the backend initializes the session's MCP servers, so a burst of "
+            "subagent starts on one shared runtime slows every start until the "
+            "budget is hit; queued starts wait in FIFO order and their queue time "
+            "is not counted against the start budget or the startup watchdog. A "
+            "fixed bound, not adaptive: the adaptive loop is the MCP gateway spawn "
+            "gate and the execution-cap controller. Clamped to 1..64.",
+            restart=True,
+        ),
+    )
+    adaptive_concurrency: bool = field(
+        default=True,
+        metadata=_meta(
+            "Adaptive Concurrency",
+            "Run the adaptive concurrency controller: a runtime execution cap "
+            "beneath max_subagents (the ceiling, never written) that halves on "
+            "corroborated host pressure (event-loop lag, low memory, fd/process "
+            "counts, attributable start timeouts, slow starts on several MCP "
+            "servers) and earns +1 back per clean window, plus the same shaping "
+            "for the MCP gateway daemon's spawn gate. A fresh gateway starts at "
+            "min(max_subagents, adaptive_initial) and earns its way up. Set false "
+            "to run at the user cap only.",
+        ),
+    )
+    adaptive_concurrency_mode: str = field(
+        default="aimd",
+        metadata=_meta(
+            "Adaptive Concurrency Mode",
+            "'aimd': multiplicative decrease / additive increase with pause-and-"
+            "probe. 'fixed': both caps pinned at their initial values -- a plain "
+            "semaphore -- the one-flip reversal if the controller is seen to "
+            "oscillate.",
+            enum=["aimd", "fixed"],
+        ),
+    )
+    adaptive_floor: int = field(
+        default=1,
+        metadata=_meta(
+            "Adaptive Floor",
+            "Lowest execution cap the controller may shrink to under sustained "
+            "pressure (a pause takes new grants to 0 temporarily). Clamped to "
+            "1..64.",
+        ),
+    )
+    adaptive_initial: int = field(
+        default=4,
+        metadata=_meta(
+            "Adaptive Initial Cap",
+            "Execution cap a fresh gateway starts at, bounded by max_subagents. "
+            "The controller raises it one step per clean window once work "
+            "completes. Clamped to 1..64.",
+        ),
+    )
+    controller_sample_secs: int = field(
+        default=5,
+        metadata=_meta(
+            "Controller Sample Interval (seconds)",
+            "How often the adaptive controller samples the host and the spawn "
+            "gate. Clamped to 1..300.",
+        ),
+    )
+    dependency_max_attempts: int = field(
+        default=20,
+        metadata=_meta(
+            "Dependency Max Attempts",
+            "Coordinated retries a dependency scope gets before every task "
+            "waiting on it is failed with the reason. One probe per attempt for "
+            "the whole scope, not one per waiting task. Clamped to 1..1000.",
+        ),
+    )
+    dependency_wait_deadline_secs: int = field(
+        default=3600,
+        metadata=_meta(
+            "Dependency Wait Deadline (seconds)",
+            "Wall-clock ceiling a task may wait on one dependency scope before "
+            "it is failed with the reason; 0 disables the clock and leaves only "
+            "the attempts cap. Clamped to 0..86400.",
+        ),
+    )
+    dependency_wake_per_tick: int = field(
+        default=0,
+        metadata=_meta(
+            "Dependency Wake Per Tick",
+            "How many waiting tasks a recovered dependency releases per wake "
+            "tick, after the single probe that confirms recovery. 0 = the "
+            "current effective admission capacity, so a recovered dependency "
+            "never replays every waiter at once. Clamped to 0..4096.",
+        ),
+    )
+    dependency_wake_spacing_secs: float = field(
+        default=1.0,
+        metadata=_meta(
+            "Dependency Wake Spacing (seconds)",
+            "Pause between wake ticks while a recovered dependency's waiters are "
+            "released in capacity-sized batches. Clamped to 0..60.",
+        ),
+    )
+    interactive_command_policy: str = field(
+        default="cancel",
+        metadata=_meta(
+            "Interactive Command Policy",
+            "What the tool-stall watchdog does when a stalled shell command is "
+            "classified as waiting for input (a pager, editor, REPL or confirm "
+            "prompt). 'cancel' ends that tool call non-lethally and re-drives the "
+            "turn with a non-interactive hint; 'wait' announces a waiting_input "
+            "status once and keeps the turn open for real input, bounded by the "
+            "turn's own ceiling. Neither ever answers the prompt itself. Read "
+            "when a session handle is created and on config hot-apply.",
+            enum=["cancel", "wait"],
         ),
     )
     workflow_run_timeout_secs: int = field(
@@ -1461,6 +1712,9 @@ class AgentConfig:
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
+        # And for the content-filter fallback model — same shapes, junk
+        # collapses to "" (off) rather than "auto".
+        self.refusal_fallback_model = coerce_refusal_fallback_model(self.refusal_fallback_model)
 
     def resolve_model(self, role: str) -> str:
         """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
@@ -1801,6 +2055,14 @@ class MemoryConfig:
             "Embedding Model File Stamp",
             "Managed file identity for verified custom weights: device, inode, byte size, "
             "modification nanoseconds and change nanoseconds. An empty list means unverified.",
+        ),
+    )
+    embed_rebuild_generation: str = field(
+        default="",
+        metadata=_meta(
+            "Embedding Rebuild Generation",
+            "Managed explicit-apply request identity. Stores acknowledge it only after "
+            "invalidating their previous vectors; empty preserves ordinary upgrade behavior.",
         ),
     )
     embed_model_legacy_ids: list[str] = field(
@@ -2950,6 +3212,26 @@ class DashboardConfig:
             "Click a suggested reply to send it instantly. Shift+Click to select multiple.",
         ),
     )
+    model_picker_configured: bool = field(
+        default=False,
+        metadata=_meta(
+            "Model Picker Visibility Saved",
+            "Internal marker set after the user saves the interactive model "
+            "picker visibility list. It lets the dashboard distinguish a "
+            "never-configured picker from one intentionally saved with no "
+            "hidden models.",
+        ),
+    )
+    model_picker_hidden_models: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Selectable Models",
+            "Model IDs hidden from the interactive chat model picker. Empty shows "
+            "every advertised model; 'auto' is always shown. This preference does "
+            "not change entitlement, provider model discovery, defaults, role "
+            "models, fallback models, bulk switching, or app-specific model lists.",
+        ),
+    )
     session_grid: bool = field(
         default=False,
         metadata=_meta(
@@ -3004,9 +3286,13 @@ class DashboardConfig:
             "Terminal panel configuration. Set enabled=false to hide the CLI panel in the dashboard.",
             # Declared sub-keys become first-class schema entries
             # (dashboard.terminal.<key>) so Settings controls can reference
-            # them by configKey. The field stays a plain dict — undeclared
-            # keys (max_sessions, completion.commands, cwd) remain valid via
-            # additionalProperties and round-trip untouched.
+            # them by configKey and `kirocrew config set` accepts them on a
+            # config that has never written one (the CLI's key check consults
+            # SCHEMA_REGISTRY - see cli_config._declared_entry). `enabled` needs
+            # no declaration for that: it rides on the default_factory below, so
+            # it is always in the document that check walks. The field stays a
+            # plain dict, so a key added by a future release still round-trips
+            # untouched via additionalProperties.
             properties={
                 "shell": {
                     "type": "string",
@@ -3019,9 +3305,29 @@ class DashboardConfig:
                         ),
                     },
                 },
-                # Only `enabled` is declared; `completion.commands` (the
-                # subcommand-probe allowlist) stays an undeclared key, so the
-                # object is left open the same way `terminal` itself is.
+                "max_sessions": {
+                    "type": "integer",
+                    "default": 12,
+                    "x-meta": {
+                        "label": "Max terminal sessions",
+                        "help": (
+                            "Ceiling on concurrent terminal sessions across every chat, "
+                            "server-wide. Each chat's activity bar caps its own terminals "
+                            "below this; a session beyond the ceiling is refused."
+                        ),
+                    },
+                },
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "x-meta": {
+                        "label": "Default working directory",
+                        "help": (
+                            "Directory a terminal opens in when the chat passes no project "
+                            "directory of its own. Empty = $HOME."
+                        ),
+                    },
+                },
                 "completion": {
                     "type": "object",
                     "additionalProperties": True,
@@ -3039,6 +3345,28 @@ class DashboardConfig:
                                     "Show the completion popup while typing in the "
                                     "Terminal tab. Off = no popup; the shell's own Tab "
                                     "completion still works."
+                                ),
+                            },
+                        },
+                        # Left open like `completion` itself: a typed
+                        # `additionalProperties` would flatten into a
+                        # `commands.*` registry entry, which is not reachable
+                        # from the dataclass hierarchy the schema mirrors. The
+                        # values are protocol names and a value that is not one
+                        # is ignored by `terminal_commands.protocol_for`.
+                        "commands": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "default": {},
+                            "x-meta": {
+                                "label": "Completion protocol overrides",
+                                "help": (
+                                    "Re-point an already-allowlisted command at a different "
+                                    'completion protocol, e.g. {"docker": "cobra"}. It can '
+                                    "only change the protocol of a command the release "
+                                    "already knows - it cannot add one, because the "
+                                    "allowlist is the set of tools whose probe argv is "
+                                    "known to be inert."
                                 ),
                             },
                         },
@@ -3458,6 +3786,36 @@ class ExternalRegistryConfig:
     branch: str = field(
         default="main",
         metadata=_meta("Branch", "Git branch to read from."),
+    )
+    label: str = field(
+        default="",
+        metadata=_meta(
+            "Label",
+            "Display name shown instead of the registry id (e.g. 'Community apps' "
+            "for the id 'community'). DISPLAY ONLY: the id in `name` stays the "
+            "identity every cache path and every installed app's `_registry` tag "
+            "is keyed by, so a label change never moves an app or re-fetches an "
+            "index. Empty means the id is shown as-is. Setting it HERE has no "
+            "effect, for the same reason `trust` does not: this file is "
+            "agent-writable, so only a build-pinned row may claim one.",
+        ),
+    )
+    review: str = field(
+        default="",
+        metadata=_meta(
+            "Review",
+            "How thoroughly the listings in this registry were reviewed before "
+            "being published, which is what the UI tells the user. 'curated' "
+            "means the owning team reviewed each listing; 'community' means "
+            "contributors listed apps after a lighter review, so nothing here is "
+            "vetted; empty (the default) makes no claim either way and renders "
+            "exactly as it did before this field existed. It changes NO security "
+            "posture: `trust` alone selects the credential posture for cloning, "
+            "so a 'curated' registry at the untrusted index tier still clones "
+            "credential-free. Setting it HERE has no effect (see `label`): only a "
+            "build-pinned row may claim a tier.",
+            enum=["", "curated", "community"],
+        ),
     )
     trust: str = field(
         default="index",
@@ -4810,6 +5168,100 @@ class McpGatewayConfig:
             "agents with ~S servers each need N*S slots. Bounded by design: idle "
             "backends drain after idle_timeout_secs, so steady-state RAM tracks real "
             "concurrency, not this ceiling.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_initial: int = field(
+        default=4,
+        metadata=_meta(
+            "Spawn Concurrency",
+            "How many MCP backend spawn+initialize windows the broker runs at once, "
+            "across every server and session (pooled, private and respawned alike). "
+            "Further spawns wait their turn in FIFO order and the waiting stub is "
+            "kept informed, so a burst of new sessions cold-starts its servers a few "
+            "at a time instead of forking hundreds of processes against one disk. "
+            "This is the starting value the adaptive controller moves between "
+            "spawn_concurrency_min and spawn_concurrency_max. Distinct from "
+            "max_backends, which bounds how many backends stay RESIDENT.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_min: int = field(
+        default=1,
+        metadata=_meta(
+            "Spawn Concurrency Floor",
+            "Lowest value the adaptive controller may cut spawn concurrency to "
+            "under host pressure. At least 1: something always makes progress.",
+            restart=True,
+        ),
+    )
+    spawn_concurrency_max: int = field(
+        default=8,
+        metadata=_meta(
+            "Spawn Concurrency Ceiling",
+            "Highest value the adaptive controller may raise spawn concurrency to "
+            "when spawns keep succeeding without pressure.",
+            restart=True,
+        ),
+    )
+    spawn_queue_wait_secs: int = field(
+        default=600,
+        metadata=_meta(
+            "Spawn Queue Wait",
+            "Longest a session's stub is held in the broker's spawn queue before it "
+            "is refused for capacity. The default matches the stub's own reconnect "
+            "budget (a constant, mcp_gateway/stub.py _RECONNECT_TOTAL_BUDGET_SECS): "
+            "for that long kiro-cli's transport stays open and the server's tools "
+            "stay listed. This is a ceiling on the wait, never the wait itself -- "
+            "the daemon waits the smaller of this and the budget the stub asked "
+            "for, less a margin, so the refusal always reaches a stub that is still "
+            "listening. Raising this above 600 therefore buys a queued stub no "
+            "extra wait, because what the stub asked for caps it first; raise that "
+            "constant to wait longer. A spent wait is reported to the session as a "
+            "typed error naming the class and a retry hint, never as a crashed "
+            "server.",
+            restart=True,
+        ),
+    )
+    initialize_timeout_secs: int = field(
+        default=10,
+        metadata=_meta(
+            "Initialize Timeout",
+            "Seconds a freshly spawned backend has to answer its first MCP "
+            "initialize once the session sends it. A backend that stays silent is "
+            "failed and reaped so its slot frees; the broker holds the spawn "
+            "permit for this same window. Raise it for servers whose startup is "
+            "legitimately slow (large runtimes, remote resolution).",
+            restart=True,
+        ),
+    )
+    host_budget_max_procs: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Processes",
+            "Ceiling on MCP backend processes the broker is answerable for on this "
+            "host -- pooled, private and the per-session exec a stub runs when the "
+            "broker cannot serve it, charged identically. 0 (default) derives it "
+            "from available memory at broker start, never below max_backends.",
+            restart=True,
+        ),
+    )
+    host_budget_max_rss_mb: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Memory (MiB)",
+            "Ceiling on the summed per-backend memory estimate the broker admits. "
+            "0 (default) leaves memory to the process ceiling above.",
+            restart=True,
+        ),
+    )
+    host_budget_max_fds: int = field(
+        default=0,
+        metadata=_meta(
+            "Host Budget: Descriptors",
+            "Ceiling on the file descriptors the broker itself holds for backends "
+            "(three pipes each). 0 (default) derives it from the broker's own "
+            "open-file limit, leaving room for stub connections.",
             restart=True,
         ),
     )

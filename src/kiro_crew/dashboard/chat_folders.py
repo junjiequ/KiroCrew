@@ -1240,6 +1240,24 @@ def _slot_meta_txn_lock(state: Any) -> LoopBoundLock:
     return lock
 
 
+async def _subagent_work_pending(subagents: Any, parent_session_key: str) -> bool:
+    """Whether *parent_session_key* still has sub-agents running or QUEUED.
+
+    Asked through ``SubagentManager.has_pending_work_for_async``, whose store
+    ``count_pending`` runs on the task store's writer thread; the synchronous
+    entry takes the SQLite connection on the dashboard's own event loop. A
+    manager double without the async sibling is asked synchronously -- the
+    pre-queue behaviour those doubles model, and the same probe
+    ``handlers.messaging._spawn_on_loop`` makes for ``spawn_async``.
+    """
+    import inspect
+
+    entry = getattr(subagents, "has_pending_work_for_async", None)
+    if inspect.iscoroutinefunction(entry):
+        return bool(await entry(parent_session_key))
+    return bool(subagents.has_pending_work_for(parent_session_key))
+
+
 async def api_chat_slot_folder(request: web.Request) -> web.Response:
     """PATCH /api/chat/slots/{slot}/folder — assign slot to a folder."""
 
@@ -1285,6 +1303,16 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     folder_id = str(body.get("folder_id") or "")
     if folder_id and not any(f["id"] == folder_id for f in state._folders):
         return web.json_response({"error": "folder not found"}, status=400)
+    # Optional generation token. The identity re-check below covers THIS
+    # request's own awaits, but a caller that resolved the slot in an earlier
+    # request (``chat_folder_file_self`` reads ``/api/chat/slots`` first) has a
+    # gap this handler cannot see: its tab can close and the same slot key be
+    # recreated for a different conversation before its PATCH arrives, and the
+    # recreated slot carries the same ``dashboard:<key>`` transcript key, so the
+    # history pin alone cannot tell them apart. ``created_at`` is minted once
+    # per slot object and persisted, so echoing it back is the caller's proof
+    # that the slot it is filing is the one it resolved.
+    expected_created = str(body.get("expected_created") or "")
     # Serialize the whole re-check/mutate/persist/rollback span under the
     # state-wide metadata txn lock (rebind-stable; see _slot_meta_txn_lock):
     # with awaits inside the span, a second concurrent request would capture
@@ -1298,8 +1326,14 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
         # same slot OBJECT still registered under the name, routing still on
         # the transcript captured before the first await. No await between
         # this check and the mutation below; the _unhide_folder and persist
-        # awaits after it are covered by the save's pin.
-        if state._slots.get(name) is not slot or slot_history_key(slot) != authorized_history_key:
+        # awaits after it are covered by the save's pin. The generation token
+        # is checked in the same breath: a mismatch means the caller resolved a
+        # slot that has since been replaced under its key.
+        if (
+            state._slots.get(name) is not slot
+            or slot_history_key(slot) != authorized_history_key
+            or (expected_created and slot.created_at != expected_created)
+        ):
             source, caller = _audit_origin(request)
             sel().log_api_access(
                 caller=caller,
@@ -1559,7 +1593,7 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 # so deriving it differently here reports "idle" while that
                 # slot's subagents are still running and flips the execution
                 # model out from under them.
-                busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
+                busy = bool(await _subagent_work_pending(subs, effective_session_key(slot)))
             except Exception:
                 busy = True  # fail closed: refuse rather than risk the flip
         if slot.running or busy:
