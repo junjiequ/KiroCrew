@@ -61,9 +61,10 @@ MAX_TASK_FAILURES = 3
 MAX_STAGE_ROUNDS = 3
 MAX_STAGE_ESCALATIONS = 2  # after 2 escalations (= 9 rounds), force-fail
 
-# Whole-plan watchdog. ``stage_timeout_seconds`` bounds one stage; a plan with
-# many stages multiplies it, so a 10-stage plan at the 30-minute default can run
-# for hours unattended. This is the ceiling for the WHOLE run, checked at each
+# Whole-plan watchdog. ``stage_timeout_seconds`` gates the next automatic turn
+# after one stage has spent its budget; it never interrupts a running turn. A
+# plan with many stages still multiplies that budget, so a 10-stage plan at the
+# 30-minute default can run for hours unattended. This is the ceiling for the WHOLE run, checked at each
 # stage boundary, with a single warning once the run passes
 # ``PLAN_WARN_FRACTION`` of it so the user can intervene before the cut.
 PLAN_WARN_FRACTION = 0.75
@@ -236,11 +237,11 @@ class OrchestrationTracker:
 
     @property
     def stage_timeout_seconds(self) -> int:
-        """Configured per-stage timeout in seconds (0 = disabled).
+        """Configured stage start-gate budget in seconds (0 = disabled).
 
-        Public accessor for callers that need the raw budget -- e.g. the
-        orchestrator's ``asyncio.wait_for`` around a stage turn and its
-        subagent-wait poll cap, both of which derive from this value.
+        The budget decides whether another automatic stage turn may start; it
+        never interrupts a turn already running. Callers also derive the bounded
+        subagent-wait window from this value.
         """
         return self._stage_timeout
 
