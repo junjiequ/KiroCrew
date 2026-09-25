@@ -17307,6 +17307,43 @@ async def _run_chat(
                 await _deliver_cross_surface_reply(state, session_key, assistant_text)
     except asyncio.CancelledError:
         _crew_log_error = "CancelledError"
+        # A task cancellation is only the dashboard half of a turn. Stage and
+        # chat ceilings cancel this coroutine directly, unlike the user Stop
+        # path, which sends ACP ``session/cancel`` first. Without the native
+        # handoff the tool keeps running after the UI reports a timeout and its
+        # late result lands only in the discarded ACP transcript. Fire the
+        # established host-cancel seam here; an already-cancelled user Stop is
+        # an idempotent ``no_turn``.
+        native_cancel = asyncio.create_task(
+            state.sessions.cancel_current(session_key, wait_ack_timeout=0.0)
+        )
+        state._background_tasks.add(native_cancel)
+
+        def _native_cancel_done(task: asyncio.Task[Any]) -> None:
+            state._background_tasks.discard(task)
+            if task.cancelled():
+                logger.warning(
+                    "Native ACP cancellation task was cancelled for dashboard slot %s",
+                    slot.key,
+                )
+                return
+            try:
+                task.result()
+            except Exception:
+                logger.warning(
+                    "Could not cancel native ACP turn for cancelled dashboard slot %s",
+                    slot.key,
+                    exc_info=True,
+                )
+
+        native_cancel.add_done_callback(_native_cancel_done)
+        try:
+            await asyncio.shield(native_cancel)
+        except asyncio.CancelledError:
+            # A repeated cancellation belongs to this dashboard task, not to the
+            # native send it already started. The retained task completes in the
+            # background and its callback consumes and logs any failure.
+            pass
         _persist_partial_reply()
     except AcpAuthRequired as exc:
         # The signed-out CLI is discovered HERE, not by a probe: this is the

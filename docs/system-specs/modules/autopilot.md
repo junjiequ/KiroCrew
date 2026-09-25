@@ -295,8 +295,10 @@ entry.
    budget is a property of the plan, not of the mode, and a re-arm would let
    Go/Go All alternation refresh the ceiling indefinitely.
 4. Check `tracker.is_stage_timed_out()` **before** entering the stage, because
-   `start_stage` restarts the stage clock. On timeout: clear `_auto_run`, post
-   the elapsed notice, log `auto_run_timeout`, break.
+   `start_stage` restarts the stage clock. On timeout: clear `_auto_run`, reset
+   only the expired stage clock (failure and round budgets remain spent), post
+   the elapsed notice with fresh **Go / Cancel** controls, log
+   `auto_run_timeout`, and pause for human guidance.
 5. `tracker.start_stage(stage_num)` and append a `───── Stage N: Title ─────`
    separator (class `stage-sep`). `start_stage` registers the stage at **zero
    rounds** and restarts the stage clock; it deliberately spends no round, because
@@ -308,8 +310,16 @@ entry.
    (completed / execute-now / pending), previous stage results, the current
    stage's title and bullets, and an explicit "execute Stage N of M now"
    instruction. It is appended as a hidden user message (`auto-go` class) and
-   passed to `_run_chat`. An exception from `_run_chat` clears `_auto_run`,
-   posts a stage-error notice, logs `auto_run_stage_error`, and breaks.
+   passed to `_run_chat`. If the stage ceiling cancels `_run_chat`, the runner
+   also sends native ACP `session/cancel`; ending only the dashboard coroutine
+   is forbidden because a tool could otherwise keep running and land its result
+   only in the discarded native transcript. The controller preserves the exact
+   interrupted boundary, resets only its expired clock, marks it guidance-ready,
+   and posts fresh **Go / Cancel** controls. Ordinary human guidance may run
+   during that pause, but destructive history operations still see the reserved
+   boundary; Go closes the pause and reconciles the interrupted stage before any
+   later stage starts. An exception from `_run_chat` clears `_auto_run`, posts a
+   stage-error notice, logs `auto_run_stage_error`, and breaks.
 7. **Wait for the stage's sub-agents.** Registers one
    `SubagentManager.completion_event(parent_key)` for every immutable parent key
    captured by the boundary, pulsed once per terminal report from

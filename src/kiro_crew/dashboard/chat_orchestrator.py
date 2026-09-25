@@ -1440,9 +1440,12 @@ async def _stage_loop(
             # the per-stage clock, so reading it afterwards would always be 0.
             if tracker.is_stage_timed_out():
                 slot._auto_run = False
+                tracker.pause_after_stage_timeout()
+                _paused = True
                 _timeout_msg = (
                     f"⏱️ Stage {stage_num} timed out after {tracker.timeout_human}. "
-                    "Auto-run stopped."
+                    "Auto-run stopped. The stage is paused; choose **Go** to resume "
+                    "it, or **Cancel** to end the plan.\n\n[OPTION: Go | Cancel]"
                 )
                 slot.append("assistant", _timeout_msg, "msg msg-a")
                 state.broadcast_ws(
@@ -1582,9 +1585,12 @@ async def _stage_loop(
                 )
                 _timeout_msg = (
                     f"⏱️ Stage {stage_num} timed out after {tracker.timeout_human}. "
-                    "Auto-run stopped."
+                    "Auto-run stopped. The stage is paused; choose **Go** to resume "
+                    "it, or **Cancel** to end the plan.\n\n[OPTION: Go | Cancel]"
                 )
                 slot._auto_run = False
+                tracker.pause_after_stage_timeout()
+                _paused = True
                 slot.append("assistant", _timeout_msg, "msg msg-a")
                 state.broadcast_ws(
                     "chat_append",
@@ -1604,6 +1610,7 @@ async def _stage_loop(
                     )
                 )
                 _preserve_interrupted_stage()
+                stage_boundary_for(slot).awaiting_guidance = True
                 # stage-boundary-exit: stage-turn-timeout owned
                 break
             except Exception:

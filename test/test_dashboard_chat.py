@@ -3745,6 +3745,7 @@ class TestKiroReadinessQueueHandoff:
         client.stream_command = stream
         client.context_usage_pct = MagicMock(return_value=1.0)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.cancel_current = AsyncMock(return_value="acked")
         state.sessions.record_failure = AsyncMock()
         state.conversation_log = MagicMock()
         state.conversation_log.read_messages.return_value = []
@@ -6600,6 +6601,7 @@ class TestTokenPersistenceBackfill:
         client.context_used_tokens = MagicMock(return_value=0)
         client.context_window_tokens = MagicMock(return_value=0)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.cancel_current = AsyncMock(return_value="acked")
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.generate_session_summary",
             AsyncMock(return_value=None),
@@ -12938,6 +12940,11 @@ class TestOrchestratorPlanGateArming:
         ), "the user must see a timeout card, not a silently-advanced stage"
         seps = [m["content"] for m in slot.messages if "stage-sep" in m.get("cls", "")]
         assert not any("Stage 2" in s for s in seps), "a cut stage must NOT advance to the next one"
+        assert slot.stage_boundary.stage == 1
+        assert slot.stage_boundary.awaiting_guidance is True
+        assert any(
+            "[OPTION: Go | Cancel]" in m.get("content", "") for m in slot.messages
+        ), "a timed-out stage must offer an explicit resume-or-cancel checkpoint"
 
     @pytest.mark.asyncio
     async def test_stage_loop_disabled_timeout_does_not_abort_instantly(
@@ -13528,6 +13535,34 @@ class TestPythonStageLoop:
 
         run_chat_mock.assert_not_called()
         assert any(entry.get("content") == "unrelated post-login reply" for entry in slot._queue)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_stage_accepts_guidance_without_dropping_retry_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        """Timeout hands the floor back while the interrupted stage stays resumable."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("timed-out-stage-guidance", mode="orchestrator")
+        slot.stage_boundary.arm(1, consumed=True)
+        slot.stage_boundary.awaiting_guidance = True
+
+        run_chat_mock = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", run_chat_mock)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "the build may still be running", "slot": slot.key},
+            )
+            assert response.status == 200
+            assert (await response.json()).get("queued") is not True
+
+        assert slot.stage_boundary.stage == 1
+        assert slot.stage_boundary.awaiting_guidance is True
+        if slot.task is not None:
+            await asyncio.wait_for(slot.task, timeout=1)
+        run_chat_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_pending_stage_queues_stop_prefixed_message_without_escalation(
@@ -18578,6 +18613,7 @@ class TestAcpProcessDiedRecovery:
         state = _make_state(tmp_path)
         state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
         state.sessions.release = MagicMock()
+        state.sessions.cancel_current = AsyncMock(return_value="acked")
         state.sessions.reset = AsyncMock()
         state.sessions.set_approval_policy = MagicMock()
         state.sessions.check_context_usage = MagicMock()
@@ -18929,6 +18965,88 @@ class TestAcpProcessDiedRecovery:
         assert assistant_msgs, "Expected at least one assistant message with redacted content"
         for m in assistant_msgs:
             assert "AKIA1234567890ABCDEF" not in m.get("content", "")
+
+    @pytest.mark.asyncio
+    async def test_outer_cancellation_cancels_the_native_acp_turn(self, tmp_path: Path) -> None:
+        """Cancelling the dashboard runner must also cancel its native ACP turn.
+
+        A stage ceiling cancels ``_run_chat`` directly. Without this handoff the
+        dashboard reports a timeout while the native tool keeps running and its
+        late result lands only in the discarded ACP transcript.
+        """
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        entered = asyncio.Event()
+
+        async def _stream_until_cancelled(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="work started")
+            entered.set()
+            await asyncio.Event().wait()
+
+        client.stream = _stream_until_cancelled
+        client.stream_command = _stream_until_cancelled
+
+        task = asyncio.create_task(_run_chat(state, slot, "test message"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(task, timeout=1)
+
+        state.sessions.cancel_current.assert_awaited_once_with(
+            "dashboard:pipe-death-slot", wait_ack_timeout=0.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_cancellation_does_not_abandon_native_cancel_or_partial_reply(
+        self, tmp_path: Path
+    ) -> None:
+        """A repeated cancel must not interrupt native cancellation cleanup.
+
+        The stage deadline supplies the first cancellation. Gateway shutdown can
+        supply a second one while ``session/cancel`` is still being sent. That
+        interleave must retain the native cancel task and persist text the user
+        already watched stream instead of abandoning both cleanup obligations.
+        """
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        stream_entered = asyncio.Event()
+        native_cancel_entered = asyncio.Event()
+        release_native_cancel = asyncio.Event()
+        native_cancel_completed = asyncio.Event()
+
+        async def _stream_until_cancelled(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="work started")
+            stream_entered.set()
+            await asyncio.Event().wait()
+
+        async def _gated_native_cancel(*args, **kwargs):
+            native_cancel_entered.set()
+            await release_native_cancel.wait()
+            native_cancel_completed.set()
+            return "acked"
+
+        client.stream = _stream_until_cancelled
+        client.stream_command = _stream_until_cancelled
+        state.sessions.cancel_current = AsyncMock(side_effect=_gated_native_cancel)
+
+        task = asyncio.create_task(_run_chat(state, slot, "test message"))
+        await asyncio.wait_for(stream_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(native_cancel_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        release_native_cancel.set()
+        try:
+            await asyncio.wait_for(task, timeout=1)
+        except asyncio.CancelledError:
+            pass
+        await asyncio.wait_for(native_cancel_completed.wait(), timeout=1)
+
+        assert any(
+            m.get("role") == "assistant" and m.get("content") == "work started"
+            for m in slot.messages
+        ), "the second cancellation skipped partial-reply persistence"
 
     @pytest.mark.asyncio
     async def test_retry_requeues_via_queue_insert(self, tmp_path: Path) -> None:

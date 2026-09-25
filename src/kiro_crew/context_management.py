@@ -140,6 +140,16 @@ class OrchestrationTracker:
         self._task_failures.clear()
         self._stage_start = 0.0  # reset timeout clock for next stage
 
+    def pause_after_stage_timeout(self) -> None:
+        """Re-arm only the expired stage clock for the next explicit Go.
+
+        A timeout is not user guidance and does not forgive task failures or
+        spent spawn rounds. It only stops unattended execution, so the stage's
+        next human-approved entry needs a fresh clock without resetting any
+        other safety budget.
+        """
+        self._stage_start = 0.0
+
     def is_force_failed(self, stage: int) -> bool:
         """True if stage has exhausted all escalations (2 escalations = 9 rounds)."""
         return self._stage_escalations.get(stage, 0) >= MAX_STAGE_ESCALATIONS
