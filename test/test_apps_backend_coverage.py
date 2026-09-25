@@ -3409,6 +3409,41 @@ class TestBackendTargetLease:
         bmod.release_app_backend_target(lease)
         assert ap.forward_leases == 0
 
+    def test_adopted_record_uses_a_separate_tracked_target_lease(self) -> None:
+        adopted = AppProcess(
+            app_name="adopted",
+            port=9200,
+            pid=0,
+            proc=None,
+            healthy=True,
+            adopted_pids=[888],
+            adopted_start_times={888: "start-888"},
+        )
+        with bmod._lock:
+            bmod._processes[adopted.app_name] = adopted
+            bmod._allocated_ports[adopted.app_name] = adopted.port
+
+        assert bmod.acquire_app_backend_target("adopted", "current") is None
+        lease = bmod.acquire_adopted_app_backend_target("adopted")
+        assert lease is not None
+        assert (lease.port, lease.pid) == (adopted.port, 888)
+        assert adopted.forward_leases == 1
+        bmod.release_app_backend_target(lease)
+        assert adopted.forward_leases == 0
+
+    def test_adopted_target_requires_complete_owner_identities(self) -> None:
+        adopted = AppProcess(
+            app_name="adopted",
+            port=9200,
+            pid=0,
+            proc=None,
+            healthy=True,
+            adopted_pids=[888],
+        )
+        with bmod._lock:
+            bmod._processes[adopted.app_name] = adopted
+        assert bmod.acquire_adopted_app_backend_target("adopted") is None
+
     @pytest.mark.parametrize("state", ["stale", "unhealthy", "retiring", "adopted", "dead"])
     def test_untrusted_target_states_fail_closed(self, state: str) -> None:
         ap = self._track()

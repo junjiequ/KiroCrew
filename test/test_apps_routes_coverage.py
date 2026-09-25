@@ -49,7 +49,6 @@ from kiro_crew.apps.routes import (
     _resolve_app_backend_url,
     _sync_builtin_config,
     _unregister_notification_channels,
-    invalidate_app_secret_cache,
     register_app_routes,
 )
 
@@ -97,7 +96,6 @@ def _setup_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     bmod._processes.clear()
     bmod._allocated_ports.clear()
     monkeypatch.setattr(routes_mod, "sel", lambda: MagicMock())
-    invalidate_app_secret_cache(APP)
     return home
 
 
@@ -4021,7 +4019,6 @@ class TestAppSecretReads:
         assert _get_app_secret(APP) == "second"
         secret_file.unlink()
         assert _get_app_secret(APP) == ""
-        invalidate_app_secret_cache(APP)  # compatibility no-op
         assert _get_app_secret(APP) == ""
 
 
@@ -4190,7 +4187,6 @@ class TestApiProxyAuthorization:
         secret_file = home / "apps" / APP / ".app_secret"
         if secret_file.exists():
             secret_file.unlink()
-        invalidate_app_secret_cache(APP)
         monkeypatch.setattr(
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
@@ -4209,7 +4205,6 @@ class TestApiProxyAuthorization:
         _install(tmp_path)
         enable_app(APP)
         (home / "apps" / APP / ".app_secret").write_text("k", encoding="utf-8")
-        invalidate_app_secret_cache(APP)
         monkeypatch.setattr(
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
@@ -4228,7 +4223,6 @@ class TestApiProxyAuthorization:
         _install(tmp_path)
         enable_app(APP)
         (home / "apps" / APP / ".app_secret").write_text("k", encoding="utf-8")
-        invalidate_app_secret_cache(APP)
         monkeypatch.setattr(
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
@@ -4302,6 +4296,46 @@ async def test_managed_backend_forwards_only_to_matching_tracked_generation(
 
 
 @pytest.mark.asyncio
+async def test_adopted_backend_forwards_through_its_tracked_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiro_crew.apps.backend as bmod
+    from kiro_crew.apps.backend import AppProcess
+
+    home = _setup_env(tmp_path, monkeypatch)
+    _install(tmp_path, backend={"entryPoint": "server.py", "port": "7801"})
+    enable_app(APP)
+    secret = "adopted-generation"
+    (home / "apps" / APP / ".app_secret").write_text(secret, encoding="utf-8")
+    seen: list[bytes] = []
+
+    async def _backend(request: web.Request) -> web.Response:
+        seen.append(await request.read())
+        return web.json_response({"ok": True})
+
+    backend = web.Application()
+    backend.router.add_post("/api/run", _backend)
+    async with TestServer(backend) as backend_server:
+        adopted = AppProcess(
+            app_name=APP,
+            port=backend_server.port,
+            pid=0,
+            proc=None,
+            healthy=True,
+            adopted_pids=[888],
+            adopted_start_times={888: "start-888"},
+        )
+        with bmod._lock:
+            bmod._processes[APP] = adopted
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(f"/apps/{APP}/api/run", data=b"signed body")
+            assert resp.status == 200
+            assert await resp.json() == {"ok": True}
+        assert seen == [b"signed body"]
+        assert adopted.forward_leases == 0
+
+
+@pytest.mark.asyncio
 async def test_api_proxy_signs_and_forwards_to_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4318,7 +4352,6 @@ async def test_api_proxy_signs_and_forwards_to_backend(
     _install(tmp_path)
     enable_app(APP)
     (home / "apps" / APP / ".app_secret").write_text("proxy-key", encoding="utf-8")
-    invalidate_app_secret_cache(APP)
 
     seen: dict[str, Any] = {}
 

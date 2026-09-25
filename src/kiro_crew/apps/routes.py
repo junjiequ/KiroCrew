@@ -32,6 +32,7 @@ from aiohttp import web
 from kiro_crew import platform_compat
 from kiro_crew.apps import official_catalog
 from kiro_crew.apps.backend import (
+    acquire_adopted_app_backend_target,
     acquire_app_backend_target,
     list_app_processes,
     recorded_backend_port,
@@ -809,8 +810,6 @@ async def handle_install_app(request: web.Request) -> web.Response:
                 error=result.error,
             )
             return web.json_response(result.to_dict(), status=400)
-        invalidate_app_secret_cache(result.name)
-
         # Same gate as the registry paths: a fresh install whose manifest declares
         # ``permissions.sessionApproval`` is consent-pending, so its resources
         # are not registered and its backend does not start until the user
@@ -1711,11 +1710,10 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                     # time this runs `uninstall_app` has already removed the app's
                     # files, so the uninstall is past being retried as a whole. An
                     # ENOSPC or a permission error here would raise straight out of
-                    # the handler and skip `invalidate_app_secret_cache`,
-                    # `_unregister_notification_channels` and `forget_app_hooks` --
-                    # and a surviving slot-close hook makes the removed app's
-                    # leftover tabs UNDISMISSABLE, which costs the user more than
-                    # the pointer this write failed to persist. The CLI sibling
+                    # the handler and skip `_unregister_notification_channels`
+                    # and `forget_app_hooks` -- and a surviving slot-close hook makes
+                    # the removed app's leftover tabs UNDISMISSABLE, which costs the
+                    # user more than the pointer this write failed to persist. The CLI sibling
                     # states the same rule as `SessionPointerCleanup(failed=True)`.
                     try:
                         await sessions.aflush()
@@ -1748,7 +1746,6 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             error=result.error,
         )
         return web.json_response(result.to_dict(), status=400)
-    invalidate_app_secret_cache(name)
     _unregister_notification_channels(request, name)
     # Same reason as the line above, for the hook registries: uninstall is the
     # terminal path, so an entry left behind is a closure over a store this
@@ -4127,11 +4124,6 @@ def _get_app_secret(name: str) -> str:
     return path.read_text().strip() if path.is_file() else ""
 
 
-def invalidate_app_secret_cache(name: str) -> None:
-    """Compatibility hook retained for lifecycle callers; secrets are uncached."""
-    return None
-
-
 _PROXY_HOP_HEADERS = frozenset(
     {
         "connection",
@@ -4280,6 +4272,8 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
         backend_url: str | None
         if manifest.backend.entryPoint:
             lease = acquire_app_backend_target(name, secret)
+            if lease is None:
+                lease = acquire_adopted_app_backend_target(name)
             if lease is None:
                 return web.json_response(
                     {

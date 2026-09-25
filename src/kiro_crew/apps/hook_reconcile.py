@@ -192,6 +192,13 @@ async def _reconcile_managed_backend(
         return
     if _stopping or (ap is not None and ap.starting):
         return
+    if ap is not None and ap.proc is None:
+        # Externally-managed adoption is an existing audited capability.  It
+        # has no spawn-time secret digest, and this reconciler must not turn
+        # that absence into permission to kill and replace the operator's
+        # process.  The backend health watcher owns adopted-record recovery.
+        _backend_retry_after.pop(name, None)
+        return
 
     generation_matches = await asyncio.to_thread(app_backend_matches_current_secret, name)
     if generation_matches is None:

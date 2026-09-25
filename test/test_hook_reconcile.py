@@ -139,7 +139,7 @@ def _harness(monkeypatch):
 def _managed_backend_harness(monkeypatch):
     calls: list[str] = []
     state: dict[str, Any] = {
-        "process": SimpleNamespace(starting=False),
+        "process": SimpleNamespace(starting=False, proc=object()),
         "matches": False,
         "denied": None,
         "transient": False,
@@ -191,6 +191,25 @@ async def test_stale_managed_backend_is_replaced(_harness, _managed_backend_harn
     await hr.reconcile_once([app])
     assert calls == ["stop", "start", "audit:allowed"]
     assert state["process"] is state["spawn_result"]
+    assert "managed" not in hr._backend_retry_after
+
+
+@pytest.mark.asyncio
+async def test_adopted_managed_backend_remains_externally_managed(
+    _harness, _managed_backend_harness
+):
+    _, (set_current, _, _) = _harness
+    calls, state = _managed_backend_harness
+    state["process"] = SimpleNamespace(
+        starting=False,
+        proc=None,
+        adopted_pids=[888],
+    )
+    app = _app_info("managed", hooks=False, managed=True)
+    set_current(app)
+    await hr.reconcile_once([app])
+    assert calls == []
+    assert state["process"].adopted_pids == [888]
     assert "managed" not in hr._backend_retry_after
 
 

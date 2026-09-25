@@ -3293,6 +3293,35 @@ def acquire_app_backend_target(app_name: str, secret: str) -> BackendTargetLease
         return BackendTargetLease(port=ap.port, pid=ap.pid, _process=ap)
 
 
+def acquire_adopted_app_backend_target(app_name: str) -> BackendTargetLease | None:
+    """Lease a healthy backend already adopted under the existing contract.
+
+    Adoption is an explicit externally-managed capability: the gateway records
+    the listener owners and their start-time identities, but did not spawn the
+    process and therefore has no spawn-time secret digest to compare.  Keep
+    that capability separate from :func:`acquire_app_backend_target` so an
+    absent tracking record can never become permission to use a manifest port.
+
+    The lease serializes gateway teardown with request transmission.  It does
+    not claim control over the external supervisor, matching the existing
+    adoption contract.
+    """
+    with _lock:
+        ap = _processes.get(app_name)
+        if (
+            ap is None
+            or not ap.healthy
+            or ap.retiring
+            or ap.starting
+            or ap.proc is not None
+            or not ap.adopted_pids
+            or set(ap.adopted_pids) != set(ap.adopted_start_times)
+        ):
+            return None
+        ap.forward_leases += 1
+        return BackendTargetLease(port=ap.port, pid=ap.adopted_pids[0], _process=ap)
+
+
 def release_app_backend_target(lease: BackendTargetLease) -> None:
     """Return a target lease and wake teardown waiting on this process."""
     with _forward_leases_changed:
