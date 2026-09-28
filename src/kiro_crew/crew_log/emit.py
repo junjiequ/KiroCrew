@@ -6,8 +6,9 @@ dashboard chat path where a lifecycle fact is already known, and every one of
 them is **fail-soft** -- a crew log error is reported once and then swallowed, so a
 broken crew log can never break a turn.
 
-The whole module is inert unless ``KIROCREW_CREW_LOG`` is truthy. With the
-flag off nothing is created and every call returns immediately.
+The module is on by default and inert when ``KIROCREW_CREW_LOG`` is set to a
+falsy value (``0``/``false``/``no``/``off``). With the flag off nothing is
+created and every call returns immediately.
 
 The grouping identity of a session entry is ``data.turn`` -- the runner's own turn
 ordinal -- and, inside a turn, ``data.step``, the MODEL CALL the entry belongs to.
@@ -103,7 +104,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import env_flag_enabled
+from kiro_crew.constants import CREW_LOG_ENV, crew_log_enabled
 from kiro_crew.executors import crew_log_executor
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -114,9 +115,6 @@ if TYPE_CHECKING:  # pragma: no cover -- typing only; the runtime import stays g
     from kiro_crew.crew_log.store import CrewLog
 
 logger = logging.getLogger(__name__)
-
-#: Turning this on is a separate change from landing the emitter.
-CREW_LOG_ENV = "KIROCREW_CREW_LOG"
 
 _KIND = "session"
 
@@ -615,7 +613,7 @@ def _crew_log() -> Any:
     gate -- pure glue, no import-time work, no shutdown hook registered until a
     write happens -- and the package it fronts (the store, the schema and the
     lease) stays unloaded until one of the entry points below reaches storage. A
-    launch with ``KIROCREW_CREW_LOG`` unset never imports it, because
+    launch with ``KIROCREW_CREW_LOG`` switched off never imports it, because
     ``enabled()`` refuses before any of those paths is taken.
     """
     global _subsystem
@@ -628,7 +626,7 @@ def _crew_log() -> Any:
 
 def enabled() -> bool:
     """True when the emitter should write. Read per call, never cached."""
-    return env_flag_enabled(CREW_LOG_ENV)
+    return crew_log_enabled()
 
 
 def _notify() -> None:
@@ -3060,6 +3058,49 @@ def _candidate_is_same_slot(candidate_sid: str, slot: str) -> bool:
     return unit_header_slot(_KIND, candidate_sid) == slot
 
 
+def slot_previous_store(slot: str) -> "tuple[str, bool, bool]":
+    """The crew log *slot* is writing NOW, as ``(sid, decided, complete)``.
+
+    Read from the store, so it survives the process that wrote it. Every gateway
+    process asking this question of the same slot gets the same answer: the units
+    under *slot* and the succession edges they recorded are the whole input, and a
+    restart reads them exactly as the process before it would have. The
+    slot-to-session mapping cannot answer it -- an allocation whose history replay
+    is pending holds the prior resumable id there on purpose, so for that window the
+    mapping names a generation older than the store the slot is writing.
+
+    FOUR answers, because a caller must tell three kinds of empty apart. A ``sid``
+    names the store. ``decided`` false is "the units could not be read, or do not
+    say" -- a unit that would not open, more than one uncited unit -- and falling
+    back THERE would hand the edge to the very source this read was preferred over,
+    which inside the replay window is a generation behind. The honest outcome is no
+    edge: one citation lost transiently, rather than a wrong citation frozen into an
+    append-only entry.
+
+    The two DECIDED empties differ by ``complete``, and a caller that flattens them
+    writes a false statement. Complete means the store holds no unit of this slot at
+    all, so the absence of a predecessor is the whole truth and the caller may state
+    it. Incomplete means the store holds units it cannot rank -- units written before
+    these keys existed, or several each stating they start the chain -- so the caller
+    may consult its next source and may state NOTHING, because an empty answer from
+    that source means only that it had nothing to give, not that this slot has no
+    earlier store.
+
+    Blocking, and gated: a launch with the crew log off answers ``("", True, True)``,
+    which is also what keeps the storage subsystem unimported there -- no unit exists,
+    so there is nothing indeterminate about it and the absence is complete. The caller
+    hops a thread for this
+    (:func:`~kiro_crew.crew_log.session_tree.slot_chain_head` lists the store and
+    reads a line pair per unit of the slot).
+    """
+    if not slot or not enabled():
+        return ("", True, True)
+    from kiro_crew.crew_log.session_tree import slot_chain_head
+
+    head = slot_chain_head(slot)
+    return (head.sid, head.decided, head.complete)
+
+
 def on_session_opened(
     session_id: str,
     *,
@@ -3077,6 +3118,7 @@ def on_session_opened(
     channel: bool = False,
     workspace: str = "",
     previous_sid: str = "",
+    previous_undecided: bool | None = None,
 ) -> None:
     """Create the crew log if this session has none, then echo its header.
 
@@ -3284,6 +3326,24 @@ def on_session_opened(
                 else ""
             ),
         )
+        # Buffered beside the id above and gated the same way, because it answers the
+        # same question: what this entry says about the slot's earlier store. It is
+        # only meaningful when NOTHING was named -- a named edge already says the
+        # predecessor is known -- so a caller passing both leaves the id winning.
+        #
+        # THREE values, not two, and the third is the one that keeps this honest. A
+        # caller that looked reports what it found; a caller that never looked passes
+        # nothing, and this entry then says nothing either way. Collapsing the last
+        # two would make the emitter state a conclusion on behalf of a caller that
+        # never reached one, which is the same defect as reading an absent key as a
+        # conclusion, written from the other side.
+        determined = announce.setdefault(
+            "previous_determined", bool(created and previous_undecided is not None)
+        )
+        unresolved = announce.setdefault(
+            "previous_unresolved",
+            bool(created and previous_undecided is True and not superseded),
+        )
         if not announce.setdefault("owed", created or bool(resumed)):
             # Nothing new to say about the OPENING, which is what this entry
             # records. A class that has moved since the last statement of it is
@@ -3317,6 +3377,34 @@ def on_session_opened(
             # No ``slot`` inside: it is the slot in ``data.slot``, and repeating it
             # would invite a reader to trust a second copy of one fact.
             data["previous"] = {"sid": superseded}
+        elif unresolved:
+            # A predecessor EXISTS and could not be named. Recorded BESIDE the
+            # citation rather than as an empty one, because ``previous.sid`` is
+            # required and a citation naming nothing would be a weaker promise for
+            # every reader of it. This is a third thing from the two a reader already
+            # tells apart: a named edge, and neither key, which means this log starts
+            # the slot's chain. Without it this log would read as that chain start,
+            # and a fold ranking the slot's logs would pass over it and elect the log
+            # before it -- the citation this read refused to guess, written anyway by
+            # another route and frozen into an append-only entry.
+            data["previous_undecided"] = True
+        elif created and determined and not previous_sid:
+            # The caller LOOKED and there is no predecessor: this is the slot's first
+            # store. Stated rather than left to the absence of the other two keys,
+            # because a store written before any of these keys existed also has none of
+            # them -- and ITS omission may equally be a predecessor the gateway of the
+            # day failed to name. Only a store that says this may be passed over when a
+            # later reader ranks the slot's stores. A named predecessor that was
+            # REJECTED for belonging to another slot says nothing either way, so it
+            # falls through to writing no key at all.
+            #
+            # ``determined`` is what makes the claim answerable for, and it is not a
+            # formality: a caller that hands over an id it read from one source and
+            # never established whether a predecessor exists would otherwise have this
+            # entry declare, in an append-only record, that the slot has none. An empty
+            # id from such a caller means "I have nothing to give you", which is the
+            # unexplained silence this key exists to be distinguished FROM.
+            data["previous_none"] = True
         if parent_slot:
             # Written only when there IS a creator, and ``sid`` only when the
             # creator still had a live handle: an empty string in either place
@@ -4592,8 +4680,8 @@ def on_plan_updated(session_id: str, turn: int, *, items: Any) -> None:
 
     Guarded on the flag HERE rather than relying on :func:`_write`'s own guard,
     because this function does real work before it reaches one: a redaction per task
-    and a serialize probe per admitted row, on the chat loop, for a feature that is
-    off by default. The subagent and background emitters are guarded at their callers
+    and a serialize probe per admitted row, on the chat loop, for a feature that can
+    be switched off. The subagent and background emitters are guarded at their callers
     instead; this and :func:`on_approval_requested` are the two the runner calls
     unconditionally, so they carry their own.
     """
@@ -5538,6 +5626,7 @@ __all__ = [
     "on_turn_refused",
     "on_turn_started",
     "reset_caches",
+    "slot_previous_store",
 ]
 
 # The graceful path is the gateway's own cleanup hook, which drains in a thread

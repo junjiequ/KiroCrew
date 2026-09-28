@@ -1967,6 +1967,71 @@ class TestProvisionBuildPaths:
         monkeypatch.setattr(prov.shutil, "which", lambda exe: "/opt/python3.12")
         assert prov._find_python() == "/opt/python3.12"
 
+    def _windows_without_versioned_exe(self, monkeypatch: pytest.MonkeyPatch, launcher: str | None):
+        """A Windows host as python.org leaves it: ``python.exe`` only, never a
+        ``python3.12.exe``, so the versioned name resolves to nothing."""
+        monkeypatch.setattr(prov.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(prov.Path, "exists", lambda self: False)
+        monkeypatch.setattr(prov.shutil, "which", lambda exe: launcher if exe == "py" else None)
+
+    def test_find_python_asks_the_py_launcher_on_windows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = tmp_path / "Python312" / "python.exe"
+        real.parent.mkdir()
+        real.write_bytes(b"")
+        self._windows_without_versioned_exe(monkeypatch, r"C:\Windows\py.exe")
+        calls: list[list[str]] = []
+
+        def fake_check_output(cmd, **kwargs):
+            calls.append(cmd)
+            return f"{real}\n"
+
+        monkeypatch.setattr(prov.subprocess, "check_output", fake_check_output)
+        assert prov._find_python() == str(real)
+        # The launcher is asked for EXACTLY the wanted version: a host with
+        # several interpreters must not hand back whichever is the default.
+        assert calls[0][:2] == [r"C:\Windows\py.exe", "-3.12"]
+
+    def test_find_python_is_none_when_the_launcher_has_no_such_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._windows_without_versioned_exe(monkeypatch, r"C:\Windows\py.exe")
+
+        def no_such_version(cmd, **kwargs):
+            raise prov.subprocess.CalledProcessError(103, cmd)
+
+        monkeypatch.setattr(prov.subprocess, "check_output", no_such_version)
+        assert prov._find_python() is None
+
+    def test_find_python_is_none_when_the_launcher_names_a_missing_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._windows_without_versioned_exe(monkeypatch, r"C:\Windows\py.exe")
+        gone = tmp_path / "uninstalled" / "python.exe"
+        monkeypatch.setattr(prov.subprocess, "check_output", lambda cmd, **kw: f"{gone}\n")
+        assert prov._find_python() is None
+
+    def test_find_python_is_none_on_windows_without_a_launcher(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._windows_without_versioned_exe(monkeypatch, None)
+        monkeypatch.setattr(
+            prov.subprocess, "check_output", lambda *a, **k: pytest.fail("no launcher to run")
+        )
+        assert prov._find_python() is None
+
+    def test_find_python_never_runs_the_launcher_off_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(prov.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(prov.Path, "exists", lambda self: False)
+        monkeypatch.setattr(prov.shutil, "which", lambda exe: None)
+        monkeypatch.setattr(
+            prov.subprocess, "check_output", lambda *a, **k: pytest.fail("POSIX must not probe py")
+        )
+        assert prov._find_python() is None
+
 
 class TestProvisionDependencyInstall:
     """npm deps install before the dist build, and dev extras install in
@@ -3628,13 +3693,18 @@ class TestPodNameMutexOnLinux:
         module-level helper `boot` reaches that takes the lock would all deadlock
         identically, so pinning only the direct bare-name call would pin the letter
         of the rule rather than the property.
+
+        Read across the whole pod runtime -- ``runtime.py`` and every
+        ``runtime_*.py`` owner beside it -- because boot and the helpers it reaches
+        live in several of those modules, and a walk confined to one file would stop
+        at the first call that crosses into another.
         """
-        tree = ast.parse(Path(rt.__file__).read_text(encoding="utf-8"))
-        funcs = {
-            n.name: n
-            for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
+        funcs: dict[str, list[ast.AST]] = {}
+        for source in sorted(Path(rt.__file__).parent.glob("runtime*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs.setdefault(n.name, []).append(n)
 
         def called_names(fn: ast.AST) -> set[str]:
             out: set[str] = set()
@@ -3654,7 +3724,8 @@ class TestPodNameMutexOnLinux:
             if name in reached or name not in funcs:
                 continue
             reached.add(name)
-            stack.extend(called_names(funcs[name]))
+            for fn in funcs[name]:
+                stack.extend(called_names(fn))
 
         assert "boot" in reached, "boot must exist for this guard to mean anything"
         assert "pod_name_mutex" not in reached
@@ -7042,20 +7113,33 @@ class TestSessionBus:
     def test_systemctl_env_is_the_only_env_source_for_systemd_calls(self) -> None:
         """Anti-regression: a future direct ``subprocess.run(["systemctl", ...])``
         that forgets ``env=_systemctl_env()`` would silently reintroduce the bug,
-        so pin every systemd/journalctl spawn in the module to that one source.
+        so pin every systemd/journalctl spawn in the pod runtime -- ``runtime.py``
+        and every ``runtime_*.py`` owner beside it -- to that one source.
         """
         import ast
 
-        src = Path(rt.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        tree = ast.parse(Path(rt.__file__).read_text(encoding="utf-8"))
+        owner_trees = [
+            ast.parse(source.read_text(encoding="utf-8"))
+            for source in sorted(Path(rt.__file__).parent.glob("runtime_*.py"))
+        ]
+        assert owner_trees, "no pod runtime owner found beside runtime.py; the scan is mis-aimed"
 
+        # An owner reaches the core as ``runtime.<name>``, so both helpers also
+        # accept that spelling: ``runtime.subprocess.run`` and
+        # ``env=runtime._systemctl_env()``.
         def _is_subprocess_run(node: ast.Call) -> bool:
             fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "run"):
+                return False
+            receiver = fn.value
+            if isinstance(receiver, ast.Name):
+                return receiver.id == "subprocess"
             return (
-                isinstance(fn, ast.Attribute)
-                and fn.attr == "run"
-                and isinstance(fn.value, ast.Name)
-                and fn.value.id == "subprocess"
+                isinstance(receiver, ast.Attribute)
+                and receiver.attr == "subprocess"
+                and isinstance(receiver.value, ast.Name)
+                and receiver.value.id == "runtime"
             )
 
         def _uses_systemctl_env(node: ast.Call) -> bool:
@@ -7063,15 +7147,21 @@ class TestSessionBus:
                 if kw.arg != "env":
                     continue
                 val = kw.value
+                if not isinstance(val, ast.Call):
+                    return False
+                fn = val.func
+                if isinstance(fn, ast.Name):
+                    return fn.id == "_systemctl_env"
                 return (
-                    isinstance(val, ast.Call)
-                    and isinstance(val.func, ast.Name)
-                    and val.func.id == "_systemctl_env"
+                    isinstance(fn, ast.Attribute)
+                    and fn.attr == "_systemctl_env"
+                    and isinstance(fn.value, ast.Name)
+                    and fn.value.id == "runtime"
                 )
             return False
 
         literal_systemd = 0
-        for node in ast.walk(tree):
+        for node in (n for t in (tree, *owner_trees) for n in ast.walk(t)):
             if not isinstance(node, ast.Call) or not _is_subprocess_run(node):
                 continue
             argv = node.args[0] if node.args else None

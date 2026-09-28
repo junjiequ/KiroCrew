@@ -1916,7 +1916,7 @@ def test_an_empty_body_writes_no_sent_entry_at_all():
 
 def test_every_new_family_is_silent_with_the_flag_off(monkeypatch):
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     before = len(_body())
     emit.on_message_received(SESSION, 1, text="x")
     emit.on_message_sent(SESSION, 1, text="y")
@@ -1933,11 +1933,11 @@ def test_a_disabled_emitter_does_no_payload_work_at_all(monkeypatch):
 
     Hashing a tool result is proportional to its size and redaction walks a whole
     body, both once per frame on the event loop. An emitter that did that work and
-    then discarded it inside the writer would charge every user for a feature that
-    is off by default.
+    then discarded it inside the writer would charge a user who switched the log
+    off for work it then throws away.
     """
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     worked: list[str] = []
     monkeypatch.setattr(
         emit, "_payload_digest", lambda payload: worked.append("digest") or ("", -1)
@@ -3159,11 +3159,11 @@ def test_flag_off_writes_no_file_at_all(monkeypatch):
     assert not _store_root().exists()
 
 
-def test_flag_unset_writes_no_file_at_all(monkeypatch):
+def test_flag_unset_records_by_default(monkeypatch):
     monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
-    assert emit.enabled() is False
+    assert emit.enabled() is True
     _open_session()
-    assert not _store_root().exists()
+    assert _log_path().is_file()
 
 
 def test_flag_off_allocates_no_state_either(monkeypatch):
@@ -3204,14 +3204,16 @@ def test_a_flag_turned_off_mid_turn_still_releases_what_it_allocated(monkeypatch
     assert SESSION not in emit._pinned
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
-def test_the_flag_accepts_the_repo_truthy_spellings(monkeypatch, value):
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on", "", "  "])
+def test_the_flag_is_on_when_empty_or_truthy(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is True
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "2"])
-def test_the_flag_rejects_everything_else(monkeypatch, value):
+@pytest.mark.parametrize(
+    "value", ["0", "false", "FALSE", " no ", "off", "Off", "2", "disable", "fasle"]
+)
+def test_the_flag_is_off_for_a_falsy_or_unrecognised_spelling(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is False
 
@@ -4829,7 +4831,7 @@ print(
 
 
 def _boot_probe(tmp_path: Path) -> dict:
-    """Import a boot-path module in a CLEAN interpreter with the flag unset.
+    """Import a boot-path module in a CLEAN interpreter with the flag off.
 
     A clean process is the only place this is observable: the suite has already
     imported both the emitter and its storage package, so an in-process check
@@ -4840,6 +4842,7 @@ def _boot_probe(tmp_path: Path) -> dict:
         "PATH": os.environ.get("PATH", ""),
         "TMPDIR": str(tmp_path),
         "KIROCREW_HOME": str(tmp_path / "home"),
+        "KIROCREW_CREW_LOG": "0",
     }
     if sys.platform == "win32":  # pragma: no cover - parity with the lease suite
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
@@ -4877,10 +4880,7 @@ def test_a_flag_off_launch_does_not_load_the_storage_subsystem(tmp_path: Path) -
     """
     seen = _boot_probe(tmp_path)
     assert seen["glue"], "the probe did not reach the emitter at all, so it proves nothing"
-    assert seen["storage"] == [], (
-        "a launch with KIROCREW_CREW_LOG unset imported the storage subsystem: "
-        f"{seen['storage']}"
-    )
+    assert seen["storage"] == [], f"a flag-off launch imported storage: {seen['storage']}"
 
 
 def test_a_flag_off_launch_registers_no_shutdown_hook(tmp_path: Path) -> None:
@@ -5612,14 +5612,18 @@ def test_every_slot_allocation_site_latches_the_predecessor_first():
 
 
 def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
-    """A source ratchet, because the two accessors are one identifier apart.
+    """A source ratchet, because the sources are one identifier apart.
 
-    `mapped_sid` and `resumable_sid` differ by a filesystem stat and a prune, and
-    at this call site that difference is a sync store read on the gateway loop
-    plus the loss of the very edge being recorded. Both spellings type-check, both
-    return the id on the happy path, and every behavioural test of the emitter
-    passes either way, because the emitter is handed the value rather than
-    choosing it. So the choice is pinned where it is made.
+    Three spellings type-check here and only one is right. `mapped_sid` and
+    `resumable_sid` differ by a filesystem stat and a prune, and at this call site
+    that difference is a sync store read on the gateway loop plus the loss of the
+    very edge being recorded. Feeding the latch from the mapping ALONE type-checks
+    too, and is the defect this edge was moved off: the mapping is deliberately a
+    generation behind while an allocation's replay is pending, so a gateway that
+    restarts inside that window cites a generation back and the store between is
+    cited by nobody. Every behavioural test of the emitter passes on any of the
+    three, because the emitter is handed the value rather than choosing it. So the
+    choice is pinned where it is made.
 
     It is pinned at EVERY site, not one: the slot has two allocation sites -- the
     eager prefetch and the first real turn -- and a spelling that is right at one
@@ -5627,30 +5631,88 @@ def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
     edge, which is the shape that shipped broken once already. A site added later
     that feeds the latch from anything else reds this.
 
-    Mutation guard: swapping either call site to `resumable_sid`, or feeding the
-    latch from any other source, reds this.
+    Mutation guard: feeding either latch from `mapped_sid` directly, or swapping the
+    resolver's own fallback to `resumable_sid`, reds this.
     """
     runner = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_runner.py"
     source = runner.read_text(encoding="utf-8")
     # Joined because the call can be wrapped across lines; the whole expression is
     # what this pins, so a line-at-a-time read could not see it.
     flat = " ".join(source.split())
-    latches = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)[^)]*\)", flat)
-    # Both allocation sites, each reading the mapping through the non-pruning
-    # accessor under the session key. The `sessions` receiver differs because the
-    # prefetch is handed the boundary directly and the turn reaches it through
-    # `state`.
+    found = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)", flat)
+    # Paren-adjacent spaces dropped, because whether a call fits on one line is the
+    # formatter's business and this ratchet is about what feeds the latch.
+    latches = [call.replace("( ", "(").replace(" )", ")") for call in found]
+    # Both allocation sites, each latching ALL THREE parts of what the one resolver
+    # answered. A site that passed only the sid would latch a slot with an
+    # undetermined predecessor as one that has none; a site that dropped
+    # `from_mapping` would cite the mapping inside the window where it is knowingly a
+    # generation behind, because the slot cannot otherwise tell a mapped id from its
+    # own record.
     assert latches == [
-        "slot.latch_crew_log_previous(sessions.mapped_sid(session_key))",
-        "slot.latch_crew_log_previous(state.sessions.mapped_sid(session_key))",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
     ], f"the predecessor is latched somewhere unexpected: {latches}"
+    # Each of those reads its pair from the one helper that consults the store first.
+    # The `sessions` receiver differs because the prefetch is handed the boundary
+    # directly and the turn reaches it through `state`.
+    resolutions = re.findall(r"_previous = await _slot_predecessor_store\([^)]*\)", flat)
+    assert resolutions == [
+        "_previous = await _slot_predecessor_store(sessions, slot, session_key)",
+        "_previous = await _slot_predecessor_store(state.sessions, slot, session_key)",
+    ], f"the predecessor is resolved somewhere unexpected: {resolutions}"
+    # The store is the authority and the mapping is the fallback, read non-pruning,
+    # inside that one helper -- so this ratchet pins one resolution rather than one
+    # per call site.
+    resolver = source[source.index("async def _slot_predecessor_store(") :]
+    resolver = resolver[: resolver.index("\ndef ")]
+    assert "await asyncio.to_thread( crew_log_emit.slot_previous_store, slot.key )" in " ".join(
+        resolver.split()
+    )
+    # The mapping serves a DECIDED empty only, and comes back FLAGGED rather than
+    # cited: whether allocation is holding the prior resumable id back cannot be read
+    # here, because the marker belongs to a session this runs before. The undecided
+    # case names no store while SAYING so, rather than citing the source the store read
+    # was preferred over or passing for a log that has no predecessor at all. And the
+    # absence is STATED only when the store's answer is complete -- units it could not
+    # rank make an empty mapping no finding about this slot.
+    assert "undecided=False if complete else None," in resolver
+    assert 'return CrewLogPrevious(sid="", undecided=True)' in resolver
+    assert "provider_switch_replay_pending" not in resolver, (
+        "the replay window is decided in the resolver again, which runs before this "
+        "turn's session exists -- so a cold start reads 'no replay owed' from there "
+        "being nobody to ask, and cites the generation the mapping is holding"
+    )
     # Spent exactly once, at the emitter call, which is also where the slot is told
     # which store it is now on. A second consumer would hand the same edge to two
-    # entries; none would leave it for the slot's next store.
-    takes = [line.strip() for line in source.splitlines() if "take_crew_log_previous(" in line]
+    # entries; none would leave it for the slot's next store. The record is what names
+    # a store whose unit is still queued to the writer thread, so dropping it here
+    # reopens that window.
+    #
+    # Read off the FLATTENED source for the same reason the latches are: whether the
+    # call fits on one line is the formatter's business.
+    takes = [
+        call.replace("( ", "(").replace(" )", ")")
+        for call in re.findall(r"slot\.take_crew_log_previous\([^)]*\)", flat)
+    ]
     assert takes == [
-        "previous_sid=slot.take_crew_log_previous(now_writing=_crew_log_sid),"
+        "slot.take_crew_log_previous(now_writing=_crew_log_sid, "
+        "replay_pending=_crew_log_replay_owed)"
     ], f"the predecessor edge is consumed somewhere unexpected: {takes}"
+    # The window is asked about HERE, where a session exists to answer. Asked at the
+    # latch instead, a cold start is told "no replay owed" by the absence of anybody to
+    # ask, and that is the case where the mapping is most likely a generation behind.
+    assert (
+        "_crew_log_replay_owed = state.sessions.provider_switch_replay_pending(session_key) "
+        "is True" in flat
+    )
+    # BOTH halves reach the entry from that one handover. Feeding the emitter the sid
+    # alone would write a log that claims to start the slot's chain while its
+    # predecessor was merely undetermined.
+    assert "previous_sid=_crew_log_edge.sid," in source
+    assert "previous_undecided=_crew_log_edge.undecided," in source
 
 
 def test_the_predecessor_is_read_without_pruning_the_mapping():

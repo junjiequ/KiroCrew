@@ -155,20 +155,14 @@ writers, projections, migration, and transport are owned by
 [member-event-log.md](member-event-log.md); this core owns only the shared
 envelope, storage, lease, and damage rules it uses.
 
-## 5. The session-log format, pre-release
+## 5. The session-log format and its compatibility rule
 
-**The shapes below are PRE-RELEASE and may change.** `KIROCREW_CREW_LOG` defaults off, so
-the session emitter creates no session-kind unit on a stock install. The shared `crew-log`
-root is still pre-created as a security boundary, and independent member-kind logs may exist;
-neither freezes the default-off session entry shapes. While that holds, a session type may be
-added, removed or reshaped in one commit.
-
-**The freeze point is the release that turns the flag on by default.** From then on there are
-files a reader may hold, so the compatibility strategy has to be decided rather than assumed: a
-type gains fields additively and an unknown type is skipped when its writer marked it
-`ignorable`, OR a shape change carries a migration. That choice belongs to the change that flips
-the default, which is the first one with data to migrate. `version` is the escape hatch it would
-spend.
+`KIROCREW_CREW_LOG` defaults on, so a stock install writes session-kind units and a later
+build may read files an earlier one wrote. The shapes below change under one rule. A type
+gains fields additively, and a reader ignores a key it does not know. A new type that an
+older reader may safely skip is written `ignorable` (see "An unknown type is the reader's
+rule" below). Any other change to an existing type's shape carries a migration and spends
+`version`, the header's escape hatch.
 
 Every type is `domain/<past participle>`, a fact that happened. Every turn-scoped entry carries
 `data.turn`, and `data.step` where a step exists. `thread` stays unset on session entries.
@@ -344,17 +338,42 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id is the store this slot last handed to a
-`session/opened`, recorded on the slot as that entry's edge is spent. That record is the
-authority because it is the writer's own statement about which store the slot is on. The
-persisted slot-to-session mapping, read without pruning, is the fallback for a slot this process
-has not opened a crew log for. It cannot be the authority: an allocation whose replay is still
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, and an entry the read proves is the slot's first records `previous_none`,
+because neither meaning may rest on a key being ABSENT. A log that merely omits every
+predecessor key is one written before these keys existed, and its silence is equally "I am
+first" and "I could not tell": without the two fields the state a later fold must refuse on is
+byte-identical to the state it may pass over, and passing over it elects the log before it.
+The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not cited at all: an allocation whose
+replay is still
 pending holds the prior resumable id in the mapping on purpose, so that a restart can still
 resume it, and the mapping is then a generation
 behind -- two successive crew logs would cite one predecessor
 and the crew log between them would be cited by nobody, the one chain gap a reader cannot see.
+Whether that window is open is asked where a SESSION EXISTS to answer, as the edge is handed to
+an entry, and not where the id is read: the marker belongs to a live session, the read runs
+before this turn's session is allocated, and asked from there it answers "no replay owed" both
+when none is owed and when there is nobody to ask -- the second being a cold start, which is the
+restart this whole tier exists to survive. So a mapped id is carried provisional and becomes a
+recorded break at that point instead; what this process itself recorded is never provisional.
 A successful resume answers the same id and the emitter writes no edge,
 since a crew log cannot be its own predecessor.
+
+An empty answer from that mapping is a FINDING only when the store holds no unit of the slot at
+all. When it holds units this read could not rank, the mapping having nothing to give says nothing
+about the slot, so the entry records no predecessor key rather than stating it has none -- which
+would let a later fold pass over a log whose siblings sit uncited beside it.
 
 The edge is a citation and nothing else. Recording it opens no store for writing but this session's
 own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
@@ -562,7 +581,7 @@ running right now, and a rule that read the newest close would call it expired a
 conversation's log. Entries that are neither -- a turn, a tool, an in-flight closer the emitter writes
 after a teardown by design -- say nothing about the state and are skipped.
 
-Four things are skipped regardless of age, and each is a refusal rather than an oversight:
+Five things are skipped regardless of age, and each is a refusal rather than an oversight:
 
 - **An OPEN unit** -- one whose newest lifecycle entry is a `session/opened`, or which has no
   lifecycle entry in the window at all. The deciding entry is looked for in a bounded read of the
@@ -574,6 +593,8 @@ Four things are skipped regardless of age, and each is a refusal rather than an 
 - **A torn tail.** Unterminated trailing bytes are what `open(repair=True)` truncates, and the sweep
   cannot tell a dead writer's crash artifact from an append that has not reached its fsync -- the
   bytes are identical. Deleting the unit would destroy the history the repair exists to recover.
+- **A unit the session trash holds** (a `.trash-hold` file in its directory). Its session is
+  still in the trash or being restored, so the user can still get it back whole.
 - **A header whose id does not fold back to its own directory name.** The removal is aimed by id, so
   a directory carrying another unit's id would have the removal land on that other unit.
 - **A close whose reason does not END the ACP id's life.** A unit is collectable on exactly ONE reason:

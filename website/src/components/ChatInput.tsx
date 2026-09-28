@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, BrainCircuit, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -14,8 +14,8 @@ import { createPortal } from 'react-dom'
 import { InstantTip, useInstantTip } from './InstantTip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
-import { useAppSelector, useAppDispatch } from '../store'
-import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone, setAgentSwitchNotice, switchSlot } from '../store/chatSlice'
+import { useAppStore, useAppSelector, useAppDispatch } from '../store'
+import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone, setAgentSwitchNotice, switchSlot, selectSlotMessages } from '../store/chatSlice'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { useSlotId } from '../providers/SlotContext'
 import { useToolPillVisible } from '../store/toolPillRegistry'
@@ -148,6 +148,7 @@ import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
 import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
+import { LiquidGlass } from './ui/liquid-glass'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -629,7 +630,8 @@ interface ChatInputProps {
   stopState?: 'idle' | 'soft_pending' | 'killing'
   approvalMode?: string
   reasoningEffort?: string
-  onReasoningEffortClick?: (rect: DOMRect) => void
+  onReasoningEffortClick?: (rect: DOMRect, trigger: HTMLElement) => void
+  separateEffort?: boolean
   providerId?: string
   /** Invoked when an @-mention picks a file or directory. `kind` defaults to
    *  'file'. `token` is the exact composer text the pick inserted (e.g.
@@ -1001,6 +1003,7 @@ function ChatInput({
   approvalMode,
   reasoningEffort,
   onReasoningEffortClick,
+  separateEffort,
   providerId: _providerId,
   onFileSelect,
   onFileOpen,
@@ -1052,6 +1055,7 @@ function ChatInput({
     voiceDeviceSwitchIsLive = false,
     voiceTranscribing = false,
     voiceTranscribeActive,
+    voiceDrainCancellable = false,
     voiceBusyElsewhere = false,
     voiceBusyElsewhereSession = null,
     voiceHeldLanded = false,
@@ -1078,6 +1082,11 @@ function ChatInput({
   const disabled = disabledProp
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
+  // The store handle, read at click time (not subscribed) so "Optimize prompt"
+  // can pull THIS pane's slot messages without re-rendering every composer on
+  // each streamed frame. useAppStore returns the Provider-injected store, the
+  // same pattern ChatPane uses for its at-send reads.
+  const chatStore = useAppStore()
   const pendingApprovalRaw = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
   // Suppressed at the READ so every consumer (bar, ghost, pill, rounded-corner
   // class) follows one judgment instead of each render site re-deciding.
@@ -1504,6 +1513,10 @@ function ChatInput({
   // Below ~340px the labels no longer fit comfortably alongside the context bar
   // + model chip, so collapse the chips (agent/project) to icon-only.
   const shelfCompact = shelfWidth < 340
+  // A two-column split can leave under 200px per composer. Keep the value
+  // visible at ordinary compact widths, but let the title/aria label carry it
+  // when even the other shelf chips have no room for text.
+  const shelfTiny = shelfWidth < 220
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
   // previously discoverable is lost, and names the branch even when the label
@@ -1525,6 +1538,29 @@ function ChatInput({
   useEffect(() => {
     if (showDictation || voiceTranscribing) composerControl()?.focus()
   }, [showDictation, voiceTranscribing, composerControl])
+
+  // Discarding a drain from the strip's own button removes the element the press
+  // happened on: the discard clears `draining`, so `voiceDrainCancellable` goes
+  // false and the strip unmounts with the focused button inside it. The effect
+  // above cannot catch that -- a streaming drain has already cleared `recording`
+  // (so `showDictation` is null) and `voiceTranscribing` is the batch flag -- and
+  // focus would land on the document body, leaving the composer deaf to the very
+  // keyboard and touch users this control was added for. Hand focus back as part
+  // of the discard rather than on an effect edge, so it is the same press.
+  //
+  // Stays `undefined` when there is no discard to run, because the strip reads
+  // the handler's presence as one of the two terms deciding whether to offer the
+  // control at all: wrapping unconditionally would put a button on screen whose
+  // only effect is to move focus.
+  const cancelVoiceDrain = useMemo(
+    () => onVoiceCancel
+      ? () => {
+        onVoiceCancel()
+        composerControl()?.focus()
+      }
+      : undefined,
+    [onVoiceCancel, composerControl],
+  )
 
   // Escape CANCELS dictation (discards the audio), from ANYWHERE. Deliberately a
   // document-level listener rather than the textarea's onKeyDown: starting a
@@ -1891,7 +1927,14 @@ function ChatInput({
     onChange(next.value)
     requestAnimationFrame(() => composerControl()?.setSelection(next.caret, next.caret, { focus: true }))
   }, [value, onChange, composerControl])
-  const chatMessages = useAppSelector(s => s.chat.messages)
+  // The optimizer's context is the ONLY reader of this slot's message history,
+  // and only when "Optimize prompt" is clicked. Subscribing here forced every
+  // mounted composer to re-render on each streamed frame (Immer hands back a new
+  // `state.messages` reference per flush, so the `===` selector always tripped),
+  // which multiplied with N split panes. Read the slot's own messages at click
+  // time instead — `selectSlotMessages` returns THIS pane's slot (falling back
+  // to the active mirror when this pane IS active), which also fixes a bug where
+  // a non-active pane sent the *active* pane's conversation as optimizer context.
   /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
    *  this is the raw stored value and is not what the composer renders at. */
   const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
@@ -2667,7 +2710,17 @@ function ChatInput({
     // Pin the slot that owns this optimize so the overlay and the completion
     // handler stay bound to it across session switches.
     optimizeSlotRef.current = slotId
-    const context = chatMessages
+    // Read THIS pane's slot messages at click time (not via a live subscription),
+    // so a non-active pane optimizes against its own conversation, not the active
+    // pane's. When slotId is null (no SlotProvider / global composer) read the
+    // active mirror, which is exactly what the old `s.chat.messages` subscription
+    // returned; selectSlotMessages also falls back to that mirror for the active
+    // slot, so the focused composer's behavior is preserved.
+    const rootState = chatStore.getState()
+    const slotMessages = slotId
+      ? selectSlotMessages(rootState, slotId)
+      : rootState.chat.messages
+    const context = slotMessages
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .slice(-10)
       .map(m => (m.content || '').slice(0, 200))
@@ -2680,7 +2733,7 @@ function ChatInput({
     const referenced = pruneBlocks(txt, pasteBlocks)
     const pastes = referenced.map(b => ({ seq: b.seq, content: b.content }))
     runOptimize({ prompt: txt, context, pastes, slotId })
-  }, [runOptimize, chatMessages, pasteBlocks, slotId])
+  }, [runOptimize, pasteBlocks, slotId, chatStore])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Cmd/Ctrl+Shift+V → next paste inserts full text inline (no chip collapse).
@@ -4135,11 +4188,22 @@ function ChatInput({
       >{/* File drag-and-drop target. Drag-drop is inherently pointer-only; the
            keyboard-accessible path is the "Attach files" button that opens the
            hidden file input above. Hence the scoped disable for the drop zone. */}
+      {/* Liquid Glass pane under the composer: --glass-tint over the blurred
+           transcript; the wrapper's own hairline border takes --glass-edge so the
+           pane keeps an outline on a white page, where a lit white rim vanishes. Always
+           mounted so an approval box arriving above never remounts the editor;
+           while one is attached the wrapper goes back to a solid surface and
+           square top, and the glass simply sits hidden behind it. */}
+      <LiquidGlass
+        cornerRadius={16}
+        frost={24}
+        lightIntensity={24}
+      >
       {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${hasApproval ? 'bg-bg-elevated' : 'bg-transparent'} ${memoryMode === 'temporary' ? 'border-aim' : memoryMode === 'incognito' ? 'border-warn' : hasApproval ? 'border-border focus-within:border-accent/50' : 'border-[color:var(--glass-edge)] focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -4183,6 +4247,21 @@ function ChatInput({
         ) : (
           <VoiceStatusBar
             recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload}
+            /* The released utterance's own window. Gated on the transport of the
+               request IN FLIGHT, which is what `voiceDrainCancellable` reads: a
+               streaming drain is held against an open socket and the discard
+               closes it, while a batch transcription is already in the
+               transcriber's hands over HTTP and the strip offers it no exit
+               rather than an exit that leaves the work running.
+
+               Not on `voiceStreaming`. That is the saved setting, so it describes
+               the NEXT utterance; a setting flipped while one request is open
+               names a transport nothing in flight is using, and the control then
+               appears over a batch request whose transcript still lands. The flag
+               is ownership-gated at its source, so a composer offers the discard
+               for its OWN drain and never for a session another chat holds. */
+            draining={voiceDrainCancellable}
+            onCancelDrain={cancelVoiceDrain}
             /* Visible reasons, not tooltips: why the mic is blocked, or that a
                held dictation just arrived. Only while the mic is offered at all.
                Shown in hold mode too: one message, one shape, and the name
@@ -4880,7 +4959,7 @@ function ChatInput({
 
         {/* Mobile bottom sheet */}
 
-      </div></motion.div>)}
+      </div></LiquidGlass></motion.div>)}
       </AnimatePresence>
 
       {/* The way back. It stands exactly where the composer was and is the only
@@ -4953,7 +5032,7 @@ function ChatInput({
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
           !!sessionControls?.length) && (
-        <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
+        <div ref={shelfRef} data-testid="composer-context-shelf" className="pt-1 flex items-center gap-2 min-w-0">
           {/* App-contributed session controls live in their OWN group, not
               beside the agent/project chips. `max-two-buttons-per-row`
               (AUTOSDE.yaml, blocking) caps a horizontal group at 2 action
@@ -5237,13 +5316,29 @@ function ChatInput({
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>
                 </>
               )}
-              {onReasoningEffortClick && !shelfCompact && (
+              {onReasoningEffortClick && !separateEffort && !shelfCompact && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort || '')}</span>
                 </>
               )}
             </button>
+          )}
+          {separateEffort && onReasoningEffortClick && (
+            <div className="ml-1 pl-1 border-l border-border flex items-center shrink-0">
+              <Btn
+                type="button"
+                className={`inline-flex items-center h-7 gap-1.5 text-[12px] text-muted hover:text-text rounded-md border-none bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors ${shelfCompact ? 'px-1' : 'px-2'}`}
+                aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+                title={`${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortLabel(reasoningEffort || '')}`}
+                disabled={isRunning}
+                onClick={e => onReasoningEffortClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+                data-testid="composer-effort-chip"
+              >
+                <BrainCircuit size={13} className="shrink-0 opacity-70" aria-hidden="true" />
+                {!shelfTiny && <span className="whitespace-nowrap">{i18nT('components.reasoningEffortDropdown.effort')}: {effortLabel(reasoningEffort || '')}</span>}
+              </Btn>
+            </div>
           )}
           </div>
         </div>
