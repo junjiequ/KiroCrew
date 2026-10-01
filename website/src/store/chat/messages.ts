@@ -6,6 +6,7 @@
 import type { PayloadAction } from '@reduxjs/toolkit'
 import type { ChatMessage } from '../../types'
 import { isRejectedDecision } from '../../utils/approvalDecision'
+import { expandAll, type PasteBlock } from '../../utils/pasteTokens'
 import type { ChatState } from './state'
 import { isUnsafeKey, safeKey } from './wire'
 import { RECONCILE_WINDOW, ensureMsgId, finalizeTrailingStreaming, mintMsgId, tailNotInPage } from './transcript'
@@ -101,7 +102,28 @@ export const messageReducers = {
       }
       const bubble = target ?? fallback
       if (bubble) {
-        if (message.content) bubble.content = message.content
+        // Preserve the collapsed `[ Paste #N ]` content when the server echo
+        // is merely the EXPANDED equivalent of what we already hold. The
+        // optimistic steer bubble carries the token-form content plus its
+        // backing `meta.pastes`; the backend stores/echoes only the fully
+        // expanded text (what the LLM saw). Blindly overwriting with
+        // `message.content` here replaces the chip with hundreds of raw lines
+        // in state, and the render-time `recollapsePastes` net can only put the
+        // chip back when every block matches verbatim — which fails after
+        // server-side redaction alters the echoed text. The result is a row
+        // that renders as a chip pre-reconcile and as raw inline text after,
+        // flipping whenever the virtualized transcript remounts it on scroll.
+        // Keeping the optimistic token content (whose expansion equals the echo,
+        // modulo the trailing whitespace the backend strips) makes the chip
+        // stable and remount-proof — the same invariant mergePreservedPastes's
+        // in-memory fallback already enforces for an ordinary send.
+        const bubblePastes = (bubble.meta?.pastes as PasteBlock[] | undefined) || []
+        const bubbleFiles = (bubble.meta?.files as string[] | undefined) || []
+        const keepCollapsed =
+          !!message.content &&
+          bubblePastes.length > 0 &&
+          expandAll(bubble.content, bubblePastes).trimEnd() === message.content.trimEnd()
+        if (message.content && !keepCollapsed) bubble.content = message.content
         // Preserve the optimistic (client-generated) ts as meta.clientTs
         // BEFORE overwriting with the server ts. The chat renderer keys
         // rows by `meta.clientTs ?? ts`; without this stash the ts change
@@ -112,6 +134,16 @@ export const messageReducers = {
         }
         if (message.ts) bubble.ts = message.ts
         bubble.meta = { ...(bubble.meta || {}), ...(message.meta || {}) }
+        // When we kept the collapsed token content, the backing paste blocks
+        // (and any file chips) must survive the server-meta merge even if the
+        // echo carries its own `pastes`/omits `files`, or the chip loses its
+        // expansion data and the row reverts to raw text on the next render.
+        if (keepCollapsed) {
+          ;(bubble.meta as Record<string, unknown>).pastes = bubblePastes
+          if (bubbleFiles.length && !(message.meta?.files as string[] | undefined)?.length) {
+            ;(bubble.meta as Record<string, unknown>).files = bubbleFiles
+          }
+        }
         delete (bubble.meta as Record<string, unknown>).optimistic
         return
       }
