@@ -46,6 +46,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
@@ -725,8 +726,11 @@ def test_codex_resolves_its_own_adapter_and_declares_its_own_handshake() -> None
     # And the client core carries neither the constant nor a row for codex.
     assert not hasattr(acp_client, "PROTOCOL_VERSION_CODEX")
     assert ACP_BACKEND_CODEX not in acp_client._PROTOCOL_VERSION_BY_BACKEND
-    assert "_PROTOCOL_VERSION_BY_BACKEND" in inspect.getsource(
+    assert "self._initialize_params()" in inspect.getsource(
         acp_client.AcpClient._initialize_session
+    )
+    assert "_PROTOCOL_VERSION_BY_BACKEND" in inspect.getsource(
+        acp_client.AcpClient._initialize_params
     )
 
 
@@ -1033,12 +1037,19 @@ _SELECT_ONLY_SESSION_RESP = {
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
 def test_steer_advertisement_matches_the_steer_table(backend):
-    """H6: the handle advertises steer iff the host is in ``ACP_BACKENDS_STEER``.
+    """H6: the handle advertises steer iff the host is in a steer table.
+
+    User steer reads ``ACP_BACKENDS_STEER`` or ``ACP_BACKENDS_STEERING_REQUEST``;
+    a deny notice reads ``ACP_BACKENDS_STEER`` alone.
 
     Ran for every known backend, which is the point: this answer was a literal
     ``True`` for years and was honest only while ``AcpRuntime`` served one host.
     """
-    assert _handle_for(backend).supports_steer is (backend in ACP_BACKENDS_STEER)
+    handle = _handle_for(backend)
+    assert handle.supports_steer is (
+        backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+    )
+    assert handle.supports_refusal_steer is (backend in ACP_BACKENDS_STEER)
 
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))

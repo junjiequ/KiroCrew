@@ -1,6 +1,6 @@
 {
   "name": "kirocrew-desktop",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "desktopName": "kirocrew-desktop.desktop",
@@ -208,8 +208,10 @@
       "host-config.js",
       "open-path.js",
       "store-rename.js",
+      "upgrade-cache.js",
       "remote-token.js",
       "remote-crew-setup.js",
+      "tunnel-keeper.js",
       "token-acquire.js",
       "token-retry.js",
       "capture-trust.js",

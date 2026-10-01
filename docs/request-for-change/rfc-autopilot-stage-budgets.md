@@ -1,26 +1,34 @@
 ---
 title: Autopilot stage budgets admit work; they do not kill productive turns
-status: draft
+status: superseded
 kind: decision
 author: junjiequ (incident owner; drafted with Kiro Crew)
 created: 2026-09-26
-last-audited: 2026-09-26
-audited-at: 7f1f4fb1d
+last-audited: 2026-10-01
+audited-at: 191c9d35c
 revision: 1
 doc-pr: 14043
 implementation-prs: [13992]
 tracking-issues: []
 supersedes: []
-superseded-by: []
+superseded-by: [rfc-retire-chat-autopilot.md]
 ---
 
 # RFC: Autopilot stage budgets admit work; they do not kill productive turns
 
-Status: draft. This document asks maintainers to decide how Autopilot bounds a
-productive stage and how the dashboard recovers when a real turn ceiling fires.
-It must land before the implementation in
-[#13992](https://github.com/kirodotdev/KiroCrew/pull/13992) is made ready again.
-The implementation PR is a prototype, not the decision source.
+> **Superseded before acceptance.** The accepted
+> [Autopilot retirement](rfc-retire-chat-autopilot.md) replaced this proposal,
+> and backend removal [#15362](https://github.com/kirodotdev/KiroCrew/pull/15362)
+> merged on 2026-09-30. The stage loop, its prompt, and its system spec are absent
+> from current `main`. This document and its sanitized evidence appendix remain
+> as the record of six incidents and the cancellation failure they exposed.
+
+Status: superseded. The stage-budget decision and draft implementation
+[#13992](https://github.com/kirodotdev/KiroCrew/pull/13992) no longer apply. The
+ordinary four-hour chat-turn ceiling on current `main` still cancels `_run_chat`
+without first sending native `session/cancel`; that narrower lifecycle defect
+requires a separate bug fix and must not restore the retired Autopilot mode.
+The proposal below is retained as historical context, not as current direction.
 
 - Measured against `main` at `7f1f4fb1d` on 2026-09-26.
 - Incident evidence: [sanitized timeout evidence](assets/autopilot-stage-timeout-evidence.md).

@@ -1,6 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -62,9 +62,20 @@ interface UserMessageProps {
    *  send while the member works is a steer), the badge would label every
    *  such send with the mechanics the surface exists to hide. */
   hideSteerBadge?: boolean
+  /** ⌘↑ / Ctrl+Up edit request: a monotonically increasing sequence
+   *  number. ChatPage passes a NEW value when the keyboard requests an edit of
+   *  THIS row (the session's last user message); the rising edge opens the
+   *  existing Edit & resend editor with the caret at the end — the same state
+   *  the hover affordance drives. */
+  editRequest?: number
+  /** Acknowledgement for the ⌘↑ request above: called exactly once when this
+   *  row consumes a request, so ChatPage can drop it. A consumed request must
+   *  never persist — a remount would replay the rising edge and re-open the
+   *  editor over the user's dismissed draft. */
+  onEditConsumed?: () => void
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge, editRequest, onEditConsumed }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -162,6 +173,26 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     setPlaySteer(true)
   }, [isSteer, playSteer, meta, messageTs, content])
 
+  // A PLAIN send whose receipt never came. `markSendUnconfirmed` stamps
+  // `deliveryUnconfirmed` on the bubble when the transport deadline fires with
+  // no echo, and the receipt or echo that finally proves delivery clears it.
+  // Keyed on that mark, never on `optimistic` alone: the flag also survives a
+  // `refused` or `transport-error` send (whose error row and restored composer
+  // already say what happened) and a `queued` receipt (whose card owns the
+  // text), and a line on those rows would claim a wait nobody is waiting on.
+  // Carried on the row itself, not left to the WARN notice the same receipt
+  // posts under it: that notice is an ordinary transcript row, not an
+  // always-visible one like an error row, so once a later inject-dispatched
+  // turn (a cron prompt, a queued continuation) lands in this bubble's turn,
+  // a transcript that collapses reasoning folds the notice behind the steps
+  // toggle while the bubble stays on screen. No running-turn gate either,
+  // unlike `pendingSteer`: the mark is client-minted and never persisted, so
+  // a row re-read from history cannot carry it, and the send that most needs
+  // the line is one whose local turn has already ended. A steer bubble never
+  // carries it (the steer path drops its bubble on this receipt), so the two
+  // pending treatments stay disjoint.
+  const pendingSend = !!(meta as { deliveryUnconfirmed?: boolean } | undefined)?.deliveryUnconfirmed
+
   useEffect(() => {
     if (editing && taRef.current) {
       const ta = taRef.current
@@ -179,6 +210,24 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     setDraft(initial)
     setEditing(true)
   }, [content, meta])
+
+  // ⌘↑ / Ctrl+Up edit request: fire on the rising edge only, so a
+  // re-render that re-delivers the same seq (or a memo-compare miss elsewhere)
+  // does not re-open the editor over the user's in-progress draft.
+  const lastEditRequestRef = useRef(0)
+  useEffect(() => {
+    if (!editRequest || editRequest === lastEditRequestRef.current) return
+    lastEditRequestRef.current = editRequest
+    if (editing) {
+      // Already open with a draft in progress — restart would overwrite it
+      // with the original content. Just refocus, no re-fetch.
+      taRef.current?.focus()
+      onEditConsumed?.()
+    } else if (canEdit && onEditResend) {
+      startEdit()
+      onEditConsumed?.()
+    }
+  }, [editRequest, editing, canEdit, onEditResend, onEditConsumed, startEdit])
   const cancel = useCallback(() => setEditing(false), [])
   const submit = useCallback(() => {
     const trimmed = draft.trim()
@@ -390,6 +439,20 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               exclusive to backend-confirmed injection (#7997). Rendering in the
               badge's slot keeps the pending -> consumed / requeued hand-off a
               content change in one place rather than a layout jump. */}
+          {pendingSend && (
+            /* The plain send's counterpart to the steer line below: same slot,
+               same muted weight, same pulse for a wait still open (a late echo
+               can still settle it), its own glyph so the two pending states
+               never read as one. No explainer of its own: the WARN notice the
+               same receipt posts directly under the bubble says what to do.
+               `role="status"` lets a screen reader hear that the message is
+               unconfirmed. */
+            <div role="status" className="inline-flex items-center gap-1 text-[12px] leading-5 font-medium text-muted mb-1 pr-1" data-testid="send-pending">
+              <span className="inline-flex items-center gap-1 animate-pulse">
+                <Clock size={12} className="shrink-0" aria-hidden="true" /> {i18nT('pages.chat.userMessage.delivery_pending')}
+              </span>
+            </div>
+          )}
           {pendingSteer && (
             /* animate-pulse (a simple loading indicator, per the animation
                conventions) marks it as in-flight; it must NOT touch

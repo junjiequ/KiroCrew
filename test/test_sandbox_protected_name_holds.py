@@ -291,7 +291,7 @@ class TestLeafOnlyPopulationIsRecorded:
     #: home it protects (the two ``$HOME``-joined ``_CREW_HOME_PREFIXES`` plus
     #: the resolved ``config_dir()`` when it is a third place, as the relocated
     #: ``KIROCREW_HOME`` the conftest pins always is), so one new root-level
-    #: leaf is three entries in every tier. Three landed after the first
+    #: leaf is three entries in every tier. Six landed after the first
     #: measurement, all at the data-home root, whose parent no stand-in can
     #: hold, so leaf-only is the only hold available to them:
     #:
@@ -302,13 +302,26 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   refresh-chain state is never listable from inside the namespace;
     #: * ``redaction-allow`` -- the reader's allowed link hosts, sealed read-only
     #:   so an agent cannot allow the host it wants to send conversation data to.
+    #: * ``panel-dismissals`` -- the operator's subagent-panel dismissals. An
+    #:   owner decision about what the panel HIDES, so it sits at the root beside
+    #:   ``crew-panels`` and ``crew-teams`` rather than under ``trust/``, which
+    #:   stays sandbox read-write for SEL and would leave the record forgeable by
+    #:   a runtime-built path. Same hold as those two, and the same reason it can
+    #:   only be leaf-only.
+    #: * ``config.json`` / ``config.local.json`` -- the owner's settings files,
+    #:   sealed read-only so an agent cannot loosen its own settings. Both sit
+    #:   at the data-home root, so two leaves are six entries per tier.
+    #: * ``vouched-executions`` -- the gateway's restart-surviving vouches for
+    #:   member-store admission. A forged file would admit a session to a peer
+    #:   member's private memory, so it sits at the root, masked, rather than
+    #:   under the sandbox read-write ``trust/``. Leaf-only for the same reason.
     #:
     #: Two directories hold what the MCP gateway launches outside the sandbox,
     #: six entries per tier. ``mcp-launch-approvals`` holds the owner's approved
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 250, "cc": 257, "strict": 258}
+    EXPECTED: dict[str, int] = {"standard": 262, "cc": 269, "strict": 270}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

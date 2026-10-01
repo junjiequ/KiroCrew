@@ -150,7 +150,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
-from kiro_crew.mcp_gateway.abort import schedule_abort
+from kiro_crew.mcp_gateway.abort import schedule_abort_for
 from kiro_crew.member_memory_auth import prune_legacy_member_pid_bindings
 from kiro_crew.messaging.link import (
     UNBIND_REASON_SESSION_DESTROYED,
@@ -1289,7 +1289,7 @@ class SessionManager:
                 _provider_uses_kiro_identity_store(provider)
             ),
             get_audit_logger=lambda: sel(),
-            schedule_abort=lambda *args, **kwargs: schedule_abort(*args, **kwargs),
+            schedule_runtime_abort=lambda *args, **kwargs: schedule_abort_for(*args, **kwargs),
             monotonic=lambda: time.monotonic(),
         )
 
@@ -1546,6 +1546,16 @@ class SessionManager:
         the registry lock.
         """
         return self._closing
+
+    @property
+    def final_drain_started(self) -> bool:
+        """Whether ``close_all()`` began, so no turn here outlives this process.
+
+        An update pause also closes admission, but it can resume. ``close_all``
+        revokes that pause, so closing without an owned pause is the final drain
+        of a shutdown or an in-app re-exec restart.
+        """
+        return self._closing and not self._update_pause_owned
 
     @property
     def _update_pause_owned(self) -> bool:
@@ -1940,6 +1950,8 @@ class SessionManager:
                 acp_backend_kiro=ACP_BACKEND_KIRO,
                 bg_recycle_pct=_BG_RECYCLE_PCT,
                 bg_blind_recycle_prompts=_BG_BLIND_RECYCLE_PROMPTS,
+                rss_max_mb=lambda: self._rss_max_mb,
+                tree_rss_mb=lambda pid: get_session_rss_mb(pid),
                 runtime_backends=lambda: _bg_runtime_backends(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 runtime_types=lambda: _load_bg_runtime_types(),
@@ -3269,6 +3281,11 @@ class SessionManager:
     def mirror_accepts_inbound(self, key: str) -> bool:
         """True iff this session's mirror is a session-resume (two-way) binding."""
         return self._session_map.mirror_accepts_inbound(key)
+
+    def has_mirror_row(self, key: str) -> bool:
+        """Whether an explicit ``mirror`` row is stored under exactly *key* (no Slack
+        synthesis, no legacy-row fallback); see ``SessionMap.has_mirror_row``."""
+        return self._session_map.has_mirror_row(key)
 
     def mirror_link_nonce(self, key: str) -> str:
         """The per-binding nonce of the mirror ``get_mirror_link`` returns (``""`` for none)."""

@@ -65,6 +65,7 @@ const {
   READY_PATH,
 } = require("./instance-guard");
 const { getRemoteHostConfig } = require("./host-config");
+const { createTunnelKeeper } = require("./tunnel-keeper");
 const {
   remoteCrewAction,
   remoteCrewDraft,
@@ -290,6 +291,52 @@ function createGatewaySupervisor({
     log: glog,
     getSpawnedExecutablePaths: () => spawnedExecutablePaths,
   });
+  // The SSH forward a client-only launch reaches its crew through, when the
+  // crew opted in. Its PATH is recovered the same way the gateway's is, because
+  // ssh runs the user's ProxyCommand (an SSM helper, typically) by name.
+  const tunnelKeeper = createTunnelKeeper({
+    store,
+    port: PORT,
+    spawn,
+    resolveBin: resolveGatewayBin,
+    // Built per spawn, not here: recovering the launchd PATH shells out, and
+    // a launch whose crew never opted in must not pay for it.
+    getEnv: () => {
+      const { KIROCREW_PORT: _unused, ...tunnelEnv } = processObj.env;
+      const recovered = recoverLaunchdPath(tunnelEnv.PATH || "");
+      return recovered ? { ...tunnelEnv, PATH: recovered.path } : tunnelEnv;
+    },
+    isWindows: IS_WIN,
+    log: glog,
+    setTimeoutFn,
+    clearTimeoutFn,
+  });
+
+  // How long a launch waits for a managed forward to come up before asking the
+  // port. ssh's own connect budget is 15s (DEFAULT_CONNECT_TIMEOUT_SECS on the
+  // Python side); a little over it lets one full attempt land.
+  const TUNNEL_READY_TIMEOUT_MS = 20000;
+  const TUNNEL_READY_POLL_MS = 500;
+
+  /**
+   * Start the managed forward when this port opted in, and give it one connect
+   * budget to answer. Never rejects: a forward that is still down leaves the
+   * ordinary "no gateway is answering" path to explain it, and the keeper goes
+   * on retrying behind that dialog, so Retry works once the crew is back.
+   */
+  async function ensureManagedTunnel() {
+    if (!tunnelKeeper.start()) return;
+    sendStatus("Opening the tunnel to your crew…");
+    // Counted in polls rather than read off the clock, so the injected timer
+    // fully decides how long this waits.
+    for (let waited = 0; waited < TUNNEL_READY_TIMEOUT_MS; waited += TUNNEL_READY_POLL_MS) {
+      try { await checkBackend(); return; }
+      catch { /* not up yet */ }
+      await new Promise((resolve) => setTimeoutFn(resolve, TUNNEL_READY_POLL_MS));
+    }
+    glog(`tunnel: :${PORT} still not answering after ${TUNNEL_READY_TIMEOUT_MS}ms; keeper keeps retrying`);
+  }
+
   const { resolveFamilyConflict } = createFamilyTakeover({
     dialog,
     execFile,
@@ -301,7 +348,7 @@ function createGatewaySupervisor({
     waitForPortFree,
     waitForIncumbentExit,
   });
-  const { fetchRemoteToken, fetchLocalToken } = createTokenSources({
+  const { fetchRemoteToken, mintLocalToken } = createTokenSources({
     store,
     port: PORT,
     backendUrl: BACKEND_URL,
@@ -314,7 +361,7 @@ function createGatewaySupervisor({
     snapshotGatewayPortPids,
     getGatewayProcess: () => gatewayProcess,
   });
-  const { promptRemoteCrew } = createRemoteCrewPrompt({ BrowserWindow, nativeTheme });
+  const { promptRemoteCrew } = createRemoteCrewPrompt({ BrowserWindow, nativeTheme, isWindows: IS_WIN });
 
   /**
    * May the failure dialog offer "Start Local Gateway"?
@@ -716,6 +763,15 @@ function createGatewaySupervisor({
     }
   }
 
+  async function isCurrentBundleGateway() {
+    if (!app.isPackaged || IS_WIN || !path.isAbsolute(processObj.resourcesPath || "")) return false;
+    const pids = await snapshotGatewayPortPids(PORT);
+    if (pids?.length !== 1) return false;
+    const command = (await psCommand(pids[0])).trim();
+    const bundleRoot = path.join(processObj.resourcesPath, "backend-dist") + path.sep;
+    return command.startsWith(bundleRoot);
+  }
+
   async function resolveGatewayConflict(rebindDepth = 0) {
     const health = await fetchHealthInfo();
     // A remote host configured for this port makes the holder a tunnel by
@@ -725,7 +781,13 @@ function createGatewaySupervisor({
       glog(`:${PORT} is a configured remote host (${remoteHost}) — holder treated as non-local`);
     }
     const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT);
-    const decision = decideGatewayAction(app.getVersion(), health, { localOwner });
+    const bundledGateway = runLocalGateway
+      && health?.version !== app.getVersion()
+      && (localOwner === "kirocrew" || localOwner === "service")
+      && await isCurrentBundleGateway();
+    const decision = decideGatewayAction(app.getVersion(), health, {
+      localOwner, bundledGateway,
+    });
     // The rule this enforces, as one sentence: adopt a responder on this port
     // only when the port can be attributed either to us (a Kiro Crew LISTEN
     // owner, or a service-managed one) or to a crew the user configured here.
@@ -735,7 +797,7 @@ function createGatewaySupervisor({
     // an unidentified payload, a same-family gateway, a dev-family one, and a
     // cross-family one whose LISTEN owner is not ours -- and a gateway reached
     // through `ssh -L` answers with a perfectly ordinary same-family payload, so
-    // a gate on one reason value misses four. `fetchLocalToken` then posts this
+    // a gate on one reason value misses four. `mintLocalToken` then posts this
     // machine's `.local_secret` to it, because the mint only requires a literal
     // loopback origin and a tunnel's local end is one. The header goes out before
     // any 403 is seen, so there is no recovery after the fact.
@@ -744,11 +806,31 @@ function createGatewaySupervisor({
     // it". `kirocrew` and `service` still adopt, and so do `none` and `unknown`:
     // the fail-open this narrows is preserved wherever the probe did not
     // positively find someone else holding the port.
+    //
+    // `warn-stale` cannot reach here with a `foreign` owner: the bundled-path
+    // probe above only runs for a `kirocrew` or `service` owner, so that action
+    // is unreachable without positive local attribution.
     if (decision.action === "reuse" && localOwner === "foreign" && !remoteHost) {
       glog(`:${PORT} is served by a process this app did not start and no remote crew is configured there — refusing to adopt it`);
       return "foreign-holder";
     }
-    if (decision.action === "reuse") {
+    if (decision.action === "warn-stale") {
+      glog(`bundled gateway ${decision.oldVersion} predates app ${app.getVersion()} — warning before reuse`);
+      const stopGateway = `Run this command in Terminal:\nkirocrew stop --port ${PORT}`;
+      const recovery = localOwner === "service"
+        ? `${stopGateway}\nIf the gateway starts again automatically, stop or update the service that restarts it.`
+        : stopGateway;
+      const { response } = await dialog.showMessageBox({
+        type: "warning",
+        message: "The gateway is still running an older version.",
+        detail: `This app is version ${app.getVersion()}. The gateway is still running version ${decision.oldVersion}.\n\nContinue will try to connect to the existing gateway; updated features may be unavailable.\n\nTo finish the update, quit Kiro Crew.\n${recovery}\nThen reopen Kiro Crew.`,
+        buttons: ["Continue with existing gateway", "Quit"],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (response === 1) return "abort";
+    }
+    if (decision.action === "reuse" || decision.action === "warn-stale") {
       // Adopt-or-wait. Only a positive shutting-down verdict refuses adoption;
       // every ambiguity preserves historical fail-open reuse. Remote tunnels are
       // exempt because their local socket is not expected to clear on restart.
@@ -882,7 +964,8 @@ function createGatewaySupervisor({
         resolve(false);
       };
 
-      checkBackend()
+      ensureManagedTunnel()
+        .then(() => checkBackend())
         .then(async () => {
           const outcome = await resolveGatewayConflict();
           if (outcome === "reuse") { resolve(true); return; }
@@ -1189,6 +1272,7 @@ function createGatewaySupervisor({
   }
 
   function stopGatewayOnQuit() {
+    tunnelKeeper.stop();
     stopGatewayGracefully()
       .catch((error) => console.error("Gateway stop failed:", error?.message));
   }
@@ -1826,7 +1910,7 @@ function createGatewaySupervisor({
       // just before local mint accepts that secret, so retry only an own-gateway
       // 403; foreign/SSH gateways can never be minted from this machine.
       for (let attempt = 0; ; attempt += 1) {
-        let token = await fetchLocalToken(targetBackendUrl);
+        let token = await mintLocalToken(targetBackendUrl);
         if (!token) {
           ({ token } = await fetchRemoteToken(new URL(targetBackendUrl).port));
         }
@@ -2235,12 +2319,18 @@ function createGatewaySupervisor({
   return Object.freeze({
     start: startGateway,
     connect: showLoadingThenConnect,
-    fetchLocalToken,
+    mintLocalToken,
     fetchRemoteToken,
     entryUrl: dashboardEntryUrl,
     probePrimaryPortOwner,
     stopGracefully: stopGatewayGracefully,
     stopOnQuit: stopGatewayOnQuit,
+    // After sleep the old forward can look alive while carrying nothing, so a
+    // wake rebuilds it at once instead of waiting out ssh's keepalive.
+    reopenTunnel: () => tunnelKeeper.restart(),
+    // A remote-crew edit re-applies the launch port's tunnel choice at once:
+    // start, replace (new host or port) or stop the forward to match it.
+    syncTunnel: () => tunnelKeeper.start(),
     onInstallDispatched,
     onInstallFailed,
   });

@@ -723,6 +723,99 @@ describe('chat sidebar — conductor lane', () => {
     expect(laneRows(lane).length).toBe(3)
   })
 
+  it('nests a peer worker under the peer conductor that opened it, shut by default', () => {
+    // The hub forwards `parent` on a peer row (useInstanceSessions). The lane then
+    // resolves it within the row's own origin: `peer-1:k-lead` owns `peer-1:k-w1` and
+    // `peer-1:k-w2`, and a LOCAL `k-lead` does not gain them. Before the citation
+    // crossed the wire every remote worker rendered here as a top-level stray.
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
+    const peer = (key: string, title: string, modified: number, parent?: string) => ({
+      key, title, messages: 0, running: false, modified,
+      peer_id: 'peer-1', row_identity: `peer-1:${key}`,
+      ...(parent ? { parent: { slot: parent, key: parent } } : {}),
+    })
+    const { getByTestId, getByPlaceholderText } = renderSidebar([
+      { key: 'k-lead', title: 'Local lead', messages: 1, running: false, modified: 5000 },
+      peer('k-lead', 'Peer lead', 4000),
+      peer('k-w1', 'Peer worker 1', 3000, 'k-lead'),
+      peer('k-w2', 'Peer worker 2', 2000, 'k-lead'),
+    ])
+    // The lane element is re-queried after the click: the lane remounts on a toggle.
+    const lane = () => getByTestId('conductor-view-lane')
+    // Collapsed by default: two roots, no children rendered, and no stray glyph.
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-lead'])
+    expect(within(lane()).getByTestId('conductor-child-count-peer-1:k-lead').textContent).toBe('2')
+    expect(within(lane()).queryByTestId('conductor-child-count-k-lead')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w2')).toBeNull()
+
+    fireEvent.click(within(lane()).getByTestId('conductor-chevron-peer-1:k-lead'))
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-lead', 'k-w1', 'k-w2'])
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+    const w1 = lane().querySelector('[data-slot-key="k-w1"]')
+    expect(w1?.getAttribute('data-conductor-depth')).toBe('1')
+    // Search flattens the tree; the peer child then wears the same "opened by"
+    // glyph a local child does, read off `parent.slot` -- the half the hub now
+    // forwards. Same query on the local twin as a control.
+    fireEvent.change(getByPlaceholderText(/search/i), { target: { value: 'worker' } })
+    expect(within(lane()).getByTestId('conductor-cites-parent-peer-1:k-w1')).toBeTruthy()
+  })
+
+  it('nests a peer worker under the LOCAL row driving its creator when the hub stamps `hub_key`', () => {
+    // A local lead executes on the peer (`executor: 'remote'`), so the sessions it
+    // opens live ON the peer and cite the peer slot the hub drives. The hub filters
+    // that driven row and rewrites each citation to the local lead's key as
+    // `parent.hub_key` -- the one half resolved among LOCAL rows. The payoff: a
+    // remote-executed crew reads as one unit under the row the user chats in, where
+    // it rendered as a column of top-level strays. A peer row whose key collides
+    // with the lead's does NOT gain the workers: `hub_key` is local by contract.
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
+    const peer = (key: string, title: string, modified: number, parent?: { slot?: string; key?: string; hub_key?: string }) => ({
+      key, title, messages: 0, running: false, modified,
+      peer_id: 'peer-1', row_identity: `peer-1:${key}`,
+      ...(parent ? { parent } : {}),
+    })
+    const { getByTestId } = renderSidebar([
+      { key: 'k-lead', title: 'Local lead', messages: 1, running: false, modified: 5000, executor: 'remote', instance_id: 'peer-1' },
+      peer('k-lead', 'Peer twin', 4000),
+      peer('k-w1', 'Peer worker 1', 3000, { slot: 'k-lead', hub_key: 'k-lead' }),
+      peer('k-w2', 'Peer worker 2', 2000, { slot: 'k-lead', hub_key: 'k-lead' }),
+    ])
+    const lane = () => getByTestId('conductor-view-lane')
+    // Two roots: the local lead holding both workers shut, and the colliding peer
+    // twin holding nothing.
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-lead'])
+    expect(within(lane()).getByTestId('conductor-child-count-k-lead').textContent).toBe('2')
+    expect(within(lane()).queryByTestId('conductor-child-count-peer-1:k-lead')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w2')).toBeNull()
+
+    fireEvent.click(within(lane()).getByTestId('conductor-chevron-k-lead'))
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-w1', 'k-w2', 'k-lead'])
+    const w1 = lane().querySelector('[data-slot-key="k-w1"]')
+    expect(w1?.getAttribute('data-conductor-depth')).toBe('1')
+  })
+
+  it('marks a hub-cited worker as opened-by, not orphaned, while the local driver is merely filtered', () => {
+    // The creator-exists check must read `hub_key` among LOCAL rows: looked up in
+    // the peer's origin it would miss, and the glyph would say the lead is closed
+    // while the lead is open and working.
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    const { getByTestId, getByPlaceholderText } = renderSidebar([
+      { key: 'k-lead', title: 'Local lead', messages: 1, running: false, modified: 5000, executor: 'remote', instance_id: 'peer-1' },
+      {
+        key: 'k-w1', title: 'Peer worker', messages: 0, running: false, modified: 3000,
+        peer_id: 'peer-1', row_identity: 'peer-1:k-w1', parent: { slot: 'k-lead', hub_key: 'k-lead' },
+      },
+    ])
+    const lane = () => getByTestId('conductor-view-lane')
+    fireEvent.change(getByPlaceholderText(/search/i), { target: { value: 'worker' } })
+    expect(within(lane()).getByTestId('conductor-cites-parent-peer-1:k-w1')).toBeTruthy()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+  })
+
   it('caps the indent past six levels and names the level in the tooltip', () => {
     // Depth has no ceiling and each level costs 14px, so a deep chain would walk the
     // card off a 320px sidebar. Past the cap the rows stop stepping and the level is

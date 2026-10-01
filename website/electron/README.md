@@ -16,7 +16,13 @@ The app will:
 1. Reuse an existing gateway if one is already reachable and actually serving
    (`/api/ready` 200) — a gateway draining after `/api/shutdown` still answers
    `/api/status`, so it is never adopted; the app waits for the port to clear
-   and spawns fresh instead
+   and spawns fresh instead. Before reusing a same-family gateway on a fixed-path
+   POSIX install, the app detects whether its sole listener is an older gateway
+   from the current bundled backend path. If so, it warns that updated features
+   may be unavailable and offers Continue or Quit, with instructions to stop the
+   old gateway before reopening the app. It does not restart or force-stop the
+   gateway automatically. Remote tunnels, separate CLI installs, unknown owners,
+   same or newer versions, Windows, and moved AppImages retain existing behavior
 2. Launch `kirocrew gateway` when needed
 3. Show a loading screen while the backend boots. A live bundled backend gets an
    extended Windows cold-start window; a child that actually exits still fails
@@ -48,7 +54,7 @@ and each facade composes cohesive owners under `runtime/<area>/`:
 |---|---|---|
 | `gateway-supervisor.js` (`createGatewaySupervisor`) | `runtime/gateway/launch-preflight.js` (backend binary, bundle completeness, project dir, sandbox-profile advice, launchd `PATH`, relaunch target) · `port-holders.js` (lsof/ps/netstat probes, trusted Windows gateway commands, incumbent snapshot and exit wait, force-stop) · `family-takeover.js` (quitting the other release family's app) · `token-sources.js` (the local-secret mint and the SSH token fetch) · `remote-crew-prompt.js` (the Add / Edit Remote Crew form) | All gateway state (child, ownership, start failure, liveness monitor, update handoff), the spawn site and its environment, every port occupancy and identity decision, the connect flow, the failure dialog, liveness recovery and shutdown |
 | `window-lifecycle.js` (`createWindowLifecycle`) | `runtime/window/chrome.js` (traffic lights, title-bar overlay, native theme, zoom, focus-mode chrome) · `prompts.js` (New Connection Window port prompt, Rename Window) · `session-security.js` (session permission policy, microphone and screen-recording recovery dialogs) · `linux-captions.js` (frameless Linux caption controls) · `browser-panels.js` (per-window native browser panels and their agent command channel) | Window creation and state restore, the drag band, fullscreen handling, close-to-tray and every show path, the tray, the remote-host prompt, the menu, window-control admission, and the browser IPC routing |
-| `auto-update.js` (`initAutoUpdate` and 15 policy exports) | `runtime/update/state-reporter.js` (channel, lane pair, lifecycle pushes, replayable info) · `feed-lane.js` (electron-updater discovery, download, staged install) · `managed-lane.js` (the marker-driven check and apply commands) | Channel and feed policy (`KNOWN_CHANNELS`, `channelHasLane`, `channelForVersion`, `buildFeedBase`, `manualDownloadUrl`), the update-policy flags, the `EXTERNALLY-MANAGED` marker reader and its caps, the narrowed marker-command `PATH`, the install-shape probes, and the gates that choose a lane |
+| `auto-update.js` (`initAutoUpdate` and 16 policy exports) | `runtime/update/state-reporter.js` (channel, lane pair, lifecycle pushes, replayable info) · `feed-lane.js` (electron-updater discovery, download, staged install) · `managed-lane.js` (the marker-driven check and apply commands) | Channel and feed policy (`KNOWN_CHANNELS`, `channelHasLane`, `channelForVersion`, `buildFeedBase`, `manualDownloadUrl`), the update-policy flags, the `EXTERNALLY-MANAGED` marker reader and its caps, the narrowed marker-command `PATH`, the install-shape probes, and the gates that choose a lane |
 | `crash-collector.js` (`armCrashCollector`, `collectCrashReports`, `crashNoticeSummary`) | `runtime/crash/ownership.js` · `artifact-parsers.js` · `candidates.js` · `persistence.js` · `scan.js` | The export surface and `crashNoticeSummary`, the one renderer-facing view |
 
 Three rules keep this layout safe to change:
@@ -70,6 +76,15 @@ Three rules keep this layout safe to change:
   allowlist, and `test/packaging.test.js` on a single-quoted or template-literal
   relative require, which the scans cannot read, or on an owner no facade
   composes.
+
+New main-process code goes to the runtime owner whose entry above names its
+responsibility, not to the facade: a new lsof/ps/netstat or process-identity
+probe goes to `runtime/gateway/port-holders.js`, a launch precondition to
+`launch-preflight.js`, native window chrome to `runtime/window/chrome.js`, an
+update lane's step to `feed-lane.js` or `managed-lane.js`, and a crash-artifact
+rule to its owner under `runtime/crash/`. A facade grows only in its "What stays
+in the facade" column, and a responsibility no owner names gets a new file under
+`runtime/<area>/` that its facade composes.
 
 ## Install as macOS App
 
@@ -185,7 +200,11 @@ via SSH instead of reading the local `.local_secret`.
 
 ### Prerequisites
 
-1. An SSH tunnel forwarding the remote gateway port to localhost:
+1. An SSH tunnel forwarding the remote gateway port to localhost. Either tick
+   **Keep an SSH tunnel to this crew open** for the app's launch port (in the
+   Add/Edit Remote Crew form the "no gateway is answering" dialog opens, or in
+   Set Remote Host… on that tab, below), and the app opens and maintains it;
+   saving either form applies the choice at once. Or run your own:
    ```bash
    ssh -L 5476:localhost:5476 YOUR_HOST.example.com
    ```
@@ -211,7 +230,16 @@ Remote host settings are **per-port** — each tab can have its own remote host
    from the local tab port (default: same as tab port)
 5. Optionally set a **Remote PATH** if kirocrew needs additional directories
    (default: `~/.toolbox/bin:/usr/bin:/bin`)
-6. Click Save. Leave hostname empty to clear (use local token for that port).
+6. Optionally tick **Keep an SSH tunnel to this crew open** (macOS and Linux).
+   The app then runs `kirocrew desktop tunnel`, which holds the forward from the
+   tab's port to the crew's with the same supervisor and backoff Remote Crew uses
+   inside a gateway. A dropped forward is rebuilt on its own, and waking the
+   machine from sleep rebuilds it at once. Leave it unticked if something else
+   (your own ssh, a VPN, `kubectl port-forward`) already carries that port: the
+   app never takes a port over without this opt-in. Routing and identity come
+   from your `~/.ssh/config`, and ssh runs non-interactively, so the host must
+   authenticate without a prompt.
+7. Click Save. Leave hostname empty to clear (use local token for that port).
 
 **Multi-instance example:**
 - Tab 1 on `:5476` — local gateway, no remote host needed
@@ -223,9 +251,12 @@ each launch to get a fresh JWT — no manual paste required.
 ### Token flow (per tab)
 
 ```
-1. Read `$KIROCREW_HOME/.local_secret` when a valid override is set; otherwise read
-   `~/.kiro/crew/.local_secret`, then call `/api/token/local` on the tab's port.
-   Only the authoritative home is read; there is no legacy-directory fallback.
+1. Read `<data home>/run/gateway-<port>-<bind address>.secret` for the tab's port,
+   trying the bind addresses whose listener answers the dialed v4 loopback
+   (`127.0.0.1`, then `0.0.0.0`), then call `/api/token/local` on that port.
+   The credential is keyed by the listener, so an entry belonging to a gateway on
+   another address or another port is never read. No entry means refuse, not
+   fall back: the home-wide `.local_secret` is not consulted here.
 2. If remote host configured for this port:
    SSH: export PATH=<remotePath> KIROCREW_PORT=<port>; <bin> token
 3. Fallback: show manual token prompt

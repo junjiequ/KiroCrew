@@ -24,7 +24,7 @@ import type { PlanStepInput } from '../../api/client'
 import { extractSteeringAcks, parseOptions, stripPartialOptionMarker } from '../../app-sdk/protocol'
 import { i18nT } from '../../i18n/t'
 import { ROUTING_PREFIX_RE } from '../../providers/modelRegistry'
-import { fmtCurrency, fmtDuration, fmtNumber, fmtUnit } from '../../i18n/format'
+import { fmtCredits, fmtCurrency, fmtDuration, fmtUnit } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
@@ -53,14 +53,6 @@ export function fmtTurnElapsed(ms: number): string {
   // before rounding seconds can push the remainder to 60).
   const total = Math.round(s)
   return fmtDuration([[Math.floor(total / 60), 'minute'], [total % 60, 'second']])
-}
-
-/** Trim credit noise: 2 decimals under 10, 1 decimal beyond ("0.25", "12.5"). */
-export function fmtCredits(c: number): string {
-  // Precision rule unchanged; only the decimal separator becomes locale-aware
-  // (de/fr/ru want `0,25`). Both bounds are pinned so trailing zeros survive.
-  const digits = c >= 10 ? 1 : 2
-  return fmtNumber(c, { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
 // A compact "Steered" chip rendered in place of the raw [STEERING …] marker.
@@ -520,7 +512,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
 
   return <div data-role="assistant" className="group/msg">
     {/* 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md */}
-    <div ref={contentRef} className={`message-bubble mc-message-font-scope msg-content group/bubble relative leading-relaxed text-text overflow-hidden${bubbleClassName ? ` ${bubbleClassName}` : ''}`} data-testid="message-bubble" style={rawMode && rawBoxHeight !== null && !isStreaming
+    <div ref={contentRef} className={`message-bubble mc-message-font-scope msg-content group/bubble relative leading-relaxed text-text overflow-hidden${bubbleClassName ? ` ${bubbleClassName}` : ''}`} data-testid="message-bubble" data-bordered={bubbleClassName ? '' : undefined} style={rawMode && rawBoxHeight !== null && !isStreaming
       ? { overflowWrap: 'anywhere', wordBreak: 'break-word', height: rawBoxHeight, overflowY: 'auto', fontSize: 'var(--mc-message-font-size, 14px)' }
       : { overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       <MessageErrorBoundary rawContent={smoothedText}>

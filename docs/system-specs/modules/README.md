@@ -20,13 +20,14 @@ agent loads only the one it needs.
 | [harness-onboarding.md](harness-onboarding.md) | The sequence a new ACP harness walks to land: vocabulary, capability decisions, spawn path, handshake, install probe, selectability, and what a live harness additionally touches. |
 | [model-fallback.md](model-fallback.md) | The throttle-exhaustion model fallback (`agent.fallback_model`): trigger, shared walk, sticky restore, visibility — plus the single-message content-filter refusal fallback (`agent.refusal_fallback_model`). |
 | [session.md](session.md) | Sessions, slots, session keys, the warm pool, and PID tracking. |
+| [runtime-ownership.md](runtime-ownership.md) | Who owns an agent process: the lease and tenancy tables, the one kill gate, death classification, the kernel-versus-registry reconciler, and the pid-reader guards. |
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
 | [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
 | [member-event-log.md](member-event-log.md) | Per-member append-only event log, its four projections, the whole-value push frames, and load-time closers behind the Members page. |
 | [session-work-ledger.md](session-work-ledger.md) | Per-session durable work state (goal, phase, tried, artifacts) on disk, its MCP tools, and monitor-loop snapshot injection. |
 | [crew-log-core.md](crew-log-core.md) | Append-only per-crew and per-session crew logs: the wire format, type ownership and guest namespacing, the torn-tail rule, and the pre-release status of the session vocabulary. |
 | [crew-log-emitter.md](crew-log-emitter.md) | The flag-gated writer that turns the ACP turn lifecycle into an append-only per-session `log.jsonl`: which facts are recorded, from which call site, and which are deliberately not. |
-| [crew-log-projection.md](crew-log-projection.md) | The five session folds (`status`, `usage`, `timeline`, `tools`, `approvals`), their resumable checkpoints, the paged `crew-log` reads with refs resolved, and the `session_projection` push. |
+| [crew-log-projection.md](crew-log-projection.md) | The six session folds (`status`, `usage`, `timeline`, `tools`, `approvals`, `subagents`), their resumable checkpoints, the paged `crew-log` reads with refs resolved, and the `session_projection` push. |
 | [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
 | [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
 | [session-control.md](session-control.md) | One chat session opening, stopping, and reading another. |
@@ -60,7 +61,6 @@ agent loads only the one it needs.
 | [task.md](task.md) | Task models and state. |
 | [taskrunner.md](taskrunner.md) | The execution engine that runs a task spec to completion. |
 | [workflows.md](workflows.md) | The dynamic-workflow engine: the frozen `ctx` contract, the event stream, budgets, and the named conformance gates with the test pinning each. |
-| [autopilot.md](autopilot.md) | Plan-driven orchestration and its lifecycle. |
 | [decisions.md](decisions.md) | The Jev decision seam: `decisions.enabled` as the only opt-in, session-key sampling through `decisions.bucket`, the scrub-before-send refusal, `skills.select` as the one integration that consumes an answer (with the word-overlap result as its fallback), and the basic call-metadata log. |
 | [crew-mode.md](crew-mode.md) | Crews: the config record, `select_crew` roster and binding, model and workspace resolution, the Crews UI, and the record of the retired `"crew"` slot mode (Crew Mode). |
 | [pipeline-conductor.md](pipeline-conductor.md) | The `kirocrew-pipeline-conductor` agent and its skill: the generated spec's permission narrowing, the three deterministic scripts, the patrol cycle, and what the RFC leaves unbuilt. |
@@ -100,6 +100,7 @@ agent loads only the one it needs.
 | [mcp-probe-quarantine.md](mcp-probe-quarantine.md) | A durable consecutive-probe-failure count per MCP server, surfaced on its dashboard row with a reset control. The unmount half is deferred; the spec records why. |
 | [app-notifications.md](app-notifications.md) | How an app publishes a notification to the local bus, and the two shipped producers. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
+| [dashboard-templates.md](dashboard-templates.md) | A dashboard page shipped with its own typed contract, provider and parity gate: the three invariants, the fold menu the numbers come from, and why a publisher writes sentences and never numbers. |
 | [prompt-optimizer.md](prompt-optimizer.md) | Rewriting a draft prompt on demand, and the paste-forwarding surface. |
 | [steering-viewer.md](steering-viewer.md) | Reading, creating, editing and deleting the steering files a session loads, and the declared-`inclusion` reporting. |
 | [turn-stats-footer.md](turn-stats-footer.md) | The per-turn token and timing footer: capture, persistence, and the frontend render gates. |

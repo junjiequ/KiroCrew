@@ -270,6 +270,8 @@ class _AllocationOwner(Protocol):
 
     def _fold_key(self, key: str) -> str: ...
 
+    def _bg_backend_supports_runtime(self) -> bool: ...
+
     async def await_replay_gap(self, key: str) -> None: ...
 
     def absorb_orphaned_release(self, key: str) -> bool: ...
@@ -1099,6 +1101,19 @@ class SessionAllocationService:
             return await owner.get_or_create(
                 key, agent=agent, approval_policy=approval_policy, cwd=cwd
             )
+        if not owner._bg_backend_supports_runtime():
+            # Dispatch on the SAME membership rule ``get_bg_session`` uses: only
+            # a backend in ``ACP_BACKENDS_ACP_RUNTIME`` has a shared multiplexed
+            # runtime to open a per-step session on. A harness outside that set
+            # has no such runtime to share, so ``_get_or_bootstrap_run_runtime``
+            # would bootstrap one -- always a kiro-family process -- under the
+            # task runner's own key, spawning kiro-cli under a foreign backend
+            # label (and failing outright when kiro-cli is not installed). Route
+            # those to the dedicated per-session path instead, exactly as
+            # ``get_bg_session`` serves them a provider-backed session.
+            return await owner.get_or_create(
+                key, agent=agent, approval_policy=approval_policy, cwd=cwd
+            )
         async with self._lock:
             # The other publication door: a key whose run is being ended
             # (``begin_ending``) admits no per-step session either. Refused here
@@ -1479,6 +1494,13 @@ class SessionAllocationService:
                     "new occupant's",
                     key,
                 )
+            else:
+                # A release marks the end of a live turn, not the start of
+                # idleness: refresh liveness so the idle sweep measures from
+                # when the session went quiet rather than when it was
+                # acquired. A run that never returns still goes stale and is
+                # reaped; a run working between tasks is not mistaken for one.
+                session.last_used = time.monotonic()
 
     async def _safe_cleanup(self, provider: LLMProvider, session_id: str) -> None:
         try:

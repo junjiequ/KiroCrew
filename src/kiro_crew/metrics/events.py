@@ -74,6 +74,18 @@ CHILD_PERMISSION_ROUTED = "kirocrew.acp.child_permission.routed"
 #: value is a routing regression alarm.
 DROPPED_FRAMES = "kirocrew.acp.dropped_frames"
 
+#: One point per ``session/set_mode`` that did not land on the freshly prepared
+#: skill-view alias on the first try (``acp/runtime.py::_activate_mode_bracketed``).
+#: ``outcome`` is the closed enum ``loaded_after_retry`` (the host loaded it after a
+#: forced reload) / ``refused_unloaded`` (it never did; the session start failed) /
+#: ``refused_unprepared`` (no view could be prepared; the start failed) /
+#: ``refused_superseded`` (a concurrent start adopted a newer view of the agent, or
+#: began one that did not complete, while this start's ``set_mode`` was pending; the
+#: start failed). More than a trickle of
+#: ``refused_unloaded`` or ``refused_unprepared`` means the host is not loading
+#: published aliases.
+SKILL_VIEW_FALLBACKS = "kirocrew.acp.skill_view.fallback"
+
 #: Cause attribution for turn timeouts (the 2h-ceiling hangs): whether the
 #: session was parked on a permission prompt and whether backend children
 #: were live when the ceiling fired.
@@ -242,3 +254,31 @@ RECOVERY_ESCALATIONS = "kirocrew.recovery.escalations"
 #: One per rebuild a layer performed (a backend respawn, a runtime rebuild, a
 #: daemon respawn); ``layer``.
 RESTARTS_TOTAL = "kirocrew.recovery.restarts"
+
+
+# ---------------------------------------------------------------------------
+# Gateway-daemon saturation signal — the loaded-but-alive state that precedes
+# every kill/reconnect cycle. Emitted by the supervisor's liveness watchdog
+# (``mcp_gateway/manager.py``) at the one moment it can be observed: the fast 2s
+# ping missed and the escalated probe was run. Attribute values are closed-set
+# constants (a boolean and the ``process`` role name), never ids or counts.
+# ---------------------------------------------------------------------------
+
+#: One per ESCALATED liveness probe the supervisor had to run — i.e. every time
+#: the fast 2s ping misses and the daemon gets its one longer chance to answer.
+#: ``answered`` is the whole point of the signal: ``True`` is a daemon that is
+#: LOADED-BUT-ALIVE (it missed the fast bound but replied to the longer probe —
+#: the precursor state to every kill cycle), ``False`` is a cycle that missed
+#: BOTH probes and is on its way to the zombie verdict. A rising rate of
+#: ``answered=True`` is "your gateway is saturated"; the concrete alert threshold
+#: is an ops tuning decision, not hardcoded here.
+LIVENESS_ESCALATED_PROBES = "kirocrew.mcp_gateway.liveness.escalated_probes"
+
+#: The OBSERVED round-trip latency (milliseconds) of an escalated probe that the
+#: daemon ANSWERED — the load evidence the fast bound throws away by giving up at
+#: 2s. Recorded only on ``answered=True`` (a miss has no latency to report).
+#: ``process=gatewayd`` names whose responsiveness this measures, mirroring
+#: :data:`LOOP_LAG_MS`. This is what lets the ``_LIVENESS_ESCALATED_TIMEOUT_SECS``
+#: bound be checked against field data and a daemon trending toward it become
+#: visible before it crosses.
+LIVENESS_ESCALATED_LATENCY_MS = "kirocrew.mcp_gateway.liveness.escalated_latency_ms"

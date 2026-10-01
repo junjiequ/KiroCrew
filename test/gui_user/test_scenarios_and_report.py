@@ -15,6 +15,8 @@ SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 KNOWLEDGE_NOTES_DIR = (
     Path(__file__).resolve().parents[2] / "scripts" / "gui-user-test" / "knowledge-notes"
 )
+#: boot.sh's seed step; a script, not a package, so the test loads it by path.
+SEED_HOME_PY = Path(__file__).resolve().parents[2] / "scripts" / "gui-user-test" / "seed_home.py"
 
 
 # --------------------------------------------------------------------------
@@ -62,8 +64,8 @@ SHIPPED = SHIPPED_SMOKE | {
     "crewmate-panel-tabs",
     "crewmate-reply-thread",
     "crewmate-team-view",
+    "customize-tabs",
     "knowledge-add-folder-source-and-scan",
-    "meet-crewmates-flow",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
 }
@@ -112,6 +114,58 @@ class TestShippedScenarios:
         assert any("3 supported files found" in step for step in sc.steps)
         assert any('"3 items"' in exp for exp in sc.expectations)
         assert any("/tmp/kirocrew-gui-user-test/team-notes" in step for step in sc.steps)
+
+    def test_knowledge_scenario_judges_the_settled_badge_and_survives_a_retry(self) -> None:
+        # Two ways this scenario reached NO_VERDICT on a night the product was
+        # healthy (run 36550183001). (1) The row's badge settles on "synced" once
+        # the scan the wait step waits for has finished; "active" is only the
+        # in-flight state after "Start Scanning", so an expectation demanding it
+        # asks for a screen the tester can never see, and the verdict then rides
+        # on judge leniency. (2) The retry runs against the same un-reseeded
+        # gateway, so attempt 2 meets the row attempt 1 added; a second add of
+        # the same folder is refused (409 "source already exists"), so the add
+        # step must name the final state and add nothing when the row is there.
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "knowledge-add-folder-source-and-scan.yaml")
+        assert any('"synced"' in exp for exp in sc.expectations)
+        for exp in sc.expectations:
+            if '"active"' in exp:
+                assert '"synced"' in exp, f"expectation demands the in-flight badge: {exp}"
+        guard = [s for s in sc.steps if "already listed" in s and "add nothing" in s]
+        assert guard, "no step tells a retry to leave an already-listed source alone"
+        add_step = next(i for i, s in enumerate(sc.steps) if 'Click "Local Folder"' in s)
+        assert sc.steps.index(guard[0]) < add_step, "the guard must come before the add"
+        assert '"synced"' in sc.steps[-1], "the wait must stop on the settled badge"
+
+    def test_seeded_project_reaches_the_transcript_reader(self, tmp_path: Path) -> None:
+        # seed_home.py --project writes into the starter transcript's metadata line
+        # by hand, and the dashboard restores `slot.project` from the same record
+        # through ConversationLog. Patch the real `rich` starter and read it back
+        # with the real reader, so a metadata-shape change on either side fails
+        # here rather than as "No project directory is set" on a paid nightly run.
+        import importlib.util
+
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.testing.fixtures import seeded_home
+
+        spec = importlib.util.spec_from_file_location("gui_seed_home", SEED_HOME_PY)
+        assert spec is not None and spec.loader is not None
+        seed_home = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(seed_home)
+
+        project = tmp_path / "sample-project"
+        project.mkdir()
+        with seeded_home("rich") as home:
+            sessions = home / "sessions"
+            starter = sessions / seed_home.STARTER_SESSION
+            before = starter.read_text(encoding="utf-8").splitlines()
+            seed_home._set_session_project(starter, str(project))
+            after = starter.read_text(encoding="utf-8").splitlines()
+            assert after[1:] == before[1:]  # only the metadata line moved
+            meta = ConversationLog(base_dir=sessions).get_metadata(starter.stem)
+        assert meta["project"] == str(project)
+        assert meta["title"] == "Welcome to KiroCrew"  # brand-ok: verbatim seeded title
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "chat-files-side-panel-browse.yaml")
+        assert any(meta["title"] in step for step in sc.steps)
 
     def test_rich_seed_artifacts_are_the_ones_the_scenario_reads(self) -> None:
         # The Artifacts scenario names the three artifacts the `rich` seed ships and
@@ -194,13 +248,13 @@ class TestShippedScenarios:
                 "crewmate-panel-tabs",
                 "crewmate-reply-thread",
                 "crewmate-team-view",
-                "meet-crewmates-flow",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
             ],
             "capabilities": [
                 "capabilities-agents-list-and-open-editor",
                 "capabilities-skills-filter-and-open-builtin",
+                "customize-tabs",
             ],
             "connections": ["connections-services-search-and-mcp-list"],
             "memory": ["memory-open-browser-from-overview"],
@@ -259,11 +313,11 @@ class TestShippedScenarios:
         preview_step = next(
             s for s in sc.steps if "preview" in s.lower() and "turn on" in s.lower()
         )
-        assert 'starts with "Crew Members"' in preview_step
+        assert 'starts with "Crewmates"' in preview_step
         assert (
             "Crew Members and Crew Mode" in preview_step
-        )  # the longer title is still a valid reading
-        assert any('"Crew Members" item appears in the left rail' in s for s in sc.steps)
+        )  # the older titles are still valid readings on older builds
+        assert any('"Crewmates" item appears in the left rail' in s for s in sc.steps)
 
     def test_members_scenarios_hedge_the_card_label(self) -> None:
         """A seeded member has no display name, so its card shows the id; every members scenario says so."""

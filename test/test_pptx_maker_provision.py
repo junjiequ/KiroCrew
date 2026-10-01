@@ -25,6 +25,7 @@ from unittest import mock
 
 import pytest
 
+from kiro_crew import env as env_mod
 from kiro_crew.apps.builtins.pptx_maker.backend import provision
 
 
@@ -230,8 +231,8 @@ class TestResolveUv:
         packaged.write_text("#!/bin/sh", encoding="utf-8")
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value=str(packaged)))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which") as which,
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which") as which,
         ):
             assert provision.resolve_uv() == str(packaged)
         assert not which.called, "PATH must not be consulted when the package resolves"
@@ -243,16 +244,16 @@ class TestResolveUv:
             find_uv_bin=mock.Mock(side_effect=FileNotFoundError("no uv in any location"))
         )
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/local/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/local/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/local/bin/uv"
 
     def test_falls_back_to_path_when_the_package_is_absent(self):
         """An install without the uv wheel at all must not raise ImportError."""
         with (
-            mock.patch.dict(sys.modules, {"uv": None}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", None),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/bin/uv"
 
@@ -261,8 +262,8 @@ class TestResolveUv:
         than hand an absolute nonexistent path to `subprocess.run`."""
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value=str(tmp_path / "gone")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value="/usr/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/usr/bin/uv"),
         ):
             assert provision.resolve_uv() == "/usr/bin/uv"
 
@@ -271,8 +272,8 @@ class TestResolveUv:
         binary — a system uv must still be used rather than reporting none."""
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("no binary")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value="/opt/homebrew/bin/uv"),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="/opt/homebrew/bin/uv"),
         ):
             assert provision.resolve_uv() == "/opt/homebrew/bin/uv"
 
@@ -281,17 +282,39 @@ class TestResolveUv:
         condition, not a traceback inside a detached background job."""
         fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("nope")))
         with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(provision.shutil, "which", return_value=None),
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value=None),
         ):
             assert provision.resolve_uv() is None
+
+    def test_a_relative_which_result_is_skipped(self, tmp_path: Path, monkeypatch):
+        """A relative `PATH` entry makes `shutil.which` return a relative path.
+        Pod provisioning runs uv with `cwd=<checkout>`, where that path does not
+        resolve and `Popen` would raise before the pip fallback. A binary found
+        through a relative PATH entry is also whatever sits in the cwd, so the
+        ladder reports no uv and lets the caller fall back."""
+        monkeypatch.chdir(tmp_path)
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("nope")))
+        with (
+            mock.patch.object(env_mod, "_uv_package", fake_uv),
+            mock.patch.object(env_mod.shutil, "which", return_value="bin/uv"),
+        ):
+            assert provision.resolve_uv() is None
+
+    def test_a_relative_locator_result_is_made_absolute(self, tmp_path: Path, monkeypatch):
+        """Same contract for the wheel locator branch."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "uv").write_text("#!/bin/sh", encoding="utf-8")
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(return_value="uv"))
+        with mock.patch.object(env_mod, "_uv_package", fake_uv):
+            assert provision.resolve_uv() == str(tmp_path / "uv")
 
     def test_the_resolved_path_is_cached(self, tmp_path: Path):
         """Called on every provision, and the answer cannot change in-process."""
         packaged = tmp_path / "uv"
         packaged.write_text("#!/bin/sh", encoding="utf-8")
         locator = mock.Mock(return_value=str(packaged))
-        with mock.patch.dict(sys.modules, {"uv": mock.Mock(find_uv_bin=locator)}):
+        with mock.patch.object(env_mod, "_uv_package", mock.Mock(find_uv_bin=locator)):
             assert provision.resolve_uv() == str(packaged)
             assert provision.resolve_uv() == str(packaged)
         assert locator.call_count == 1
@@ -1045,9 +1068,7 @@ class TestShippedAgentsDoNotPreAuthorizeTools:
                 raw = raw.replace(placeholder, "/rendered")
             data = json.loads(raw)
             resolvable = set(data.get("mcpServers") or {})
-            manifest = json.loads(
-                (path.parent.parent / "app.json").read_text(encoding="utf-8")
-            )
+            manifest = json.loads((path.parent.parent / "app.json").read_text(encoding="utf-8"))
             app_name = manifest.get("name")
             if isinstance(app_name, str) and app_name:
                 resolvable.update(
@@ -1073,3 +1094,57 @@ class TestShippedAgentsDoNotPreAuthorizeTools:
             "declares — kiro-cli will silently drop them at mount time:\n  "
             + "\n  ".join(offenders)
         )
+
+
+class TestTheProvisionLogIsDecodedAsUtf8:
+    """`_run`'s captured output is the provisioning log the operator reads.
+
+    ``ProvisionState`` serves it straight to the dashboard
+    (``{"ok": ..., "log": self.log[-LOG_TAIL_CHARS:], ...}``), so whatever this
+    decode gets wrong is what a human sees while trying to work out why an
+    install failed — the one moment the log has to be right.
+
+    The child is ``uv``, which this module's own docstring calls "a static Rust
+    binary": it writes UTF-8, not the console code page. But
+    ``run_limited(..., text=True)`` with no ``encoding=`` decodes with
+    ``locale.getpreferredencoding()``, which on Windows is the legacy ANSI code
+    page. uv's output carries package names and absolute paths under the user's
+    data home, so a non-ASCII account name is enough to reach this.
+
+    Measured, not argued: the child exits **0** and the whole log arrives as
+    ``""``. On Windows ``capture_output`` decodes on a helper thread, so the
+    error kills that thread rather than the call and ``proc.stdout`` is ``None``;
+    the operator gets a blank log for a run that printed plenty. On POSIX the
+    same decode raises `UnicodeDecodeError` — a `ValueError`, so neither
+    ``except subprocess.TimeoutExpired`` nor
+    ``except (OSError, subprocess.SubprocessError)`` catches it and it escapes
+    ``_run`` entirely.
+    """
+
+    #: Not valid UTF-8 (``0xff`` never begins a sequence), so this is red on
+    #: every host — it turns on the decode being strict, not on the host codec.
+    PAYLOAD = b"Resolved 41 packages\nerror: failed at " + bytes([0xFF, 0xFE]) + b"/pkg\n"
+
+    def _argv(self) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            f"import sys;sys.stdout.buffer.write({self.PAYLOAD!r});sys.stdout.buffer.flush()",
+        ]
+
+    def test_undecodable_uv_output_still_reaches_the_log(self, tmp_path):
+        """A malformed byte must cost one character, not the entire log."""
+        with pytest.raises(UnicodeDecodeError):
+            self.PAYLOAD.decode("utf-8")  # guard the guard
+
+        with (
+            mock.patch.object(
+                provision, "sandboxed_spawn_argv", return_value=(self._argv(), None, None)
+            ),
+            mock.patch.object(provision, "cgroup_scope_argv", side_effect=lambda a: a),
+        ):
+            code, out = provision._run(self._argv(), cwd=str(tmp_path), timeout=30)
+
+        assert code == 0
+        assert "Resolved 41 packages" in out, "the log must survive one bad byte"
+        assert "error: failed at" in out

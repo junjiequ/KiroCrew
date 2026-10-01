@@ -17,9 +17,10 @@ green.
 
 from __future__ import annotations
 
+import functools
 import subprocess
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from skill_script_helpers import load_skill_script
@@ -114,18 +115,36 @@ def pair(tmp_path: Path) -> Pair:
     return Pair(upstream, work)
 
 
-def _run_main(mod: ModuleType, monkeypatch, pair: Pair, *argv: str) -> int:
-    """Run the script's ``main`` from inside the work clone.
+def _git_runs_in(mod: ModuleType, monkeypatch, cwd: Path) -> None:
+    """Pin every spawn the script issues to ``cwd``, at the seam the script reads.
 
     ``green_age.run()`` is a CLI runner whose contract is "git in the invoking
-    cwd": it passes no ``cwd=`` of its own, so the PROCESS cwd is the repository
-    it measures. The ``chdir`` here is therefore the whole isolation: with it,
-    every ``git`` the script spawns runs under ``tmp_path``; without it, the same
-    spawns would run in the pytest worker's cwd -- this checkout -- and answer
-    about the wrong repository. The ``cwd=None`` descriptor itself is deliberate
-    and stays (test-hygiene class 7, "what not to re-derive").
+    cwd": it passes no ``cwd=`` of its own, and that ``cwd=None`` descriptor is
+    deliberate and stays (test-hygiene class 7, "what not to re-derive"). Left
+    alone, the ``git`` it spawns would inherit the pytest worker's cwd -- this
+    checkout -- and answer about the wrong repository. The spawn is the one
+    ``subprocess.run`` call in ``run()``, reached through the module's own
+    ``subprocess`` binding, so that binding is replaced with one whose ``run``
+    carries ``cwd``: the body of ``run()`` -- the ``which`` resolution, the
+    decode, the ``OSError`` mapping -- executes unchanged, and every descriptor
+    it opens names the scratch directory instead of relying on the process cwd.
+    A ``chdir`` alone would place the process there too, but leaves the
+    descriptor itself ``cwd=None``, which a per-spawn probe cannot tell from a
+    spawn that really did run in the checkout. The binding swap alone covers
+    only spawns that go through it: a ``from subprocess import run`` at module
+    level, an ``os.popen`` or a helper module would still inherit the worker's
+    cwd -- this checkout -- and answer. So BOTH are set: the binding for the
+    descriptor the probe reads, the process cwd for the spawns it cannot see.
     """
-    monkeypatch.chdir(pair.work)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(
+        mod, "subprocess", SimpleNamespace(run=functools.partial(subprocess.run, cwd=str(cwd)))
+    )
+
+
+def _run_main(mod: ModuleType, monkeypatch, pair: Pair, *argv: str) -> int:
+    """Run the script's ``main`` against the work clone (see ``_git_runs_in``)."""
+    _git_runs_in(mod, monkeypatch, pair.work)
     return mod.main(list(argv))
 
 
@@ -333,7 +352,8 @@ def _outside_any_repository(monkeypatch, tmp_path: Path) -> Path:
     below the named directory -- and the script inherits the environment, so the
     state the test asserts is constructed here rather than assumed of the host.
     The directory returned is a CHILD of the ceiling because git checks the
-    directory it starts in before consulting the ceiling.
+    directory it starts in before consulting the ceiling. Callers hand it to
+    ``_git_runs_in`` so the script's spawns carry it as their ``cwd``.
     """
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     nowhere = tmp_path / "nowhere"
@@ -343,7 +363,7 @@ def _outside_any_repository(monkeypatch, tmp_path: Path) -> Path:
 
 def test_outside_a_git_repository_is_an_environment_error(mod, monkeypatch, tmp_path) -> None:
     """Unknown must never read as fresh: no verdict is exit 2, not exit 0."""
-    monkeypatch.chdir(_outside_any_repository(monkeypatch, tmp_path))
+    _git_runs_in(mod, monkeypatch, _outside_any_repository(monkeypatch, tmp_path))
 
     assert mod.main([]) == mod.EXIT_ENV
 
@@ -469,6 +489,76 @@ def test_import_matching_runs_in_both_directions_on_a_dot_boundary(mod) -> None:
     assert mod._imports_touch({"kiro_crew.ledgerx"}, {"kiro_crew.ledger"}) == ""
 
 
+def test_a_package_import_reaches_its_direct_child_module(mod) -> None:
+    changed = {"kiro_crew.apps.builtins.aws_control.backend.backup"}
+    assert mod._imports_touch({"kiro_crew.apps.builtins.aws_control.backend"}, changed) == (
+        "kiro_crew.apps.builtins.aws_control.backend.backup"
+    )
+
+
+def test_an_ancestor_package_import_does_not_reach_a_grandchild_module(mod) -> None:
+    # ``from kiro_crew import platform_compat`` yields the bare root token; it
+    # names no changed module and must not reach one through the shared root.
+    changed = {"kiro_crew.apps.builtins.aws_control.backend.backup"}
+    assert mod._imports_touch({"kiro_crew"}, changed) == ""
+    assert mod._imports_touch({"kiro_crew.apps.builtins.aws_control"}, changed) == ""
+
+
+def test_the_root_package_token_does_not_reach_a_top_level_module(mod) -> None:
+    # The bare root token names no module; the real import is matched exactly.
+    assert mod._imports_touch({"kiro_crew"}, {"kiro_crew.security"}) == ""
+    assert mod._imports_touch({"kiro_crew", "kiro_crew.security"}, {"kiro_crew.security"}) == (
+        "kiro_crew.security"
+    )
+
+
+def test_a_facade_package_reaches_the_deep_module_its_init_re_exports(mod) -> None:
+    inits = {
+        "src/kiro_crew/subagent_manager/__init__.py": (
+            "from .admission import SpawnAdmissionCoordinator\n"
+        ),
+    }
+    changed = {"kiro_crew.subagent_manager.admission.gate"}
+    facade = {"kiro_crew.subagent_manager"}
+    assert mod._imports_touch(facade, changed, inits.get) == (
+        "kiro_crew.subagent_manager.admission.gate"
+    )
+    # Without the facade's own import, the deep module stays unreached.
+    assert mod._imports_touch(facade, changed, {}.get) == ""
+
+
+def test_a_parenthesized_import_binds_every_name_across_lines(mod) -> None:
+    text = "from kiro_crew import (\n    model_registry,  # the registry\n    sel,\n)\n"
+    found = mod.imported_modules(text, "src/kiro_crew/acp/client.py")
+    assert {"kiro_crew.model_registry", "kiro_crew.sel"} <= found
+    assert mod._imports_touch(found, {"kiro_crew.model_registry"}) == "kiro_crew.model_registry"
+
+
+def test_an_inline_comment_does_not_drop_the_imported_name(mod) -> None:
+    text = "from kiro_crew import agent  # the agent loop\n"
+    found = mod.imported_modules(text, "src/kiro_crew/cli.py")
+    assert "kiro_crew.agent" in found
+    assert mod._imports_touch(found, {"kiro_crew.agent"}) == "kiro_crew.agent"
+
+
+def test_each_blob_is_read_at_most_once_per_run(mod) -> None:
+    blobs = {
+        "src/kiro_crew/a.py": "from kiro_crew import pkg\n",
+        "src/kiro_crew/b.py": "from kiro_crew import pkg\n",
+        "src/kiro_crew/pkg/__init__.py": "from .sub import thing\n",
+    }
+    reads: list[str] = []
+
+    def read(path):
+        reads.append(path)
+        return blobs.get(path, "")
+
+    mine = ["src/kiro_crew/pkg/sub/x.py", "src/kiro_crew/pkg/sub/y.py"]
+    overlap = mod.classify_overlap(["src/kiro_crew/a.py", "src/kiro_crew/b.py"], mine, read)
+    assert [o["class"] for o in overlap] == ["import", "import"]
+    assert len(reads) == len(set(reads))
+
+
 def test_test_stem_prefixes_are_cumulative_and_only_for_test_files(mod) -> None:
     assert mod.test_stem_prefixes("test/test_ledger_retention.py") == [
         "ledger",
@@ -515,7 +605,7 @@ def test_the_human_line_says_unavailable_rather_than_fresh(mod) -> None:
 
 def test_summarize_never_reports_fresh_without_a_verdict(mod, monkeypatch, tmp_path) -> None:
     """The dict is always readable, and a failure carries ok=False plus a reason."""
-    monkeypatch.chdir(_outside_any_repository(monkeypatch, tmp_path))
+    _git_runs_in(mod, monkeypatch, _outside_any_repository(monkeypatch, tmp_path))
     summary = mod.summarize()
 
     assert summary["ok"] is False
@@ -528,14 +618,15 @@ def test_an_injected_runner_is_the_only_way_commands_are_issued(
 ) -> None:
     """pr_status.py embeds this script and passes its own runner; nothing leaks.
 
-    Run from a directory that is not the repository at all: the verdict is still
-    correct, which is only possible if every command went through the runner.
-    That directory is constructed, not inherited: the default cwd is the pytest
-    worker's -- this checkout, itself a git repository -- from which a command
-    that slipped past the runner would still answer, and answer about the wrong
-    repository. From ``nowhere`` a leaked ``git`` fails instead of passing.
+    Every spawn is pinned to a directory that is not the repository at all: the
+    verdict is still correct, which is only possible if every command went
+    through the runner. That directory is constructed, not inherited: the
+    default cwd is the pytest worker's -- this checkout, itself a git repository
+    -- from which a command that slipped past the runner would still answer, and
+    answer about the wrong repository. From ``nowhere`` a leaked ``git`` fails
+    instead of passing.
     """
-    monkeypatch.chdir(_outside_any_repository(monkeypatch, tmp_path))
+    _git_runs_in(mod, monkeypatch, _outside_any_repository(monkeypatch, tmp_path))
     pair.branch_changes({"src/kiro_crew/ledger/store.py": "VALUE = 2\n"})
     pair.base_gains({"src/kiro_crew/ledger/store.py": "VALUE = 3\n"})
     seen: list[list[str]] = []

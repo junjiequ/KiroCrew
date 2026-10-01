@@ -7,6 +7,7 @@ import functools
 import importlib.util
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -27,6 +28,7 @@ from kiro_crew.browser.command_bus import (
     get_command_bus,
 )
 from kiro_crew.browser_cli import install as browser_cli_install
+from kiro_crew.browser_cli import install_job as browser_install_job
 from kiro_crew.browser_cli import launcher as browser_cli_launcher
 from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.browser_cli import view as browser_cli_view
@@ -59,6 +61,7 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     run_to_completion,
     slack_options_owner_key,
+    subagent_event_slot,
 )
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
@@ -73,10 +76,19 @@ from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_reque
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
     stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
+from kiro_crew.dashboard.ws_event_scope import (
+    _audit_allow,
+    _audit_deny,
+    persisted_replay_denial_reason,
+    persisted_snapshot_denial_reason,
+    slot_owner_snapshot,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import (
@@ -108,7 +120,17 @@ from kiro_crew.subagent import (
     parent_spawn_allowlists,
     stage_boundary_owner_for_run,
 )
-from kiro_crew.subagent_persistence import _agent_dir, read_state
+from kiro_crew.subagent_persistence import (
+    DISMISSAL_FAILED,
+    DISMISSAL_NO_FOLDER,
+    PanelRecords,
+    _agent_dir,
+    classify_persisted_ending,
+    read_panel_records,
+    read_state,
+    read_tombstone,
+    record_panel_dismissal_outcome,
+)
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
@@ -715,14 +737,6 @@ async def api_spawn(request: web.Request) -> web.Response:
                 {"error": "The target member does not exist.", "code": "unknown_member"},
                 status=404,
             )
-        if crew and config is not None and not config.agents[crew].triggers.strip():
-            return web.json_response(
-                {
-                    "error": "The target member has not enabled delegated tasks.",
-                    "code": "crew_delegation_disabled",
-                },
-                status=403,
-            )
         admitted_execution = derive_execution(
             parent_execution,
             target_member=crew or None,
@@ -1243,7 +1257,21 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                     "done": True,
                     "started": disk_state.get("started"),
                 }
-                result_path = _agent_dir(agent_id) / "result.txt"
+                tombstone = await asyncio.to_thread(read_tombstone, agent_id) or {}
+                # Legacy persisted records do not carry terminal usage. Keep
+                # those fields absent rather than presenting invented zeros.
+                for field in ("elapsed", "credits"):
+                    if field in tombstone:
+                        value = tombstone[field]
+                        if (
+                            not isinstance(value, bool)
+                            and isinstance(value, (int, float))
+                            and math.isfinite(value)
+                            and value >= 0
+                        ):
+                            disk_data[field] = float(value)
+                agent_dir = _agent_dir(agent_id)
+                result_path = agent_dir / "result.txt"
                 result = ""
                 if result_path.exists() and not is_sensitive_path(str(result_path)):
                     try:
@@ -1258,17 +1286,25 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                 if view_meta:
                     disk_data["result_meta"] = view_meta
                 disk_data["result"] = _redact(view) if view else "_No result._"
-                # Check for tombstone
-                tombstone_path = _agent_dir(agent_id) / "tombstone.json"
-                if tombstone_path.exists() and not is_sensitive_path(str(tombstone_path)):
-                    try:
-                        raw = await asyncio.to_thread(tombstone_path.read_text, encoding="utf-8")
-                        ts = json.loads(raw)
-                        disk_data["error"] = _redact(f"Orphaned: {ts.get('cause', 'unknown')}")
-                    except (OSError, ValueError):
-                        disk_data["error"] = "Orphaned (unknown cause)"
-                else:
+                # One classifier, shared with the panel list. Reading the
+                # tombstone here as well let the same folder answer "completed"
+                # in a list and "Orphaned: delivered" when opened, and flattened
+                # a recorded user stop into a failure.
+                outcome, error, stopped = await asyncio.to_thread(
+                    classify_persisted_ending, agent_dir
+                )
+                if not outcome:
+                    # Nothing recorded an ending, so this run has no outcome to
+                    # report. The caller asked for this id by name, so the card
+                    # is served with what IS known and the outcome field is left
+                    # out rather than filled with a guess.
+                    disk_data.pop("outcome", None)
+                    disk_data["stopped"] = False
                     disk_data["error"] = ""
+                    return web.json_response(disk_data)
+                disk_data["outcome"] = outcome
+                disk_data["stopped"] = stopped
+                disk_data["error"] = _redact(error) if error else ""
                 return web.json_response(disk_data)
         except Exception:
             logger.debug("Persistence fallback failed for %s", agent_id, exc_info=True)
@@ -1276,6 +1312,8 @@ async def api_spawn_status(request: web.Request) -> web.Response:
     data = {"id": info.id, "task": _redact(info.task), "done": info.done}  # type: dict[str, object]
     data["started"] = info.started
     if info.done:
+        data["elapsed"] = info.elapsed
+        data["credits"] = info.credits
         # Read full result from disk (info.result is truncated to 3000 chars)
         result = info.result
         if info.result_path and not is_sensitive_path(info.result_path):
@@ -1350,7 +1388,14 @@ async def api_spawn_list(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.subagents:
         return web.json_response({"agents": []})
-    scope, refusal = await internal_memory_scope(request, "spawn.list")
+    # Called for its REFUSAL: it rejects an internal caller whose execution
+    # identity cannot be verified. The store it resolves is deliberately not kept
+    # as the ownership gate -- a verified internal caller on the default store
+    # answers an empty store, which is indistinguishable from the dashboard
+    # owner's absent one, so gating on it admits the very callers the bound is
+    # for. ``_admit`` gates on ``internal_auth`` instead, the signal the live
+    # branch below already uses on the same field.
+    _store, refusal = await internal_memory_scope(request, "spawn.list")
     if refusal is not None:
         return refusal
     agents = []
@@ -1403,7 +1448,155 @@ async def api_spawn_list(request: web.Request) -> web.Response:
         if withheld:
             entry["context_withheld"] = withheld
         agents.append(entry)
-    return web.json_response({"agents": agents})
+    # Durable half of the inventory: the runs this process never tracked, which
+    # a memory-only listing cannot name at all. Live entries win -- an id listed
+    # above is excluded rather than merged -- and the caller's own scope gate is
+    # re-applied here on the record's parent, the same field the live branch
+    # compares.
+    listed = {str(entry["id"]) for entry in agents}
+    # The audit identity is the APP, never the caller-supplied session key. The
+    # dedup registry behind ``_audit_deny`` is keyed on it and is not evicted, so a
+    # per-run session id would leave one permanent entry per subagent run. Every
+    # other call site in the tree passes a bounded app id for the same reason.
+    auditee = str(request.get("app") or "<owner>")
+
+    # An app-authenticated caller and the dashboard owner BOTH reach this route
+    # with `scope is None` -- `internal_memory_scope` answers that for a
+    # non-internal caller and for a verified session whose execution record is
+    # empty -- so scope alone cannot tell them apart. The app claim can, and it
+    # is the instrument the rest of the tree uses: `derive_caller_app` states
+    # that app-ownership checks gate on `request["app"]`. Publication is
+    # narrowing-only -- every transport sets the claim ONLY for a positively
+    # resolved app and leaves it absent for the person -- so a present non-empty
+    # claim is itself the positive signal, the same one the middleware inverts
+    # into `is_dashboard_user`. A transport flag is the wrong question here: it
+    # answers which credential arrived, and three arms publish a validated app
+    # claim without it.
+    caller_app = str(request.get("app") or "")
+    caller_is_app = bool(caller_app)
+
+    # Slot ownership is read on the LOOP, twice, and never from the worker
+    # thread. Once here as a snapshot, so the row cap is sized over the records
+    # this caller may actually see; then again after the thread returns, which is
+    # the authoritative check. A slot's owner can flip while the scan runs --
+    # keys are caller-supplied and not app-namespaced, so another app can reclaim
+    # one -- and a decision taken off-loop would be read from state the caller
+    # does not describe. The WS replay reads the same pair for the same reason.
+    owner_now = slot_owner_snapshot(state)
+
+    def _admit(record: dict) -> bool:
+        """This caller's own visibility, applied before the cap.
+
+        Two bounds with different reach. The app bound is unconditional, because
+        an app token must never read another app's run text no matter how its
+        session scope resolved. The session bound is conditional on
+        ``internal_auth`` -- the same condition the live branch above applies to
+        the same field -- so the durable half of one listing is neither wider nor
+        narrower than the live half a caller sees beside it. It is deliberately
+        NOT conditional on the resolved memory store: that answers empty for a
+        verified internal caller on the default store exactly as it does for the
+        dashboard owner, so it would lift the bound for nearly every attested
+        caller it exists to bind.
+
+        Both read only the request's own values and the record, so they are sound
+        on a worker thread. The ownership dimension is not: it answers from live
+        slot state, so here it consults the loop-taken snapshot and sizes the cap
+        only, and the record is decided again on the loop before it is listed.
+
+        Every refusal is a permission decision and leaves a SEL record under the
+        reason it actually had -- a lazily hydrated slot is `slot_missing`, not an
+        ownership breach.
+        """
+        if caller_is_app and str(record["app"] or "") != caller_app:
+            _audit_deny(auditee, "api_spawn_list", "persisted_app_mismatch")
+            return False
+        if not internal:
+            return True
+        parent = str(record["parent_session"])
+        agent_id = str(record["id"])
+        if parent != caller and caller != f"subagent:{agent_id}":
+            _audit_deny(auditee, "api_spawn_list", "persisted_scope_mismatch")
+            return False
+        # The ownership dimension, sized off the loop snapshot. Withholding is
+        # itself the permission decision, so it audits here under the reason it
+        # had; the surviving records are decided again on the loop, and the two
+        # sets are disjoint, so no record is audited twice.
+        denial = persisted_snapshot_denial_reason(owner_now, subagent_event_slot(parent), record)
+        if denial:
+            _audit_deny(auditee, "api_spawn_list", denial)
+            return False
+        return True
+
+    try:
+        persisted = await asyncio.to_thread(
+            read_panel_records,
+            keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+            max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+            exclude_ids=listed,
+            include_result=True,
+            admit=_admit,
+        )
+    except Exception:
+        logger.debug("Persisted spawn listing failed", exc_info=True)
+        persisted = PanelRecords([], 0, False)
+    for record in persisted.records:
+        parent = str(record["parent_session"])
+        agent_id = str(record["id"])
+        if internal:
+            # The authoritative gate, on the loop, against state as it is NOW
+            # rather than as the snapshot found it. A record the snapshot
+            # admitted and this rejects had its slot reclaimed mid-scan. Same
+            # reused-slot-key exposure the replay guards, reached here through the
+            # parent session rather than a frame.
+            denial = persisted_replay_denial_reason(state, subagent_event_slot(parent), record)
+            if denial:
+                _audit_deny(auditee, "api_spawn_list", denial)
+                continue
+        # The GRANT is a permission decision too, and the one an operator needs to
+        # reconstruct who was handed a persisted run's text. Recording only the
+        # refusals leaves the admissions invisible, so a review of this stream can
+        # show what was blocked and never what was released.
+        _audit_allow(auditee, "api_spawn_list")
+        error = str(record["error"])
+        agents.append(
+            {
+                "id": agent_id,
+                "task": _redact(str(record["task"])),
+                "done": True,
+                "parent": parent,
+                "agent": _redact(str(record["agent"])),
+                "started": record["started"],
+                "result": _redact(str(record.get("result") or "")),
+                "error": _redact(error) if error else "",
+                # The tombstone records the run's own outcome, so a user stop
+                # stays a stop here rather than being flattened into a failure.
+                "stopped": bool(record.get("stopped")),
+                "outcome": record["outcome"],
+            }
+        )
+    payload: dict[str, object] = {"agents": agents}
+    if persisted.overflow or persisted.overflow_is_lower_bound:
+        # Said out loud once per listing, to the operator rather than the client:
+        # a listing of 50 of 51 eligible runs otherwise reads exactly like a
+        # listing of all 50 there were. The WARNING carries the count, and it is
+        # the whole report: a truncation refuses nobody, so it is not a permission
+        # decision and does not belong in the SEL deny stream beside the ownership
+        # refusals an operator has to be able to see there. No client reads a
+        # count it cannot act on, so it stays out of the payload too.
+        # A saturated scan window reports even at a count of zero, because that
+        # is the case where the count itself cannot see what was left out.
+        logger.warning(
+            "persisted spawn listing truncated: %s%d eligible run(s) past the %d cap%s",
+            "at least " if persisted.overflow_is_lower_bound else "",
+            persisted.overflow,
+            PERSISTED_SUBAGENT_REPLAY_KEEP,
+            (
+                " (scan window saturated, older admissible runs may be uninspected)"
+                if persisted.overflow_is_lower_bound
+                else ""
+            ),
+        )
+    return web.json_response(payload)
 
 
 async def api_spawn_retry(request: web.Request) -> web.Response:
@@ -1570,7 +1763,59 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
     manager = state.subagents
     info = manager.get(agent_id) if manager is not None else None
     if manager is None or info is None:
-        return web.json_response({"error": "not found"}, status=404)
+        # A card the durable replay rebuilt has no manager entry -- after a
+        # gateway restart that is every finished run -- so a flat 404 made those
+        # cards undismissable: the delete failed, the banner showed, and the next
+        # reconnect sent the card again. The dismissal is recorded against the
+        # folder instead, which is the same record the live path writes.
+        #
+        # Dashboard owner only. That is exactly as wide as what the owner can
+        # already see -- their sockets short-circuit visibility to every live slot
+        # -- so no caller gains reach over a run it could not list. An app token
+        # is refused rather than handed a route into another app's runs, and an
+        # absent claim means the request never passed the auth middleware.
+        request_app = request.get("app", "")
+        if "app" not in request or request_app:
+            _sel().log_api_access(
+                caller=request_app or "unknown",
+                operation="spawn.dismiss",
+                outcome="denied",
+                source="app_isolation",
+                resources="dashboard-only dismissal of a persisted run",
+                error="app tokens cannot dismiss persisted subagent runs",
+            )
+            return web.json_response(
+                {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
+            )
+        outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
+        if outcome == DISMISSAL_NO_FOLDER:
+            # No folder, so nothing durable can rebuild this card and there is no
+            # run here to speak of. Same answer as before for a truly unknown id.
+            return web.json_response({"error": "not found"}, status=404)
+        if outcome == DISMISSAL_FAILED:
+            # The store is unwritable, so this card returns on the next rebuild.
+            # Answering 404 would say the run does not exist, and answering ok
+            # would claim a dismissal that did not happen; both leave the user
+            # watching a dismissed card come back with nothing to explain it.
+            _sel().log_api_access(
+                caller="internal",
+                operation="spawn.dismiss",
+                outcome="denied",
+                source="subagent",
+                resources=f"persisted run {agent_id}",
+                error="the dismissal record could not be written",
+            )
+            return web.json_response(
+                {"error": "dismissal not recorded", "code": "dismissal_unwritable"}, status=503
+            )
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.dismiss",
+            outcome="allowed",
+            source="subagent",
+            resources=f"persisted run {agent_id}",
+        )
+        return web.json_response({"ok": True, "cancelled": False, "dismissed": True})
     cancelled = await manager.cancel(agent_id)
     if not cancelled:
         deleted_owner = stage_boundary_owner_for_run(info)
@@ -2226,8 +2471,15 @@ async def _deliver_channel_dm(
     # that a future caller of this helper cannot reach a channel without it. The
     # neutral sink rather than a bare redactor pair, because the leg is
     # channel-NEUTRAL and Slack/Discord both parse broadcast-mention grammars.
-    units = chunk_for_transport(
-        display_safe_for(text, live_transport.capabilities), live_transport.capabilities
+    # Offloaded: the display sink threads the credential-aware splitter's whole-text
+    # budget search (up to 128 dense probes plus span-repair passes) onto the call,
+    # and this leg runs on the gateway's single loop thread with model-authored,
+    # length-unchecked text -- a large body would stall the loop past the watchdog's
+    # 25s dump-then-exit alarm. Offloaded like the renderer's own send legs.
+    units = await asyncio.to_thread(
+        chunk_for_transport,
+        display_safe_for(text, live_transport.capabilities),
+        live_transport.capabilities,
     )
     try:
         for unit in units:
@@ -2518,8 +2770,14 @@ async def _send_to_channel_target(
     # displayed form before scanning, and defangs broadcast-mention grammars —
     # correct here because this leg is channel-NEUTRAL and Slack/Discord do have
     # them.
-    parts = chunk_for_transport(
-        display_safe_for(text, transport.capabilities), transport.capabilities
+    # Offloaded for the same reason as the live-transport leg above: the display
+    # sink runs the credential-aware splitter's whole-text budget search on the
+    # gateway's single loop thread with model-authored, length-unchecked text, and
+    # a large body would stall the loop past the watchdog's 25s dump-then-exit alarm.
+    parts = await asyncio.to_thread(
+        chunk_for_transport,
+        display_safe_for(text, transport.capabilities),
+        transport.capabilities,
     )
     try:
         for index, part in enumerate(parts):
@@ -4116,19 +4374,167 @@ async def api_browser_command_result(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _browser_install_job(state: DashboardState) -> browser_install_job.BrowserInstallJob | None:
+    """The gateway's current or most recent install job, if one ran."""
+    job = getattr(state, "_browser_install_job", None)
+    return job if isinstance(job, browser_install_job.BrowserInstallJob) else None
+
+
+def _browser_install_active(state: DashboardState) -> bool:
+    """Whether an install occupies the gateway's one slot.
+
+    The task is consulted as well as the job so the slot stays closed until
+    the task that owns the worker has actually returned.
+    """
+    job = _browser_install_job(state)
+    task = getattr(state, "_browser_install_task", None)
+    return bool((job is not None and job.running) or (task is not None and not task.done()))
+
+
+def _browser_install_status(state: DashboardState) -> dict[str, Any]:
+    """The job-derived fields every install response carries.
+
+    ``installing`` and ``last_error`` keep their meaning for older dashboards:
+    whether a job runs, and the latest job's detail when it failed.
+    """
+    job = _browser_install_job(state)
+    failed = job is not None and job.status == browser_install_job.STATUS_FAILED
+    return {
+        "installing": _browser_install_active(state),
+        "install_job": job.snapshot() if job is not None else None,
+        "last_error": job.error_detail if failed and job is not None else None,
+    }
+
+
+def _browser_install_conflict(state: DashboardState) -> web.Response:
+    """409 naming the job that holds the slot, so the panel can say which one."""
+    job = _browser_install_job(state)
+    return web.json_response(
+        {
+            "error": "an install is already running",
+            "code": "install_already_running",
+            "install_job": job.snapshot() if job is not None and job.running else None,
+        },
+        status=409,
+    )
+
+
+def _start_browser_install_job(
+    state: DashboardState,
+    kind: str,
+    engine: str | None,
+    work: Callable[[browser_cli_install.StageCallback], dict[str, Any]],
+    default_step: str,
+) -> None:
+    """Publish a new running job, then start its worker.
+
+    The job is on ``state`` before the task exists, so a status read that
+    lands between this call and the worker's first stage already reports it.
+    Stage updates arrive from the worker thread and are marshalled onto the
+    loop; each is bound to THIS job object, whose own id and status checks make
+    a late update from a finished job a no-op.
+
+    Cancelling the task (gateway shutdown cancels every pending task) kills
+    the installer's process tree through the job's
+    :class:`~kiro_crew.browser_cli.install.InstallScope` before the task
+    ends, because cancelling the awaiting coroutine alone leaves the worker
+    thread and its subprocess running.
+    """
+    loop = asyncio.get_running_loop()
+    job = browser_install_job.BrowserInstallJob.start(kind, engine)
+    scope = browser_cli_install.InstallScope()
+    state._browser_install_job = job
+    state._browser_install_scope = scope
+
+    def _on_stage(stage: str) -> None:
+        # Runs on the worker thread; the loop owns the job.
+        loop.call_soon_threadsafe(job.apply_stage, job.id, stage)
+
+    async def _run() -> None:
+        try:
+            result = await asyncio.to_thread(
+                browser_cli_install.run_in_scope, scope, work, _on_stage
+            )
+        except asyncio.CancelledError:
+            await _terminate_install_scope(scope)
+            job.finish(
+                job.id,
+                browser_install_job.STATUS_INTERRUPTED,
+                browser_install_job.ERROR_INTERRUPTED,
+                "interrupted: the gateway stopped this install",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            # Redact the full text, then truncate: see bounded_detail. Pinned by
+            # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
+            job.finish(
+                job.id,
+                browser_install_job.STATUS_FAILED,
+                browser_install_job.ERROR_EXCEPTION,
+                browser_install_job.bounded_detail(str(exc)),
+            )
+            return
+        status, code, detail = browser_install_job.outcome_of(result, default_step)
+        if scope.terminated and status != browser_install_job.STATUS_INTERRUPTED:
+            status = browser_install_job.STATUS_INTERRUPTED
+            code = browser_install_job.ERROR_INTERRUPTED
+        job.finish(job.id, status, code, detail)
+
+    state._browser_install_task = asyncio.create_task(_run())
+
+
+async def _terminate_install_scope(scope: Any) -> None:
+    """Kill an install scope's children off the event loop.
+
+    ``InstallScope.terminate`` runs ``taskkill`` on Windows, a blocking call with
+    its own timeout, so it goes to a worker thread. At interpreter teardown the
+    default executor may already refuse work; the call then runs inline, since
+    nothing else is left on the loop to stall.
+    """
+    try:
+        await asyncio.to_thread(scope.terminate)
+    except RuntimeError:
+        scope.terminate()
+
+
+async def stop_browser_install(state: DashboardState) -> None:
+    """Terminate the running install's subprocesses and wait for its task.
+
+    For the gateway's shutdown path. Idempotent and never raises. The job is
+    left ``interrupted``; nothing is persisted or resumed, so the next gateway
+    starts with no job and the operator retries explicitly.
+    """
+    scope = getattr(state, "_browser_install_scope", None)
+    if isinstance(scope, browser_cli_install.InstallScope):
+        await _terminate_install_scope(scope)
+    task = getattr(state, "_browser_install_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
+        # ``wait`` reports the child's outcome instead of raising it here, so the
+        # CancelledError the child raises because it was just cancelled never
+        # reaches this frame, while a cancellation of THIS task (the gateway's
+        # shutdown deadline expiring around ``_shutdown()``) still propagates out
+        # of the await. A plain ``await task`` inside ``except CancelledError``
+        # could not tell the two apart and swallowed both.
+        await asyncio.wait({task})
+        if not task.cancelled():
+            # Consume a failure so the loop does not log "exception was never
+            # retrieved" at teardown; the job record already carries it.
+            task.exception()
+
+
 async def api_browser_install_get(request: web.Request) -> web.Response:
     """GET /api/browser/install -- whether browsing is available, and why not.
 
-    Reports `installing` separately from the detection fields so the card can show
-    progress for an install already in flight, including one started by a different
-    dashboard tab: the job lives on the gateway, not in a page.
+    Reports the install job separately from the detection fields so the card can
+    show progress for an install already in flight, including one started by a
+    different dashboard tab: the job lives on the gateway, not in a page. A read
+    never spawns an installer, launches a browser, or attaches to one.
     """
     state: DashboardState = request.app["state"]
     payload = dict(await asyncio.to_thread(browser_cli_install.detect))
-    task = getattr(state, "_browser_install_task", None)
-    payload["installing"] = bool(task and not task.done())
+    payload.update(_browser_install_status(state))
     payload["token"] = browser_cli_token.has_token()
-    payload["last_error"] = getattr(state, "_browser_install_error", None)
     return web.json_response(payload)
 
 
@@ -4139,71 +4545,27 @@ async def api_browser_install_start(request: web.Request) -> web.Response:
     browser, which takes long enough that holding the request open would read as a
     hung dashboard, so progress is observed by re-reading rather than awaited here.
 
-    Concurrent clicks are folded into the one running job: npm and the browser
-    installer are not safe to run twice over the same target at once.
+    A click while CLI setup already runs is folded into that job: it is the same
+    work, and npm is not safe to run twice over the same target at once. A click
+    while an ENGINE download runs is refused with 409 naming that job, because
+    folding it would answer "CLI setup accepted" for work that is not happening.
     """
     denied = _deny_non_owner_browser_request(request, "browser_cli_install")
     if denied is not None:
         return denied
     state: DashboardState = request.app["state"]
-    task = getattr(state, "_browser_install_task", None)
-    if not (task and not task.done()):
-
-        async def _run() -> None:
-            state._browser_install_error = None
-            try:
-                result = await asyncio.to_thread(browser_cli_install.install)
-                # The LAST step, not the first failed one. Two reasons, both of
-                # them cases this string is the only cure for:
-                #   * A step can fail and be RECOVERED -- a refused
-                #     ``--with-deps`` is retried without the flag
-                #     (browser_cli.os_deps) and its failed attempt stays in
-                #     ``steps`` so the operator can see what was tried. Reporting
-                #     "any failed step" would raise a permanent banner quoting a
-                #     sudo refusal on a host where browsing works.
-                #   * When the install really did fail, the FIRST failed step may
-                #     be that same recovered one, which would mask the step that
-                #     actually decided the outcome and drop the remedy it carries.
-                # ``install`` returns ``ok`` from its last step and every earlier
-                # gate returns on a real failure, so the last step is always the
-                # decisive one.
-                steps = result.get("steps") or []
-                failed = [] if result.get("ok") or not steps else steps[-1:]
-                if failed:
-                    first = failed[0]
-                    # `stderr`, not `error`: install steps only ever carry
-                    # `stderr` (see browser_cli.install._step), so reading
-                    # `error` discarded the npm / download output and left the
-                    # operator with a bare "failed" -- which cannot tell a
-                    # registry auth error apart from a blocked download, the two
-                    # cases the panel renders this string to explain.
-                    # Redacted before it reaches the panel. Step stderr is already
-                    # scrubbed at the source (browser_cli.install._step runs the
-                    # npm-aware redactor on it), but the `error` fallback and the
-                    # exception arm below are composed HERE and never pass through
-                    # _step. This call re-runs the same npm-aware redactor
-                    # (redact_install_output: the shared two-pass PLUS the npm
-                    # shapes such as a bare `_authToken=`) so all three carriers
-                    # get identical coverage -- the module-local _redact runs only
-                    # the shared pair and would let an npm registry line through.
-                    detail = first.get("stderr") or first.get("error") or "failed"
-                    state._browser_install_error = browser_cli_install.redact_install_output(
-                        f"{first.get('name', 'install')}: {str(detail).strip()}"
-                    )[:2000]
-            except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-                # Redact the FULL text, then truncate: any pre-redaction cut can
-                # split a credential so its `@` anchor is gone, no pattern
-                # matches, and npm-line compression pulls the surviving fragment
-                # into the 2000-char display window. Pinned by
-                # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
-                # Unbounded input cannot reach this arm in practice: install._run
-                # reports subprocess failures as return codes rather than raising
-                # with output, and every raise site carries a short message.
-                state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
-                    :2000
-                ]
-
-        state._browser_install_task = asyncio.create_task(_run())
+    if _browser_install_active(state):
+        job = _browser_install_job(state)
+        if job is not None and job.running and job.kind != browser_install_job.KIND_CLI_SETUP:
+            return _browser_install_conflict(state)
+    else:
+        _start_browser_install_job(
+            state,
+            browser_install_job.KIND_CLI_SETUP,
+            None,
+            lambda on_stage: browser_cli_install.install(on_stage=on_stage),
+            "install",
+        )
     return await api_browser_install_get(request)
 
 
@@ -4212,10 +4574,9 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
 
     Body: ``{"engine": "chromium" | "firefox" | "webkit"}``.
 
-    Shares the ONE ``_browser_install_task`` slot with the CLI install rather than
-    taking its own: both drive the same browser installer, which is not safe to run
-    twice over the same cache at once, and sharing the slot means the panel's single
-    "installing" flag stays true for whichever download is in flight.
+    Shares the ONE install slot with the CLI install rather than taking its own:
+    both drive the same browser installer, which is not safe to run twice over the
+    same cache at once.
     """
     denied = _deny_non_owner_browser_request(request, "browser_engine_install")
     if denied is not None:
@@ -4238,41 +4599,18 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
     # gets a 400 instead of an error they have to go re-read the status to find.
     if engine not in browser_cli_install.BROWSER_ENGINES:
         return web.json_response({"error": "unknown engine", "code": "unknown_engine"}, status=400)
-    task = getattr(state, "_browser_install_task", None)
-    if task and not task.done():
-        # 409, NOT a folded success. Folding is right for the CLI install, which
-        # has one target: a second click means the same work. Engines are three
-        # DISTINCT targets sharing one slot, so answering 200 while a different
-        # engine installs makes the panel show WebKit downloading when Firefox
-        # actually is. Refuse and say why.
-        return web.json_response(
-            {"error": "an install is already running", "code": "install_already_running"},
-            status=409,
-        )
-
-    async def _run() -> None:
-        state._browser_install_error = None
-        try:
-            result = await asyncio.to_thread(browser_cli_install.install_browser, engine)
-            # The decisive step, not the first failed one: see the CLI install
-            # path above for why a recovered attempt must neither raise a banner
-            # nor mask the step that actually decided the outcome.
-            steps = result.get("steps") or []
-            failed = [] if result.get("ok") or not steps else steps[-1:]
-            if failed:
-                first = failed[0]
-                # npm-aware redactor, same reasoning as the CLI install above.
-                state._browser_install_error = browser_cli_install.redact_install_output(
-                    f"{first.get('name', 'install-browser')}: "
-                    f"{first.get('stderr') or first.get('error') or 'failed'}"
-                )[:2000]
-        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-            # Redact the full text, then truncate; see the CLI install above.
-            state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
-                :2000
-            ]
-
-    state._browser_install_task = asyncio.create_task(_run())
+    if _browser_install_active(state):
+        # 409, NOT a folded success. Engines are three DISTINCT targets sharing
+        # one slot, so answering 200 while a different engine installs makes the
+        # panel show WebKit downloading when Firefox actually is.
+        return _browser_install_conflict(state)
+    _start_browser_install_job(
+        state,
+        browser_install_job.KIND_ENGINE_DOWNLOAD,
+        engine,
+        lambda on_stage: browser_cli_install.install_browser(engine, on_stage=on_stage),
+        "install-browser",
+    )
     return await api_browser_install_get(request)
 
 

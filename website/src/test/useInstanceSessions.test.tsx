@@ -128,6 +128,73 @@ describe('useInstanceSessions', () => {
     // asserted through the function the list actually ranks on.
     expect(lastActivityEpoch(row)).toBe(Date.parse('2026-08-31T14:35:00Z') / 1000)
     expect(result.current.failed).toEqual([])
+    // No citation on the wire stays ABSENT, not `parent: undefined` or `null`, so
+    // the row reads the way a citation-less local slot does to a presence test.
+    expect(row).not.toHaveProperty('parent')
+    expect(row).not.toHaveProperty('lineage_pending')
+  })
+
+  it('forwards the creator citation so the conductor lane can nest a peer row', async () => {
+    // The lane resolves `parent.key` against rows of the same `peer_id`. Without
+    // this field every session a peer's conductor opened rendered top-level here
+    // as a stray while the peer's own sidebar nested it.
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'lead', title: 'Lead' },
+      { key: 'w1', title: 'Worker', parent: { slot: 'lead', key: 'lead' } },
+      { key: 'w2', title: 'Provisional', parent: { key: 'lead' }, lineage_pending: true },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    // Both halves cross when present: `key` is what the lane nests on, `slot` is
+    // what the orphan glyph and the move baseline read.
+    expect(byKey.get('w1')?.parent).toEqual({ slot: 'lead', key: 'lead' })
+    expect(byKey.get('w1')).not.toHaveProperty('lineage_pending')
+    expect(byKey.get('w2')?.parent).toEqual({ key: 'lead' })
+    expect(byKey.get('w2')?.lineage_pending).toBe(true)
+    expect(byKey.get('lead')).not.toHaveProperty('parent')
+  })
+
+  it('drops a citation with no string half instead of letting the lane dereference it', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'a', parent: 'lead' },
+      { key: 'b', parent: { key: { nested: 1 } } },
+      { key: 'c', parent: { slot: 7, key: null } },
+      { key: 'd', parent: null },
+      { key: 'e', lineage_pending: 'yes' },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(5))
+    for (const r of result.current.rows) {
+      expect(r).not.toHaveProperty('parent')
+      expect(r).not.toHaveProperty('lineage_pending')
+    }
+  })
+
+  it('keeps the orphan citation (slot without key) so the lane can draw who opened the row', async () => {
+    instanceChatSlotsMock.mockResolvedValue([{ key: 'w', parent: { slot: 'gone' } }])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(1))
+    expect(result.current.rows[0].parent).toEqual({ slot: 'gone' })
+  })
+
+  it('forwards the hub-stamped `hub_key` so a worker nests under the local row driving its creator', async () => {
+    // The hub rewrites a citation of a peer slot it drives to the LOCAL slot key
+    // (`hub_key`), the peer's own key for that creator never crossing the wire.
+    // A non-string half is dropped like the other two.
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'w1', parent: { slot: 'chat-7', hub_key: 'chat-7' } },
+      { key: 'w2', parent: { slot: 'chat-7', hub_key: 7 } },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(2))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    expect(byKey.get('w1')?.parent).toEqual({ slot: 'chat-7', hub_key: 'chat-7' })
+    expect(byKey.get('w2')?.parent).toEqual({ slot: 'chat-7' })
   })
 
   it('preserves row identity across unrelated rerenders after query data settles', async () => {

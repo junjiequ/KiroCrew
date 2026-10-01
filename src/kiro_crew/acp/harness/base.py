@@ -147,6 +147,15 @@ class SpawnPlan:
     hides, or it re-exposes something nothing denied.
     """
 
+    private_state_env: str | None = None
+    """Environment variable this host needs pointed at a per-process directory.
+
+    ``None`` for a host whose state tolerates concurrent processes. Otherwise the
+    runtime sets the named variable to its own per-process scratch directory,
+    which no other process uses and which is reclaimed once this one is dead.
+    A value already in the child's environment is left as set.
+    """
+
 
 # ── Seam 3: session/new and session/load extras ──
 
@@ -381,6 +390,16 @@ class HarnessAdapter(abc.ABC):
         took its agent at spawn time.
         """
 
+    def record_session_projection(self, handle: Any, custom_agents: Any, active_agent: str) -> None:
+        """Record on a new or resumed session's *handle* what its agent batch grants.
+
+        For a host whose PreToolUse hooks Crew runs at the permission request, so
+        the turn loop can tell when that batch auto-approves a call a hook covers.
+        A host that took its agent at spawn time registers no batch and records
+        nothing, which is this default: its handle keeps the declared defaults.
+        """
+        return None
+
     @abc.abstractmethod
     def session_mcp_servers(
         self,
@@ -437,6 +456,16 @@ class HarnessAdapter(abc.ABC):
         Raise ``HostAuthCallbackError`` (or any exception the runtime maps to a
         JSON-RPC error) rather than returning a partial result: a host left
         hanging on a callback is worse than one told its credential expired.
+        """
+
+    @property
+    @abc.abstractmethod
+    def opens_external_urls(self) -> bool:
+        """This host sends ``_kiro/openExternalUrl`` for an MCP sign-in.
+
+        When true the reader loop answers that request and hands the URL to the
+        session whose sign-in the runtime started, as an ordinary OAuth request
+        frame. When false the request is answered -32601 and no sign-in starts.
         """
 
     # ── Seam 5: notification aliases ──

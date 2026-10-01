@@ -24,6 +24,7 @@ import { metricColor } from './utils/metricColor'
 import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
+import { useConfigAutolinkRules } from './hooks/useConfigAutolinkRules'
 import { useTheme } from './hooks/useTheme'
 import { useBranding } from './hooks/useBranding'
 import { useRumPageView } from './hooks/useRumPageView'
@@ -36,6 +37,7 @@ import { useFocusMode, useFocusChromeVisible, setFocusChromeVisible, FOCUS_INSET
 import { APP_NAV_ORDER_KEY, buildReorderBaseline, mergeVisibleReorder, readAppNavOrder, useAppNavHidden } from './lib/appNavHidden'
 import { useNavPinned } from './lib/navPinned'
 import { computeHeaderDragGaps, type DragGap } from './lib/dragGaps'
+import { haptic } from './lib/haptic'
 import { isEmbeddedPane } from './lib/embedded'
 import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, TOPBAR_FOCUS_Z, TOPBAR_Z, registerThemeDecorSlot } from './lib/themeDecorLayer'
 import { useHoverIntent } from './hooks/useHoverIntent'
@@ -54,7 +56,7 @@ import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCir
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Btn, Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
-import MeetCrewmatesFlow, { MeetCrewmatesEligibilityNotice } from './components/MeetCrewmatesFlow'
+import MeetCrewmatesFlow from './components/MeetCrewmatesFlow'
 import { useMeetCrewmatesGate } from './hooks/useMeetCrewmatesGate'
 import AgentImportFlow from './components/AgentImportFlow'
 import ErrorNotice from './components/ErrorNotice'
@@ -111,6 +113,10 @@ import LogsPage from './pages/LogsPage'
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
 const MembersPage = lazy(() => import('./pages/members/MembersPage'))
+// Lazy for the same reason: the crew work-item board is opened from a conductor
+// session or the Crew page, never at startup.
+const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
+const SessionDashboardsPage = lazy(() => import('./pages/chat/command-center/SessionDashboardsPage'))
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
 import { InAppUpdateFlow } from './pages/settings/AboutPanel'
 import KiroCrewNavBridge from './components/KiroCrewNavBridge'
@@ -119,6 +125,9 @@ import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
 import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
+// Dev-only layout-editor harness (RFC §7 PR 2). Lazy so it never weighs the main
+// bundle — it is a developer route, not a shipped surface.
+const LayoutEditorHarnessPage = lazy(() => import('./pages/LayoutEditorHarnessPage'))
 import { useUpdateSubscription, type UpdateState } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
@@ -133,6 +142,7 @@ import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './util
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
+import { ImportSessionOutcomeNotice } from './components/ImportSessionItem'
 import BuiltinAppRoute from './apps/BuiltinAppRoute'
 import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
@@ -151,6 +161,7 @@ import ShortcutsModal from './components/ShortcutsModal'
 import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
+import { Glass } from './components/Glass'
 import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
 import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 import { NavHistoryArrows } from './components/NavHistoryArrows'
@@ -387,6 +398,12 @@ function readMetricsFrame(raw: SysMetricsFrame) {
     },
   }
 }
+
+// Corner radius, in px, of the top bar's Liquid Glass pills (the search
+// trigger, the readout capsule; components/FeedbackPill.tsx carries the same
+// number): `rounded-xl`, which the update pill already wears, so the row reads
+// as one family of boxes.
+const TOPBAR_PILL_RADIUS = 12
 
 // The top-bar search is laid out by CSS, not measured here: `.topbar` in
 // index.css is a three-track grid whose centre track is
@@ -1566,10 +1583,18 @@ function NotificationsBellButton() {
                 the blur to nothing there, so there is no hard boundary.
                 -z-10 + isolate on the sheet keeps it behind the cards without
                 forming a backdrop root (isolation is not a root trigger, so
-                the cards' own backdrop-blur still samples the page). */}
+                the cards' own backdrop-blur still samples the page).
+                Strength: 2% black, 2px blur. The 12% / 4px it wore before the
+                rows became liquid glass (#3029, for text contrast on flat
+                cards) now stacks under every row's own glass tint and
+                `glass-shadow`, and read as a heavy shadow down the sheet's
+                left edge (measured 248 -> 217 on a white page, 12% darker).
+                At 2% the strip still separates the column from the page
+                (248 -> 243) without reading as a shadow; the rows carry the
+                contrast themselves now. */}
             <div
               aria-hidden="true"
-              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.12] backdrop-blur-xs [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
+              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.02] backdrop-blur-[2px] [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
             />
             <div className="flex-1 min-h-0 px-3 py-2 flex flex-col">
               <NotificationFeed
@@ -1653,6 +1678,11 @@ export default function App() {
   // in-window navigation back to this frame instead of escaping to '/'.
   const initialPopoutPath = useRef(window.location.pathname + window.location.search).current
   const dispatch = useAppDispatch()
+  // Register the operator's link rules (dashboard.link_patterns) into the
+  // autolink registry from the shell, so every surface linkifies — not only
+  // after a chat page has rendered. Owns the registry; the chat page reuses
+  // the same ['dashboardConfig'] query for its source hosts.
+  useConfigAutolinkRules()
   // The slice also carries the slot list and the subagent maps, so selecting all of
   // it would re-render the root on dashboard traffic neither of these fields reads.
   const connected = useAppSelector(s => s.dashboard.connected)
@@ -1673,6 +1703,9 @@ export default function App() {
   const canApplyUpdate = useAppSelector(s => s.dashboard.status?.update_can_apply)
   const canArmUpdate = useAppSelector(s => s.dashboard.status?.update_can_arm)
   const updateCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
+  // A policy-pinned command owns updates here and can update on its own, so
+  // the popup shows the policy note; Settings keeps the switch.
+  const updatesManagedByCommand = useAppSelector(s => s.dashboard.status?.update_managed_by) === 'command'
   const updateTargetVersion = useAppSelector(
     s => s.dashboard.status?.update_latest_version_display
       || s.dashboard.status?.update_latest_version
@@ -2438,7 +2471,10 @@ export default function App() {
       sortedAppGroup: sortedAll.filter(n => !appNavHidden.has(n.id)),
     }
   }, [advertisedNavItems, appNavItems, appNavOrder, appNavHidden])
-  const handleAppDragStart = useCallback((e: DragStartEvent) => setActiveAppDragId(e.active.id as string), [])
+  // dnd-kit fires this once the sensor's constraint is met (the 250ms touch hold
+  // or the mouse distance), so the tap marks the pick-up itself, not the touch.
+  // Touch is the only sensor with an engine under it; elsewhere haptic no-ops.
+  const handleAppDragStart = useCallback((e: DragStartEvent) => { haptic('medium'); setActiveAppDragId(e.active.id as string) }, [])
   // Materialize implicit sidebar positions the moment an app is HIDDEN: once
   // an id is in the hidden set, its position must live in the persisted
   // order, because every later event that could erase the implicit source —
@@ -2476,6 +2512,8 @@ export default function App() {
     setActiveAppDragId(null)
     const { active, over } = e
     if (!over || active.id === over.id) return
+    // Past the guard, so the tap means the rail really reordered.
+    haptic('light')
     const ids = sortedAppGroup.map(n => n.id)
     const from = ids.indexOf(active.id as string)
     const to = ids.indexOf(over.id as string)
@@ -2783,6 +2821,7 @@ export default function App() {
   // changelog is going to show" — the startup-video gate needs the second one.
   const [changelogDecided, setChangelogDecided] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
+  const [autoUpdateError, setAutoUpdateError] = useState('')
   const [fullChangelog, setFullChangelog] = useState('')
   const [showFull, setShowFull] = useState(false)
   const [devMode, setDevMode] = useState(() => localStorage.getItem('mc-dev-mode') === '1')
@@ -3346,7 +3385,7 @@ export default function App() {
       // No qualifying section means this build's release has no notes yet, which
       // is the normal state on a dev build. Say nothing: the modal exists to
       // deliver notes, and one carrying someone else's is worse than none.
-      if (text) { setChanges(text); setShowChangelog(true) }
+      if (text) { setChanges(text); setAutoUpdateError(''); setShowChangelog(true) }
     }).then(() => {
       // Stamp the version ONLY on a response we actually read. The old `finally`
       // stamped it either way, so a single failed fetch retired that version's
@@ -3736,9 +3775,9 @@ export default function App() {
    * `replace` so Back returns to the chat rather than to a second copy of it.
    * That is a property of the drawer that hosts the rail, so it is not an option.
    *
-   * Rows the full nav drawer offers and this rail does not: Library (reachable
-   * from Discover), Developer, Terminal and Connect-your-phone — each toggles a
-   * desktop-shaped surface or is moot on the phone itself.
+   * The only row the full nav drawer offers and this rail does not is
+   * Connect-your-phone, which is moot on the phone itself. Terminal toggles the
+   * docked panel and closes the drawer so the panel is not left behind it.
    *
    * The brand mark on top is a control -- the product's "home": it goes to the
    * chat root (the page every other app's logo returns to) and closes the
@@ -3809,6 +3848,17 @@ export default function App() {
             onClickOverride={discoverNavActive ? onActivate : undefined}
             badge={<NavBadge navId="apps" collapsed appBadges={discoverBadges} />}
           />
+          <NavItem
+            navId="apps-library"
+            path="/apps/library"
+            label={i18nT('nav.library')}
+            icon={<LayoutGrid size={16} />}
+            active={libraryNavActive}
+            collapsed
+            touch
+            replace
+            onClickOverride={libraryNavActive ? onActivate : undefined}
+          />
           {/* Apps list: scrolls in its OWN frame when many apps are installed --
               the brand mark, the Main rows and Discover above it, and
               Capabilities / Settings / Search below it stay pinned, exactly as
@@ -3821,6 +3871,32 @@ export default function App() {
           >
             {sortedAppGroup.map(railRow)}
           </div>
+          {devMode && (
+            <NavItem
+              navId="developer"
+              path="/developer"
+              label={i18nT('app.developer')}
+              icon={<Code size={16} />}
+              active={activePath === '/developer'}
+              collapsed
+              touch
+              replace
+              onClickOverride={activePath === '/developer' ? onActivate : undefined}
+            />
+          )}
+          {terminalEnabled && (
+            <NavItem
+              navId="terminal"
+              path="#"
+              label={i18nT('app.terminal')}
+              icon={<SquareTerminal size={16} />}
+              active={bottomTerminalOpen || terminalPoppedOut}
+              pressed={bottomTerminalOpen || terminalPoppedOut}
+              collapsed
+              touch
+              onClickOverride={() => { onActivate(); if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
+            />
+          )}
           {railRow(capabilitiesSurface)}
           {/* The account modal (balance, sign-in state): the desktop opens it
               from the readout capsule, which the phone does not render, so the
@@ -3869,6 +3945,9 @@ export default function App() {
   return (
     <ZoomProvider>
     <WsContext.Provider value={{ subscribeLogs, subscribeSubagents, forceReconnect }}>
+    {/* Above the layout branch, so every layout that can host the import row
+        also hosts its outcome: the row's menu has closed by the time it lands. */}
+    <ImportSessionOutcomeNotice />
     {isPopout ? (
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
@@ -4140,10 +4219,17 @@ export default function App() {
             reads it any more. Keep it. */}
         {!isMobile && (
           <div data-topbar-overlay className="flex items-center gap-1.5 min-w-0">
-          <button
+          {/* The trigger IS a Liquid Glass pane (components/Glass.tsx, chip
+              recipe) rendered as the button, the same material as the
+              sidebar's search field and the composer dock: no border and no
+              fill of its own, `glass-hover` for the hover step. */}
+          <Glass
+            as="button"
             type="button"
+            variant="chip"
+            radius={TOPBAR_PILL_RADIUS}
             onClick={commandPalette.openPalette}
-            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-strong transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
+            className="glass-shadow glass-hover h-7 flex-1 min-w-0 px-3 text-muted hover:text-text transition-colors flex items-center justify-center gap-2 cursor-pointer"
             /* The trigger has to describe the surface it actually opens. While an app
                owns the quick-search slot the gesture opens a launcher -- typing runs
                commands and does not search the corpora this label promises -- so
@@ -4170,7 +4256,7 @@ export default function App() {
                 ? i18nT('app.k_run_a_command')
                 : i18nT('app.k_search_for_anything')}
             </span>
-          </button>
+          </Glass>
           {/* Focus mode. `aria-pressed` rather than a second label, so a screen
               reader gets the state from the control instead of from copy that
               would have to be kept in step with the icon. */}
@@ -4518,9 +4604,20 @@ export default function App() {
               <motion.div
                 layout
                 transition={{ layout: { duration: capsuleLayoutPulse ? 0.25 : 0, ease: 'easeOut' } }}
-                className={`tb-capsule flex items-center gap-2 h-7 px-2.5 rounded-xl transition-colors duration-300 ${offline ? 'bg-danger-subtle' : 'bg-card'}`}
+                className="flex items-center shrink-0"
               >
-                {segments.flatMap((s, i) => (i === 0 ? [s] : [<span key={`sep-${i}`} className="w-px h-3.5 bg-border shrink-0" aria-hidden="true" />, s]))}
+                {/* The capsule IS a Liquid Glass pane (components/Glass.tsx,
+                    chip recipe) hosting the segments directly, so the
+                    `.tb-capsule > …` rungs in index.css still see them as its
+                    children; the motion wrapper outside only animates width.
+                    Offline is a tint step (`glass-danger`), never a fill. */}
+                <Glass
+                  variant="chip"
+                  radius={TOPBAR_PILL_RADIUS}
+                  className={`tb-capsule glass-shadow flex items-center gap-2 h-7 px-2.5 ${offline ? 'glass-danger' : ''}`}
+                >
+                  {segments.flatMap((s, i) => (i === 0 ? [s] : [<span key={`sep-${i}`} className="w-px h-3.5 bg-border shrink-0" aria-hidden="true" />, s]))}
+                </Glass>
               </motion.div>
             )
           })()}
@@ -4679,11 +4776,16 @@ export default function App() {
             ) : (
               <div className="text-sm text-muted py-4 text-center"><CheckCircle className="lucide-inline" /> {i18nT('app.you_re_on_the_latest_version')}</div>
             )}
-            <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
-              <span className="text-[13px] text-muted">{i18nT('app.auto_update_on_restart')}</span>
-              <Toggle checked={autoUpdate} label={i18nT('app.auto_update_on_restart')}
-                onChange={async next => { setAutoUpdate(next); await api.setAutoUpdate(next) }} />
-            </div>
+            {updatesManagedByCommand ? (
+              <p className="text-[13px] text-muted mt-4 pt-3 border-t border-border">{i18nT('pages.settings.aboutPanel.updates_managed_by_policy')}</p>
+            ) : (
+              <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
+                <span className="text-[13px] text-muted">{i18nT('app.auto_update_on_restart')}</span>
+                <Toggle checked={autoUpdate} label={i18nT('app.auto_update_on_restart')}
+                  onChange={async next => { setAutoUpdate(next); setAutoUpdateError(''); try { await api.setAutoUpdate(next) } catch (e) { setAutoUpdate(!next); setAutoUpdateError(String(e instanceof Error ? e.message : e)) } }} />
+              </div>
+            )}
+            {autoUpdateError && <ErrorNotice className="mt-3" askAgent title={i18nT('pages.overview.agentCfgTab.save_failed')} message={autoUpdateError} onHandoff={() => setShowChangelog(false)} />}
             <div className="mt-3 pt-3 border-t border-border">
               <button className="text-[13px] text-muted cursor-pointer hover:text-text transition-colors bg-transparent border-none p-0 font-body" onClick={async () => {
                 if (!showFull) { if (!fullChangelog) { const d = await api.changelog(); setFullChangelog(d.content || '') }; setShowFull(true) } else { setShowFull(false) }
@@ -4782,16 +4884,11 @@ export default function App() {
           onComplete={endFirstRun}
           onSkipAll={endFirstRun}
         />
-        {/* First-run chapter 4 — Meet CrewMates. Fires once, after the tour,
-            only for a user with no crewmates and no custom agents; also
-            reopened from the Crewmates page (mc-start-meet-crewmates). */}
+        {/* First-run chapter 4 — Meet CrewMates. Fires once per workspace:
+            after the tour for a new user, or on the first Crewmates page
+            visit; also reopened from that page (mc-start-meet-crewmates). */}
         <MeetCrewmatesFlow open={meetCrewmates.open} onDone={meetCrewmates.onDone} onCreated={meetCrewmates.onCreated} persistFailed={meetCrewmates.persistFailed} />
       </OnboardingShellHost>
-      {meetCrewmates.eligibilityError && !meetCrewmates.open && (
-        /* The Meet CrewMates eligibility read failed, so the chapter cannot
-           decide whether to fire. Said here rather than swallowed. */
-        <MeetCrewmatesEligibilityNotice onDismiss={meetCrewmates.dismissEligibilityError} />
-      )}
 
       {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
           with the panel (compositor), so there is no framer fade here; it
@@ -5217,7 +5314,11 @@ export default function App() {
                       the mark-to-text distance to 6px and cost 4px the budget
                       below never accounts for. Spacing is explicit per child instead. */}
                   <span className="flex items-center shrink-0 text-muted"><GithubIcon size={15} /></span>
-                  <div className="rail-community-links flex items-center gap-[5px] flex-1 min-w-0 ml-1.5 text-[12px]">
+                  {/* `flex-wrap`: in a locale where "Star us" and "Report issue" together
+                      outrun the rail (the pseudolocale does, and so will any long-word
+                      language), the second link drops to its own line with the full
+                      row width instead of truncating to a third of itself. */}
+                  <div className="rail-community-links flex flex-wrap items-center gap-x-[5px] gap-y-0.5 flex-1 min-w-0 ml-1.5 text-[12px]">
                     <a href="https://github.com/kirodotdev/KiroCrew" target="_blank" rel="noopener noreferrer" title={i18nT('app.star_kirocrew_on_github')} aria-label={i18nT('app.star_kirocrew_on_github')} className="shrink-0 rounded text-muted hover:text-text transition-colors">{i18nT('app.star_us')}</a>
                     <span aria-hidden="true" className="shrink-0 opacity-40">·</span>
                     {/* "Report issue" opens the SAME diagnostics flow as Settings ›
@@ -5343,11 +5444,13 @@ export default function App() {
             {/* Bookmarkable session chooser: neutral list, no auto-select; rows
                 open the full /chat/<key> experience inside this same shell. */}
             <Route path="/sessions" element={<ErrorBoundary><Suspense fallback={null}><SessionsPage /></Suspense></ErrorBoundary>} />
+            <Route path="/session-dashboards" element={<ErrorBoundary><Suspense fallback={null}><SessionDashboardsPage /></Suspense></ErrorBoundary>} />
             {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
             <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
 
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
+            <Route path="/crew-board" element={<ErrorBoundary><Suspense fallback={null}><CrewBoardPage /></Suspense></ErrorBoundary>} />
             <Route path="/schedule" element={<SchedulePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
@@ -5377,6 +5480,9 @@ export default function App() {
                 Matches bare /settings too (empty splat). */}
             <Route path="/settings/*" element={<SettingsPage />} />
             <Route path="/developer" element={<DeveloperPage />} />
+            {/* Dev-only layout-editor harness (RFC §7 PR 2) — a standalone route
+                to exercise the editor in isolation. Not linked from nav. */}
+            <Route path="/developer/layout-editor" element={<ErrorBoundary><Suspense fallback={null}><LayoutEditorHarnessPage /></Suspense></ErrorBoundary>} />
             <Route path="/artifacts" element={<ArtifactsPage />} />
             <Route path="/artifacts/deploy" element={<Navigate to="/deploy" replace />} />
             <Route path="/artifacts/remote/:provider/:externalId" element={<ErrorBoundary><RemoteArtifactDetailPage /></ErrorBoundary>} />

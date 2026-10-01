@@ -297,6 +297,15 @@ def test_ssh_auth_sock_forward_is_not_an_agent_config_field() -> None:
     assert not hasattr(cfg.agent, "sandbox_forward_ssh_auth_sock")
 
 
+def test_episodic_max_count_is_floored_at_one() -> None:
+    """A zero or negative V1 episodic cap would refuse every merge-only write, even
+    on an empty store, so the loader clamps it to 1. A positive value is kept as
+    written."""
+    assert _load_from_dict({"memory": {"episodic_max_count": 0}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": -5}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": 7}}).memory.episodic_max_count == 7
+
+
 def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
     """The Stop-hook nudge cap is built field-by-field in load(), so an
     operator's value must hydrate and survive a to_dict() -> load() round-trip.
@@ -4842,19 +4851,23 @@ class TestSaveRoundTripPreservesAllSections:
 
 
 class TestOrchestratorWatchdogThemeAreParsed:
-    """load() must actually parse the orchestrator, watchdog, and dashboard-theme
-    fields from config.json. They were advertised in config-baseline.json and
-    served by /api/config/schema, and real consumers read them
-    (acp/session_handle.py .watchdog, dashboard/chat_orchestrator.py
-    .orchestrator.stage_timeout_seconds), but the cls(...) construction passed no
-    orchestrator=/watchdog= kwargs and DashboardConfig omitted theme_mode/
+    """load() must actually parse the watchdog and dashboard-theme fields from
+    config.json. They are advertised in config-baseline.json and served by
+    /api/config/schema, and real consumers read them (acp/session_handle.py
+    .watchdog), but the cls(...) construction passed no watchdog= kwarg and
+    DashboardConfig omitted theme_mode/
     theme_color/onboarded — so config values were silently ignored (defaults
     always won) and the server-authoritative theme never round-tripped (the
     onboarding modal re-armed on every gateway restart)."""
 
-    def test_orchestrator_stage_timeout_is_parsed(self) -> None:
-        cfg = _load_from_dict({"orchestrator": {"stage_timeout_seconds": 60}})
-        assert cfg.orchestrator.stage_timeout_seconds == 60
+    def test_retired_orchestrator_section_loads_and_is_ignored(self) -> None:
+        cfg, warnings = _load_from_dict_with_logs(
+            {"orchestrator": {"stage_timeout_seconds": 60}, "watchdog": {"check_after_secs": 5}}
+        )
+        assert not hasattr(cfg, "orchestrator")
+        assert cfg.watchdog.check_after_secs == 5.0
+        assert "orchestrator" not in cfg.to_dict()
+        assert not [w for w in warnings if "orchestrator" in w]
 
     def test_watchdog_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
@@ -5019,7 +5032,6 @@ class TestOrchestratorWatchdogThemeAreParsed:
 
     def test_absent_sections_use_defaults(self) -> None:
         cfg = _load_from_dict({})
-        assert cfg.orchestrator.stage_timeout_seconds == 1800
         assert cfg.watchdog.tool_stall_hard_cap_secs == WatchdogConfig().tool_stall_hard_cap_secs
         assert cfg.dashboard.theme_mode == ""
         assert cfg.dashboard.onboarded is False
@@ -5029,11 +5041,9 @@ class TestOrchestratorWatchdogThemeAreParsed:
         cfg = _load_from_dict(
             {
                 "watchdog": {"check_after_secs": "junk"},
-                "orchestrator": {"stage_timeout_seconds": "x"},
             }
         )
         assert cfg.watchdog.check_after_secs == 60.0
-        assert cfg.orchestrator.stage_timeout_seconds == 1800
 
 
 class TestMalformedConfigNeverBricksLoad:

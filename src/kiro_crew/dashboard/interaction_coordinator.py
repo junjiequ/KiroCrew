@@ -15,6 +15,8 @@ _Redactor = Callable[[str], tuple[str, object]]
 #: rides in the ``approval_resolved`` payload: without it an expired card
 #: renders as a rejection.
 _EXPIRED_DECISION = "expired"
+#: The audit outcome of a wait whose id a later same-id request took over.
+_SUPERSEDED_DECISION = "superseded"
 
 
 def _redact(text: object, redact_url: _Redactor, redact_secret: _Redactor) -> str:
@@ -29,6 +31,14 @@ def _push_slots(state: Any) -> None:
         state.push_slots_update()
     except Exception:
         state._log.debug("push_slots_update failed after approval status change", exc_info=True)
+
+
+def _bounded_purpose(text: str) -> str:
+    """Cap a redacted approval purpose to the display bound native purposes use."""
+    # Circular import: chat_utils imports state, which imports this module.
+    from kiro_crew.dashboard.chat_utils import _MAX_TOOL_PURPOSE, _redact_tool_field
+
+    return _redact_tool_field(text, limit=_MAX_TOOL_PURPOSE)
 
 
 class ApprovalCoordinator:
@@ -53,10 +63,16 @@ class ApprovalCoordinator:
         state._approval_futures[approval_id] = future
         state._pending_approvals[approval_id] = {
             "id": approval_id,
+            # The request id is the caller's and can recur; this names THIS
+            # request, so a card rendered from an earlier record with the same
+            # id cannot resolve its replacement.
+            "instance": uuid.uuid4().hex,
             "source": source,
             "tool": _redact(tool, redact_url, redact_secret),
             "tool_input": _redact(tool_input, redact_url, redact_secret),
-            "tool_purpose": _redact(tool_purpose, redact_url, redact_secret),
+            # Retained and broadcast, so bounded here like the native path's
+            # purpose: a caller's multi-megabyte purpose never reaches the record.
+            "tool_purpose": _bounded_purpose(_redact(tool_purpose, redact_url, redact_secret)),
             "slot": slot,
             "ts": time.time(),
         }
@@ -75,19 +91,32 @@ class ApprovalCoordinator:
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return False
         finally:
-            # A future that never carried a decision means the wait expired or
-            # was cancelled: retire the approval BEFORE popping it, or the
-            # rendered card keeps live buttons that answer 404 forever because
-            # no ``approval_resolved`` frame is ever emitted. A resolved future
-            # (done with a result) is retired by resolve()/resolve_state();
-            # retiring again here would double the broadcast on the healthy path.
-            if future.cancelled() or not future.done():
-                ApprovalCoordinator._retire_unresolved(state, approval_id, slot)
-            state._pending_approvals.pop(approval_id, None)
-            state._approval_futures.pop(approval_id, None)
-            # Every exit -- decided, expired, cancelled -- leaves the record
-            # gone, so one push here takes the slot back out of the lane.
-            _push_slots(state)
+            # The id is the caller's and can recur while this wait is open; a
+            # later request then owns the record and the future under it. Only
+            # this request's own are retired and removed, judged by the future
+            # this wait created: the replacement's card, buttons and resolver
+            # stay live, and its own exit takes the slot out of the lane.
+            if state._approval_futures.get(approval_id) is future:
+                # A future that never carried a decision means the wait expired
+                # or was cancelled: retire the approval BEFORE popping it, or
+                # the rendered card keeps live buttons that answer 404 forever
+                # because no ``approval_resolved`` frame is ever emitted. A
+                # resolved future (done with a result) is retired by
+                # resolve()/resolve_state(); retiring again here would double
+                # the broadcast on the healthy path.
+                if future.cancelled() or not future.done():
+                    ApprovalCoordinator._retire_unresolved(state, approval_id, slot)
+                state._pending_approvals.pop(approval_id, None)
+                state._approval_futures.pop(approval_id, None)
+                # Every exit -- decided, expired, cancelled -- leaves the record
+                # gone, so one push here takes the slot back out of the lane.
+                _push_slots(state)
+            elif future.cancelled() or not future.done():
+                # Superseded by a same-id request: its frame, record and slot
+                # lane now belong to the replacement and are left alone, but
+                # this wait still ended undecided and the audit trail says so,
+                # under its own outcome so the replacement's rows stay distinct.
+                state._audit_approval(slot or "state", approval_id, False, _SUPERSEDED_DECISION)
 
     @staticmethod
     def _retire_unresolved(state: Any, approval_id: str, slot_key: str) -> None:
@@ -110,7 +139,7 @@ class ApprovalCoordinator:
             )
 
     @staticmethod
-    def audit_and_broadcast(
+    def audit(
         state: Any,
         session_key: str,
         approval_id: str,
@@ -119,6 +148,7 @@ class ApprovalCoordinator:
         *,
         audit_provider: Callable[[], Any],
     ) -> None:
+        """Record one approval outcome in the SEL, without telling any client."""
         try:
             audit_provider().log_tool_invocation(
                 session_key=session_key,
@@ -129,6 +159,20 @@ class ApprovalCoordinator:
             )
         except Exception:
             state._log.warning("SEL audit failed for approval resolution", exc_info=True)
+
+    @staticmethod
+    def audit_and_broadcast(
+        state: Any,
+        session_key: str,
+        approval_id: str,
+        approved: bool,
+        decision: str,
+        *,
+        audit_provider: Callable[[], Any],
+    ) -> None:
+        ApprovalCoordinator.audit(
+            state, session_key, approval_id, approved, decision, audit_provider=audit_provider
+        )
         try:
             payload: dict = {"id": approval_id, "approved": approved}
             if session_key and session_key != "state":

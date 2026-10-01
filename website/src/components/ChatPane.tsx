@@ -24,6 +24,7 @@ export type PaneLeading = { inset?: boolean; control?: React.ReactNode }
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
+import CommandCenterDock from '../pages/chat/command-center/CommandCenterDock'
 import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
@@ -36,7 +37,8 @@ import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
 import ReasoningEffortDropdown from './ReasoningEffortDropdown'
-import { ManageModelsFooter } from './ModelEffortDropdown'
+import { ManageModelsFooter, MORE_BELOW_MASK } from './ModelEffortDropdown'
+import { routeModelPickerKeys } from './modelPickerKeyRouting'
 import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
@@ -46,13 +48,15 @@ import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
-import { filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
-import { effortPopoverLeft, modelSupportsEffort } from '../lib/effort'
+import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { modelSupportsEffort } from '../lib/effort'
 import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
+import { useImeGuard } from '../hooks/useImeGuard'
+import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { useAppSelector, useAppDispatch, store } from '../store'
 import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
@@ -69,7 +73,7 @@ import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
 import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
-import { performSlotSwitch } from '../lib/slotSwitch'
+import { inFlightSlotSwitchOutcome, performSlotSwitch, stagedSlotSwitchTarget } from '../lib/slotSwitch'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
@@ -78,7 +82,9 @@ import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
 import { prepareSendPayload, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
-import { displayModel } from '../lib/model'
+import { displayModel, modelChipMarker } from '../lib/model'
+import { useSettingsDefaultModel } from '../hooks/useSettingsDefaultModel'
+import { slotApprovalMode } from '../utils/slotApprovalMode'
 
 
 import { i18nT } from '../i18n/t'
@@ -91,6 +97,10 @@ import { i18nT } from '../i18n/t'
  * Messages stream live from the store; per-slot metadata comes from
  * s.dashboard.slots. Server reads/writes go through React Query + the api client.
  */
+
+/** Delay before the post-send bottom pin, so the optimistic bubble's commit has
+ *  landed in the tail window the pin mounts (ChatPage uses the same figure). */
+const SCROLL_AFTER_RENDER_MS = 100
 
 /** Variables of the composer upload mutation: the files, the slot they were
  *  picked in, and the AbortController that can end the request. */
@@ -110,12 +120,18 @@ export default function ChatPane({
   hideEmptyHint,
   openSideChat,
   leading,
+  onFileOpen,
   busyMode = 'split',
   crewmate,
   onOpenCrewWorkLog,
+  onOpenCommandCenter,
   threads,
+  onSessionOpen,
+  sessions,
+  activeSession,
 }: {
   slotKey: string
+  onOpenCommandCenter?: () => void
   focused?: boolean
   onFocus?: () => void
   onRemove?: () => void
@@ -160,6 +176,11 @@ export default function ChatPane({
    *  split view's lives in the chat page's activity panel, the Members page's
    *  in its detail drawer. Capability by omission, like `onOpenFull`. */
   openSideChat?: (slot: string) => boolean | void | Promise<boolean | void>
+  /** Open a file in the host's file viewer, the way the main chat does.
+   *  Without it an attachment card / @mention chip renders without an opener:
+   *  the pane shows every attachment but cannot open one. Capability by
+   *  omission, like `openSideChat`. */
+  onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** What the composer's send does while the slot is busy. Defaults to
    *  `'split'` — the same Steer/Queue split button as the main chat, which
    *  split-view (⌘D) panes keep: they are the main chat's own sessions seen
@@ -186,6 +207,20 @@ export default function ChatPane({
    *  crewmate's chat (the Members page) passes it; absent, the rows draw no
    *  thread footer and no "Reply in thread" action. */
   threads?: ThreadHooks
+  /** Session routing for this pane's transcript: switch to the session a
+   *  `/chat?sid=…` link, a slot-key chip or a short name names, plus the roster
+   *  that decides whether such a chip is offered at all and the key the reader
+   *  is already in. Capability by omission, like `onFileOpen`: a host that
+   *  passes none of it renders those links exactly as before, because the
+   *  markdown renderer gates on (`onSessionOpen` AND `sessions`) -- so a side
+   *  chat and an embedded chat are unchanged. `sessions` must be WITHHELD, not
+   *  emptied, while the host does not know which sessions exist (see
+   *  `markdown/contexts.ts`), and it should hold only slots the handler can
+   *  actually land on (`utils/sessionRoster.sessionTitleRoster`): a chip to a
+   *  destination the switch clears is worse than plain text. */
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  activeSession?: string
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -404,7 +439,7 @@ export default function ChatPane({
   )
   const approvalMode = useAppSelector((s) => s.dashboard.approvalMode)
   const title = paneSlot?.title || slotKey
-  const displayMode = approvalMode === 'yolo' ? 'yolo' : paneSlot?.trust ? 'trust' : paneSlot?.trust_reads ? 'trust_reads' : 'normal'
+  const displayMode = slotApprovalMode(approvalMode, paneSlot)
   // Queued messages render in the QueueStack, not inline in the message list.
   // System injections are excluded from the interactive stack (isNonInteractiveQueued):
   // sub-agent deliveries collapse into one progress line, and synthetic
@@ -632,24 +667,15 @@ export default function ChatPane({
     [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model, jevRouteOn, jevRouteLabel, codexPairModels],
   )
   const modelDD = useFilteredDropdown(modelPickerModels)
-  const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
-  const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
+  const [attachModelList, modelListEdges, remeasureModelList] = useScrollEdgesY<HTMLDivElement>()
+  // The filter box narrows `modelDD.filtered` without a scroll or a box
+  // resize once the list sits at its max height, so re-measure on every
+  // render as well.
+  useEffect(remeasureModelList)
   // Picker anchors: keep each portaled menu glued to the ChatInput chip that
   // opened it while the menu is open (#10616, same class as #10580).
   const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDD.open)
   const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDD.open)
-  const { rect: reasoningEffortBtnRect, anchorTo: anchorReasoningEffortBtn } = useAnchoredTriggerRect(reasoningEffortDropdown)
-  useEffect(() => {
-    if (!reasoningEffortDropdown) return
-    const closeOutside = (event: MouseEvent) => {
-      if (reasoningEffortDropdownRef.current?.contains(event.target as Node)) return
-      const rect = reasoningEffortBtnRect
-      if (rect && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return
-      setReasoningEffortDropdown(false)
-    }
-    document.addEventListener('mousedown', closeOutside)
-    return () => document.removeEventListener('mousedown', closeOutside)
-  }, [reasoningEffortDropdown, reasoningEffortBtnRect])
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -691,6 +717,19 @@ export default function ChatPane({
     displayModels,
     _modelsDegraded,
     paneSlot?.model_withheld,
+  )
+  // `default` only for the Settings default (see ChatPage).
+  const chipDefault = useSettingsDefaultModel(
+    paneSlot && !paneSlot.model ? paneAgentName : '',
+    paneRemoteCrew.isRemote,
+    codexPairModels,
+  )
+  const modelMarker = modelChipMarker(
+    paneSlot?.model || '',
+    shownModel,
+    _pinShownModel,
+    chipDefault.settingsDefault,
+    chipDefault.agentPinned,
   )
 
   // One-time hydrate of this slot's message history via React Query + the api
@@ -750,10 +789,17 @@ export default function ChatPane({
   const switchModel = useCallback(async (name: string) => {
     setSwitchError('')
     try {
-      const legacyEffort = legacyCodexEffort(
-        paneSlot?.model || '', paneSlot?.reasoning_effort || '', codexPairModels,
+      // A staged slider pick or a legacy pair level is carried; an effort
+      // write already on the wire is waited for, not re-sent, and its
+      // presence blocks the legacy migration -- see effortToCarry.
+      const inFlightEffort = inFlightSlotSwitchOutcome('reasoning_effort', slotKey)
+      const carriedEffort = effortToCarry(
+        paneSlot?.model || '', paneSlot?.reasoning_effort || '',
+        stagedSlotSwitchTarget('reasoning_effort', slotKey),
+        inFlightEffort !== null,
+        codexPairModels,
       )
-      await switchGroupedModel(legacyEffort, async level => {
+      await switchGroupedModel(carriedEffort, async level => {
         let normalizedModel: string | undefined
         await performSlotSwitch('reasoning_effort', slotKey, level,
           async () => {
@@ -766,13 +812,16 @@ export default function ChatPane({
             reasoning_effort: value,
             ...(normalizedModel ? { model: normalizedModel } : {}),
           })))
-      }, async () => {
+      }, async afterEffort => {
         // performSlotSwitch owns the whole protocol: serialized dispatch,
         // latest-request-wins adjudication, hung-request timeout, and exactly
         // one store write on the authoritative value (#4523) — the pane must
         // not depend on the coalesced slots rebroadcast to see its own pick.
         await performSlotSwitch('model', slotKey, name,
           async () => {
+            // Effort first on the wire (see switchGroupedModel); a refused
+            // effort aborts this pick before anything is sent.
+            await afterEffort
             const r = await api.chatSlotModel(slotKey, name)
             return r?.model ?? name
           },
@@ -785,7 +834,7 @@ export default function ChatPane({
             model: value,
             jev_route: name === JEV_ROUTE_MODEL,
           })))
-      })
+      }, () => inFlightSlotSwitchOutcome('reasoning_effort', slotKey))
       queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', slotKey] })
     } catch (e) {
       // Same failure surface as switchAgent above: the shared notice toast,
@@ -822,6 +871,12 @@ export default function ChatPane({
     onEnterSingleMatch: () => { switchModel(modelDD.filtered[0].name); modelDD.setOpen(false) },
     closeToTrigger: () => modelDD.setOpen(false),
   })
+  // The pane's model picker embeds the reasoning-effort slider below the list
+  // (one control, see ModelEffortDropdown and
+  // docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md).
+  // Keys route through the same helper as ModelEffortDropdown; the IME guard
+  // claims a Tab before the helper re-aims it into the embedded controls.
+  const modelDialogIme = useImeGuard()
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
   //
@@ -1054,6 +1109,15 @@ export default function ChatPane({
         message: { role: 'user', content: displayTxt, cls: 'msg msg-u', ts: new Date().toISOString(), ...(meta ? { meta } : {}) },
       }))
     }
+    // Sending is explicit intent to be at the end, so the pane force-pins the
+    // transcript exactly as ChatPage does after its own optimistic append: the
+    // reader lands on the bubble they just sent, and follow is re-armed for the
+    // reply — including a reader who had scrolled up to read and sends from
+    // there, whom no automatic pin may move (see evaluateAutoPin). Without this
+    // a crewmate DM sent from mid-history streamed its answer below the fold.
+    // Through the virtualizer's own handle, not a raw scrollTop write, so the
+    // follow guard accounts for the move (followPolicy's write invariant).
+    setTimeout(scrollToBottom, SCROLL_AFTER_RENDER_MS)
     // A failed send has to say so on the pane it was typed into. This path
     // reported nothing at all: the composer had already cleared and a rejected
     // fetch was swallowed by `.catch(() => undefined)`, so an undelivered
@@ -1141,7 +1205,7 @@ export default function ChatPane({
       if (!askAtSend) return
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
-  }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
+  }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom])
   // The endpointer auto-submit (handed to the Voice atom above) reads the
   // latest send through this ref.
   doSendRef.current = doSend
@@ -1391,7 +1455,13 @@ export default function ChatPane({
     slot: slotKey,
     allQueued: allQueuedMessages,
     visibleQueued: queuedMessages,
-    restoreDraft: restoreIntoComposer,
+    // Adapter: the hook's third argument is the queued send's mention-alias
+    // snapshot, which only ChatPage's composer can re-adopt (pendingFileTokens
+    // and the reconciliation effect live there). This pane's composer has no
+    // alias store -- restoreIntoComposer's own third parameter is its
+    // paste-block list -- so the adapter pins the two-argument call and the
+    // alias map is dropped here by construction rather than misread as pastes.
+    restoreDraft: (text, files) => restoreIntoComposer(text, files),
   })
   // Split-view panes draw the SAME transcript rows as the single-chat surface,
   // through the SDK's row registry: the live ToolCallLine (purpose / input /
@@ -1417,10 +1487,19 @@ export default function ChatPane({
       // A steer-only surface has no steer/queue concept to explain, so a
       // confirmed steer draws as an ordinary message: no badge, no tint.
       hideSteerBadge: busyMode === 'steer-only',
+      // Attachment cards / @mention chips open through the host's file viewer
+      // (#9487); without it they render without an opener.
+      onFileOpen,
       crewmate,
       crewmateTranscript,
+      // Session links resolve through the SAME renderer path the single-chat
+      // page uses; there is no second resolver. Absent from the host = the
+      // renderer's own gate leaves them plain.
+      onSessionOpen,
+      sessions,
+      activeSession,
     }),
-    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, crewmate, crewmateTranscript],
+    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession],
   )
 
   // Quote / Ask on selected assistant text — the same chat-core seam the main
@@ -1585,6 +1664,7 @@ export default function ChatPane({
           onQuote={onQuote}
           onAsk={onAsk}
           threads={threads}
+          onFileOpen={onFileOpen}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,
@@ -1681,6 +1761,7 @@ export default function ChatPane({
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
+        {onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {/* Rendered on server state only. A `steer-only` host never ASKS for a
@@ -1838,6 +1919,13 @@ export default function ChatPane({
           message={provider.capabilities.reasoningEffort && selectionCapabilitiesQ.isError
             ? i18nT('pages.chatPage.effort_options_unavailable') : ''}
         />
+        {/* No hand-off: this pane holds an unsent draft; the reads retry in place. */}
+        <ErrorNotice
+          variant="inline"
+          className="mx-4 mt-2"
+          testId="chat-pane-model-default-error"
+          message={chipDefault.failed ? i18nT('pages.settings.chatPanel.failed_to_load_config') : ''}
+        />
         {/* No hand-off: the composer draft is untouched by a failed stop; the
             turn is still running, so the Stop button stays for a retry. */}
         <ErrorNotice
@@ -1903,12 +1991,12 @@ export default function ChatPane({
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           reasoningEffort={effectiveEffort}
-          separateEffort={effortSupported}
-          onReasoningEffortClick={effortSupported ? (rect, trigger) => {
-            anchorReasoningEffortBtn(rect, trigger)
-            setReasoningEffortDropdown(!reasoningEffortDropdown)
-          } : undefined}
-          modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+          effortIsDefault={!paneSlot?.reasoning_effort && !legacyCodexEffort(paneSlot?.model || '', '', codexPairModels) && !!defaultEffort}
+          // Effort is edited inside the model picker below; the chip only
+          // names the level in force.
+          hasEffort={effortSupported}
+          modelIsInheritedDefault={modelMarker === 'default'}
+          modelIsAutoChosen={modelMarker === 'auto'}
           // See ChatPage: the slot's RAW model, because `shownModel` substitutes
           // the served id and would hide every routed turn.
           modelIsJevRouted={jevRouteOn && isUnpinnedModel(paneSlot?.model)}
@@ -2041,17 +2129,30 @@ export default function ChatPane({
             role="dialog"
             aria-label={i18nT('components.chatPane.model_list')}
             tabIndex={-1}
-            onKeyDown={onModelListKeyDown}
-            className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl min-w-[252px] max-w-[348px] flex flex-col p-1 gap-0.5 animate-slide-up"
-            style={(() => { const left = Math.max(8, Math.min(modelBtnRect.left, window.innerWidth - 348)); return { bottom: window.innerHeight - modelBtnRect.top + 4, left } })()}
+            onKeyDown={event => routeModelPickerKeys(event, modelDialogIme.claimKey, onModelListKeyDown)}
+            className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl min-w-[252px] max-w-[348px] flex flex-col p-1 overflow-hidden animate-slide-up"
+            /* Capped to the space above the chip, like ModelEffortDropdown: the
+               effort block below the list adds height, and a short split pane
+               would otherwise let the dialog grow past the viewport top. The
+               model list shrinks first, floored at about two rows so a chip
+               that sits high in a short pane never opens a picker with no
+               model in it; once the cap drops below the fixed rows' own height
+               the body column scrolls instead of clipping the effort block. */
+            style={(() => { const left = Math.max(8, Math.min(modelBtnRect.left, window.innerWidth - 348)); return { bottom: window.innerHeight - modelBtnRect.top + 4, left, maxHeight: Math.max(0, modelBtnRect.top - 12) } })()}
           >
-            <div className="px-1.5 pt-1.5 pb-1">
+           <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
+            <div className="shrink-0 px-1.5 pt-1.5 pb-1">
               <input
                 ref={modelDD.inputRef}
                 type="text"
                 aria-label={i18nT('components.chatPane.type_to_filter')}
                 placeholder={i18nT('components.chatPane.type_to_filter')}
                 value={modelDD.filter}
+                /* Tracks composition for the dialog's Tab claim (see
+                   routeModelPickerKeys): the latch has to see the composition
+                   to know a Tab inside the post-composition window is the
+                   IME's, not the user's. */
+                {...modelDialogIme.bindComposition<HTMLInputElement>()}
                 onChange={(e) => modelDD.setFilter(e.target.value)}
                 /* Enter/Escape live on the portal container's onListKeyDown
                    (useListboxKeyboard), which claims Enter against IME
@@ -2061,7 +2162,7 @@ export default function ChatPane({
               />
             </div>
             {hiddenModelsQ.isError && (
-              <div className="flex items-center gap-2 px-1.5 py-1">
+              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
                 {/* No hand-off: this pane's composer may hold an unsent draft.
                     Retry keeps the user in the owning chat. */}
                 <ErrorNotice
@@ -2075,7 +2176,7 @@ export default function ChatPane({
               </div>
             )}
             {paneRemoteCrew.failed && (
-              <div className="flex items-center gap-2 px-1.5 py-1">
+              <div className="flex shrink-0 items-center gap-2 px-1.5 py-1">
                 {/* No hand-off: this pane's composer may hold an unsent draft.
                     Retry keeps the user in the owning chat. */}
                 <ErrorNotice
@@ -2089,32 +2190,30 @@ export default function ChatPane({
                 </Btn>
               </div>
             )}
-            <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
+            {/* Same bottom fade as ModelEffortDropdown's list (see MORE_BELOW_MASK). */}
+            <div ref={attachModelList} role="listbox" aria-label={i18nT('components.chatPane.model_list')} className={`min-h-[96px] flex-1 overflow-y-auto max-h-[280px] ${modelListEdges.bottom ? MORE_BELOW_MASK : ''}`}>
               <ModelDropdownList models={modelDD.filtered} activeModel={jevRouteShownModel(shownModel, paneSlot)} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
             {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
               modelDD.setOpen(false)
               navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
             }} />}
-          </div>,
-          document.body,
-        )}
-        {reasoningEffortDropdown && reasoningEffortBtnRect && effortSupported && createPortal(
-          <div
-            ref={reasoningEffortDropdownRef}
-            className="fixed z-[9999] animate-slide-up"
-            style={{
-              bottom: window.innerHeight - reasoningEffortBtnRect.top + 4,
-              left: effortPopoverLeft(reasoningEffortBtnRect.left, window.innerWidth),
-            }}
-          >
-            <ReasoningEffortDropdown
-              slot={slotKey}
-              currentEffort={paneSlot?.reasoning_effort || legacyCodexEffort(paneSlot?.model || '', '', codexPairModels)}
-              defaultEffort={defaultEffort}
-              levelsOverride={effortLevelsOverride}
-              onClose={() => setReasoningEffortDropdown(false)}
-            />
+            {/* Reasoning effort lives INSIDE the model picker (one control),
+                fed by the slot's ACP capability read: the agent's own answer
+                decides whether the row exists and which levels it offers. */}
+            {effortSupported && (
+              <div className="mt-2 shrink-0 border-t border-border">
+                <ReasoningEffortDropdown
+                  slot={slotKey}
+                  currentEffort={paneSlot?.reasoning_effort || legacyCodexEffort(paneSlot?.model || '', '', codexPairModels)}
+                  defaultEffort={defaultEffort}
+                  levelsOverride={effortLevelsOverride}
+                  onClose={() => modelDD.setOpen(false)}
+                  embedded
+                />
+              </div>
+            )}
+           </div>
           </div>,
           document.body,
         )}

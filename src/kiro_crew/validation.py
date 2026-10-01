@@ -38,6 +38,7 @@ from kiro_crew.constants import (
     CHANNEL_OWNER_DM_NAMESPACES,
     MAX_BANNER_CHARS,
     SLACK_NAMESPACE,
+    WAIT_TOOL_MAX_SECS,
     WINDOWS_DEVICE_STEMS,
 )
 
@@ -72,6 +73,65 @@ MAX_SHORT_STRING = 500  # names, IDs, categories
 MAX_SKILL_KEY_CHARS = 32768  # nested catalog keys, transported in JSON for exact reads
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
+# How many sessions one broadcast may reach. A fan-out bound, not a taste
+# judgement: every delivery runs the full ``send_to_target`` path -- a gate, an
+# audit write, and for a steer an RPC that suspends -- so an unbounded audience is
+# a way to occupy the event loop for as long as the caller likes.
+#
+# The VALUE is tied to ``dashboard.state.MAX_SLOTS_PER_CREATOR`` (50) and must
+# never fall below it. The broadcast's DEFAULT audience is "every live session
+# this caller created" (``broadcast_audience``), and that set is bounded by the
+# per-creator slot cap and by nothing else -- so a cap under it makes the
+# documented default path refuse itself with ``too_many_targets`` as soon as a
+# conductor holds more workers than the cap, which is a refusal the caller cannot
+# act on: it did not name those targets, the fence did. Sitting at the per-creator
+# cap makes the default audience structurally unable to exceed this bound instead
+# of merely unlikely to.
+#
+# It is a literal rather than an import because ``kiro_crew.dashboard.state``
+# imports this module (a derived value here would be a cycle), so the relation is
+# held by a test instead: ``test_session_broadcast.py`` asserts
+# ``MAX_BROADCAST_TARGETS >= MAX_SLOTS_PER_CREATOR``. Raise that cap and the test
+# names this line; lower this one and it names it too. Note the second consumer of
+# this number: ``mcp_dashboard`` sizes its one HTTP request as
+# ``cap * BROADCAST_TARGET_ALLOWANCE_SECS + BROADCAST_RESPONSE_MARGIN_SECS``, so
+# the worst-case broadcast request budget moves with it (50 -> 260s).
+#
+# It lives HERE, with the other input bounds, because the argument schema and the
+# verb must refuse at the same number: two literals would let one layer enforce a
+# stale cap while the other's refusal code and documentation named a different one.
+MAX_BROADCAST_TARGETS = 50
+
+# Maximum session-status rows retained for a caller. Unlike the live-slot cap,
+# this bounds the durable transcript roster left by sessions that were created
+# and closed, so one long-running conductor cannot grow a model-visible reply
+# without limit. Applied where source rows and response rows are retained.
+MAX_SESSION_STATUS_ROWS = 256
+
+# Maximum characters retained from one session-status title. Transcript metadata
+# is editable by an agent's own file tools, so this bounds attacker-controlled
+# text before it enters a retained roster row and, later, a model's context.
+MAX_SESSION_STATUS_TITLE_CHARS = 500
+
+# Seconds ONE broadcast delivery may take before the loop stops waiting for it and
+# moves to the next target. Enforced per delivery, never over the fan-out: the
+# bound exists so a single unresponsive session cannot starve the ones behind it,
+# and a shared budget the early targets could spend would do exactly that.
+#
+# It lives beside the cap because the two bound the same fan-out from opposite
+# ends and BOTH layers read it: the backend enforces it per delivery, and the MCP
+# client multiplies it by the cap to size its one HTTP request. A client budget
+# below the enforced bound would let a full audience expire the request and
+# discard the per-target report the verb exists to produce, so the two must move
+# together -- which is what one name guarantees and two literals only hope for.
+BROADCAST_TARGET_ALLOWANCE_SECS = 5.0
+
+# Seconds the one broadcast request allows beyond the backend's worst-case
+# delivery time. This covers the per-target gate and audit work, the broadcast's
+# own audit write, and the HTTP response itself. It is an allowance, not a value
+# derived from measurement: the client budget must EXCEED the sequential delivery
+# bound, never merely equal it, so the per-target report still reaches the caller.
+BROADCAST_RESPONSE_MARGIN_SECS = 10.0
 # Longest backend-authored ACP session id Kiro Crew RETAINS in a store of its
 # own: the native-child rosters and a created slot's frozen creator id (held in
 # memory only, never written to the transcript), and through it the crew log's
@@ -1376,7 +1436,8 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
             max_val=MAX_MONITOR_CADENCE_SECS,
         ),
         FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
@@ -1532,7 +1593,8 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
         FieldSpec("objective", str, allowed=publicly_armable_objectives()),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
@@ -2402,6 +2464,29 @@ CHAT_SESSION_PIN_SCHEMA = ToolSchema(
     ],
 )
 
+# Board columns (``/api/chat/tag-columns``). A column name is stored as
+# ``name[:60]`` (``chat_tags._NAME_MAX``), the same cap as a tag name, and a
+# column reference is a 12-hex id or the column's exact name.
+CHAT_TAG_COLUMN_LIST_SCHEMA = ToolSchema(tool_name="chat_tag_column_list", fields=[])
+
+CHAT_TAG_COLUMN_CREATE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_create",
+    fields=[
+        FieldSpec("name", str, required=True, max_len=_CHAT_TAG_NAME_MAX),
+        FieldSpec("tag", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+    ],
+)
+
+CHAT_TAG_COLUMN_MOVE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_move",
+    fields=[
+        # The handler requires exactly one of ``before`` / ``after``.
+        FieldSpec("column", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("before", str, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("after", str, max_len=_CHAT_TAG_REF_MAX),
+    ],
+)
+
 ARTIFACT_MOVE_SCHEMA = ToolSchema(
     tool_name="artifact_move",
     fields=[
@@ -3240,7 +3325,7 @@ READ_SLACK_PROFILE_SCHEMA = ToolSchema(
 WAIT_SCHEMA = ToolSchema(
     tool_name="wait",
     fields=[
-        FieldSpec("seconds", int, required=True, min_val=60, max_val=1800),
+        FieldSpec("seconds", int, required=True, min_val=60, max_val=WAIT_TOOL_MAX_SECS),
         FieldSpec("reason", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
@@ -3404,6 +3489,13 @@ SESSION_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_END_WAIT_SCHEMA = ToolSchema(
+    tool_name="session_end_wait",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_SET_MODEL_SCHEMA = ToolSchema(
     tool_name="session_set_model",
     fields=[
@@ -3419,6 +3511,19 @@ SESSION_CLOSE_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_REVIVE_SCHEMA = ToolSchema(
+    tool_name="session_revive",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # Same folder reference ``session_create.folder`` takes. The folder is
+        # resolved and checked BEFORE anything is revived, so an unknown or
+        # deleted folder refuses with nothing done; a revive-then-move pair
+        # would leave the session revived and unfiled when the move refused.
+        # Filing itself runs after the revive has committed and is best-effort.
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
 SESSION_SEND_SCHEMA = ToolSchema(
     tool_name="session_send",
     fields=[
@@ -3431,6 +3536,41 @@ SESSION_SEND_SCHEMA = ToolSchema(
         # that omits it keeps the queue-or-run behaviour it has today.
         FieldSpec("steer", bool, default=False),
     ],
+)
+
+SESSION_BROADCAST_SCHEMA = ToolSchema(
+    tool_name="session_broadcast",
+    fields=[
+        FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+        # REQUIRED and enumerated, with no default. The two modes are different
+        # instructions, not a setting with a safe side: a caller that meant "tell
+        # them when they next come up for air" must not interrupt eight turns
+        # because it omitted a field, and one that meant "stop, now" must not have
+        # its urgency silently downgraded to the queue. So the caller states which.
+        FieldSpec(
+            "mode",
+            str,
+            required=True,
+            allowed=frozenset({"queue", "steer"}),
+            max_len=MAX_SHORT_STRING,
+        ),
+        # Omitted means every session this caller created. Bounded to the same
+        # number the API enforces, so an oversized list is refused at the schema
+        # with the field named rather than after a round trip.
+        FieldSpec(
+            "targets",
+            list,
+            required=False,
+            item_type=str,
+            item_max_len=MAX_SHORT_STRING,
+            max_items=MAX_BROADCAST_TARGETS,
+        ),
+    ],
+)
+
+SESSION_STATUS_SCHEMA = ToolSchema(
+    tool_name="session_status",
+    fields=[],
 )
 
 SESSION_ADOPT_SCHEMA = ToolSchema(
@@ -3453,6 +3593,13 @@ SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
         FieldSpec("since", int, required=False, min_val=0),
+    ],
+)
+
+SESSION_SUMMARY_SCHEMA = ToolSchema(
+    tool_name="session_summary",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -3694,12 +3841,17 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_create": SESSION_CREATE_SCHEMA,
     "session_fork": SESSION_FORK_SCHEMA,
     "session_stop": SESSION_STOP_SCHEMA,
+    "session_end_wait": SESSION_END_WAIT_SCHEMA,
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
+    "session_revive": SESSION_REVIVE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
+    "session_broadcast": SESSION_BROADCAST_SCHEMA,
+    "session_status": SESSION_STATUS_SCHEMA,
     "session_adopt": SESSION_ADOPT_SCHEMA,
     "session_release": SESSION_RELEASE_SCHEMA,
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
+    "session_summary": SESSION_SUMMARY_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
@@ -3710,6 +3862,9 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_tag_update": CHAT_TAG_UPDATE_SCHEMA,
     "chat_tag_assign": CHAT_TAG_ASSIGN_SCHEMA,
     "chat_session_pin": CHAT_SESSION_PIN_SCHEMA,
+    "chat_tag_column_list": CHAT_TAG_COLUMN_LIST_SCHEMA,
+    "chat_tag_column_create": CHAT_TAG_COLUMN_CREATE_SCHEMA,
+    "chat_tag_column_move": CHAT_TAG_COLUMN_MOVE_SCHEMA,
 }
 
 # ── Tool Schemas (MCP crew log — server ``kirocrew-crew-log``) ──
@@ -3759,7 +3914,12 @@ CREW_LOG_PROJECTION_SCHEMA = ToolSchema(
             "name",
             str,
             required=True,
-            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals"}),
+            # Must hold every name the tool ADVERTISES in its ``inputSchema`` enum, which is
+            # ``mcp_crew_log.PROJECTION_NAMES``. Spelled literally rather than imported
+            # because that module imports this one, and the two are pinned together by
+            # ``test_the_projection_schema_accepts_every_advertised_fold`` so a fold added to
+            # one and not the other fails CI instead of advertising a name this refuses.
+            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals", "subagents"}),
         ),
     ],
 )

@@ -21,12 +21,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from typing import Any
 
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew import members as members_mod
-from kiro_crew.config.loader import KiroCrewConfig, default_project_dir
+from kiro_crew.config.loader import (
+    KiroCrewConfig,
+    default_project_dir,
+    load_config_with_content_stamp,
+)
 from kiro_crew.dashboard.chat_persistence import (
     pin_private_agent_store,
     rehydrate_slot_from_history_async,
@@ -339,7 +344,29 @@ async def api_members(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     state: DashboardState | None = request.app.get("state")
-    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    # Loaded WITH the digest of the bytes it was parsed from. Every config-derived row
+    # field below comes from this one load, and the per-row reconcile that writes them
+    # into the member log runs several awaited reads later, so a save landing in
+    # between would be overwritten by the values held here. The digest is what lets
+    # that reconcile refuse instead.
+    cfg, config_stamp = await asyncio.to_thread(load_config_with_content_stamp)
+    # The reconcile below corrects the log FROM this config, so it may run only while
+    # the config is both current and faithful. Currency is the digest: without one there
+    # is nothing to check the live file against. Faithfulness is
+    # ``degraded_sections``: a file that read whole but would not parse leaves field
+    # DEFAULTS standing in for what the operator wrote, and correcting the log from
+    # those defaults would overwrite good values because of a typo -- the same
+    # projection regression this guard exists to prevent. The permission rides on the
+    # stamp itself rather than a separate flag, so no row can reach the reconcile
+    # without one. Either way the rows below still render from the config in hand; only
+    # the correcting write is withheld.
+    reconcile_stamp = None if cfg.degraded_sections else config_stamp
+    if reconcile_stamp is None:
+        logger.warning(
+            "the agents config is %s, so this roster read reconciles no member/config; "
+            "a read of a whole, parseable config does",
+            "degraded to defaults" if cfg.degraded_sections else "unnamed by any content",
+        )
 
     # The roster's redaction chokepoint, shared with ``GET /api/agents`` so the
     # two endpoints cannot drift apart. Function-local for the same reason
@@ -540,6 +567,10 @@ async def api_members(request: web.Request) -> web.Response:
     preview_authoritative: set[str] = set()
     for row in rows:
         mt, preview, stopped, exhaustive = tails.get(row["slot_key"], (0.0, "", False, False))
+        # The TRANSCRIPT's epoch, which is what `reconcile_member_preview` below
+        # carries into its correcting event. The row's shipped `last_active_ts`
+        # is decided after the projections are folded (see the final loop): the
+        # crew log is the recency authority, and this value is its floor.
         row["last_active_ts"] = mt
         row["last_message"] = preview
         if not (preview or exhaustive) or row["slot_key"] in unflushed_slot_keys:
@@ -668,25 +699,33 @@ async def api_members(request: web.Request) -> web.Response:
                 snap = svc.snapshot(slug)
                 agent_cfg = agent_cfgs.get(row["name"])
                 appended = False
-                # Every read, for every member whose log exists. The reconcile
-                # compares the folded roster against the live config and returns
-                # before writing when they match, so a config that has not drifted
-                # costs one field comparison -- and a config edited by hand rather
-                # than through the dashboard reaches the log on the next read with
-                # nothing to remember between requests.
+                # Every read of a whole, parseable config, for every member whose
+                # log exists. The reconcile compares the folded roster against the
+                # live config and returns before writing when they match, so a
+                # config that has not drifted costs one field comparison -- and a
+                # config edited by hand rather than through the dashboard reaches
+                # the log on the next read with nothing to remember between
+                # requests.
                 #
-                # Serving the placeholder log's projection is a READ. Reconciling
-                # this row's config or preview into it is a WRITE into a log whose
-                # owner cannot be told from a retired member handed the same slug
-                # (the startup sweep in ``eventlog_hooks`` refuses for the same
-                # reason), so the write-through runs only for a log with no header
-                # yet or one the exact name owns.
+                # Two guards gate this WRITE. First OWNERSHIP: serving the
+                # placeholder log's projection is a READ, but reconciling this
+                # row's config or preview into it is a WRITE into a log whose owner
+                # cannot be told from a retired member handed the same slug (the
+                # startup sweep in ``eventlog_hooks`` refuses for the same reason),
+                # so the write-through runs only for a log with no header yet or one
+                # the exact name owns. Second FAITHFULNESS: ``reconcile_stamp`` is
+                # None for a config that is not current or not faithful, which is
+                # what withholds the write; see where it is decided.
                 owned = logged_name is None or logged_name == row["name"]
-                if agent_cfg is not None and owned:
+                if agent_cfg is not None and owned and reconcile_stamp is not None:
                     values = snap.get("values", {}) if isinstance(snap, dict) else {}
                     appended = (
                         eventlog_hooks.reconcile_member_config(
-                            slug, row["name"], agent_cfg, values.get("roster", {})
+                            slug,
+                            row["name"],
+                            agent_cfg,
+                            values.get("roster", {}),
+                            config_stamp=reconcile_stamp,
                         )
                         is not None
                     )
@@ -735,8 +774,59 @@ async def api_members(request: web.Request) -> web.Response:
     for row in rows:
         block = projections.get(row["slug"], {"asOfSeq": _SEQ_UNATTRIBUTABLE, "values": {}})
         row["projections"] = _redact_projection_value(_roster_only(block))
+        row["last_active_ts"] = _recency_for_row(block, row.get("last_active_ts"))
 
     return web.json_response({"members": rows})
+
+
+def _recency_for_row(block: dict, transcript_ts: Any) -> float:
+    """The roster row's ``last_active_ts``: the crew log's fold, floored by the
+    transcript.
+
+    The **crew log is the authority**, and that is the whole point of reading it
+    here. ``RosterProjection`` sets ``last_active_ts`` on every
+    ``member/message`` — including a machinery row that carries no preview — so
+    it answers "when was this member last active", which is the question the
+    Recent sort asks. The transcript's last SPEECH row answers a narrower one:
+    when did this member last SAY something. Ordering by that put a crewmate the
+    user had just messaged below one whose agent had spoken longer ago, and it
+    could not move at all for a member whose log exists but whose transcript
+    rows had not been flushed yet. The same fold is what the pushed
+    ``member_projection`` frame carries, so taking it here makes the cold row
+    and the live frame one value and lets a send reorder the list with no
+    roster refetch.
+
+    The transcript is kept as a **floor**, not as a rival: these events are
+    appended on a best-effort hook that a queue ceiling may drop, and a member
+    whose log has no ``last_active_ts`` at all (no log yet, a shared slug, a
+    read the store would not prove — every one of which answers an empty
+    ``values``) has only the transcript. Taking the greater of the two can
+    therefore lose neither, and because it is monotone a lagging fold can never
+    walk a row's recency backwards.
+    """
+    from kiro_crew.eventlog import types as eventlog_types
+
+    floor = _as_epoch(transcript_ts)
+    values = block.get("values") if isinstance(block, dict) else None
+    roster = values.get(eventlog_types.PROJ_ROSTER) if isinstance(values, dict) else None
+    folded = _as_epoch(roster.get("last_active_ts")) if isinstance(roster, dict) else 0.0
+    return max(floor, folded)
+
+
+def _as_epoch(value: Any) -> float:
+    """*value* as epoch seconds, or ``0.0`` for anything that is not a number.
+
+    A projection field is whatever the event carried, so this must survive
+    ``None`` (a ``member/message`` with no ``ts``), a bool, and a string,
+    without letting any of them become an ordering key. ``bool`` is excluded
+    explicitly: it is an ``int`` subclass, so ``True`` would otherwise rank a
+    member one second after the epoch instead of not at all.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / infinities
+        return 0.0
+    return float(value) if value > 0 else 0.0
 
 
 def _member_thread_slot(cfg, member: str, slug: str) -> tuple[str, str]:

@@ -8,7 +8,10 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kiro_crew.subagent import SubagentDelivery
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +329,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     # the key at module level would close an import cycle.
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
     from kiro_crew.dashboard.session_control import (
+        CHANNEL_RECIPIENT_META_KEY,
         QUEUED_CONTAINMENT_META_KEY,
         SEND_ORIGIN_META_KEY,
     )
@@ -394,7 +398,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # actor at all -- the same fail-closed baseline the flags above get.
             #
             # The SENDING SLOT goes with them, and it is the sharpest of the
-            # three because the value is not merely read, it names a WRITE
+            # first three because the value is not merely read, it names a WRITE
             # TARGET: the drain resolves the recipient of its drop notice from
             # this key alone and appends the entry's own text there
             # (`session_control.notify_send_origin_dropped`). Carried back off
@@ -407,6 +411,11 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # itself still survives -- which is what putting the stamp in
             # ``meta`` rather than a consumption callback buys, since a
             # callback-carrying entry is not persisted at all.
+            #
+            # The CHANNEL RECIPIENT stamp goes for the same reason with a wider
+            # blast radius: it names a conversation on a network surface and the
+            # drop notice would carry the entry's text there, so an edited stamp
+            # would turn a file write into an outbound channel message.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
@@ -415,6 +424,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
                     QUEUED_CONTAINMENT_META_KEY,
                     TURN_ACTOR_META_KEY,
                     SEND_ORIGIN_META_KEY,
+                    CHANNEL_RECIPIENT_META_KEY,
                 )
             }
         try:
@@ -643,14 +653,18 @@ class SlotQueueRepository:
         self,
         owner: Any,
         content: str,
-        agent_ids: list[str],
+        deliveries: list[SubagentDelivery],
     ) -> None:
         """Remember which agents a queued completion still owes delivery."""
-        if not content or not agent_ids:
+        if not content or not deliveries:
             return
         key = self._delivery_key(content)
         owed = owner._subagent_delivery_pending.setdefault(key, [])
-        owed.extend(agent_id for agent_id in agent_ids if agent_id not in owed)
+        known = {delivery.agent_id for delivery in owed}
+        for delivery in deliveries:
+            if delivery.agent_id not in known:
+                owed.append(delivery)
+                known.add(delivery.agent_id)
         # Only the consuming row may settle an entry.  A turn tail can dequeue
         # its successor before the current settlement callback runs, so sweeping
         # merely because content left the queue would lose the successor's debt.
@@ -663,9 +677,11 @@ class SlotQueueRepository:
             self._delivery_key(content) in owner._subagent_delivery_pending for content in contents
         )
 
-    def take_pending_subagent_deliveries(self, owner: Any, contents: list[str]) -> list[str]:
+    def take_pending_subagent_deliveries(
+        self, owner: Any, contents: list[str]
+    ) -> list[SubagentDelivery]:
         """Claim delivery marks in consumed-row order and forget only those rows."""
-        claimed: list[str] = []
+        claimed: list[SubagentDelivery] = []
         for content in contents:
             claimed.extend(owner._subagent_delivery_pending.pop(self._delivery_key(content), []))
         return claimed
