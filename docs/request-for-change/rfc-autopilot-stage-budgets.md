@@ -7,7 +7,7 @@ created: 2026-09-26
 last-audited: 2026-10-01
 audited-at: 133869280
 revision: 1
-doc-pr: 14043
+doc-pr: 15987
 implementation-prs: [13992]
 tracking-issues: [14058]
 supersedes: []
