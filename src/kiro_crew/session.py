@@ -3210,6 +3210,10 @@ class SessionManager:
         """Delete a persisted conversation and continuable mark."""
         return self._allocation_boundary().forget_conversation(key)
 
+    def forget_conversation_if_sid(self, key: str, expected_sid: str) -> tuple[bool, str | None]:
+        """Delete a persisted conversation only if its SID still matches."""
+        return self._allocation_boundary().forget_conversation_if_sid(key, expected_sid)
+
     def conversation_provider(self, key: str) -> str:
         """Return the persisted provider label for a folded key."""
         return self._allocation_boundary().conversation_provider(key)

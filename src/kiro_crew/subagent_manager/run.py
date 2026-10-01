@@ -624,7 +624,78 @@ class RunEventCoordinator(ManagerComponent):
                     self._manager._write_tombstone(info, "cancelled")
             logger.info("Subagent %s cancelled", info.id)
         except Exception as exc:
-            if info._reap_started and is_runtime_death(exc):
+            if getattr(exc, "context_overflow", False):
+                # The native session that raised this cannot shrink the envelope
+                # it was already rejected on, so replaying there reproduces the
+                # rejection. A zero-activity first turn on a SHARED runtime is
+                # safe to retry once on a FRESH dedicated runtime, which
+                # rebuilds session and projection state from scratch; that
+                # rebuild is best-effort, not a diagnosis of why the first
+                # envelope was too large. A first attempt that already ran
+                # dedicated is terminal: no transition is evidenced that would
+                # be expected to make a replacement's envelope small enough or
+                # different enough to fit, so another teardown, capacity and
+                # spawn cycle is not justified. Any observed text or tool call
+                # forbids replay, and the one-shot makes a second overflow
+                # terminal.
+                can_rebuild = (
+                    not info._context_overflow_retry_used
+                    and info._session_sharing
+                    and not info.conversation_key
+                    and info.turns == 0
+                    and info.tool_count == 0
+                    and not info.streaming_text
+                    and not info.result
+                    and not info.user_stopped
+                    and not info._reap_started
+                    and not self._manager._shutting_down
+                )
+                if can_rebuild:
+                    info._context_overflow_retry_used = True
+                    info._force_dedicated = True
+                    info._recovering = True
+                    logger.warning(
+                        "Subagent %s startup context overflowed on a shared runtime; "
+                        "retrying once on a fresh dedicated runtime: %s",
+                        info.id,
+                        exc,
+                    )
+                    self._manager._schedule_cancel_recovery(info, reason="context_overflow")
+                else:
+                    if not info.result and info.streaming_text:
+                        info.result = info.streaming_text
+                    detail = _redact(str(exc))[:MAX_ERROR_DETAIL_LEN]
+                    if info._context_overflow_retry_used:
+                        info.error = f"Dedicated-session recovery also overflowed: {detail}"
+                    elif info.tool_count:
+                        # A tool ran: the fresh runtime has no ledger of what it
+                        # changed, so replay could repeat a side effect (the
+                        # same gate the unexpected-cancel arm applies).
+                        info.error = (
+                            "Agent context overflowed after tools executed; it was "
+                            "not replayed because that could repeat side effects. "
+                            f"{detail}"
+                        )
+                    elif info.streaming_text or info.result or info.turns:
+                        # Text, a result or a completed turn without any tool
+                        # call is side-effect-free, exactly as the
+                        # unexpected-cancel arm treats it. Replay is still
+                        # withheld, but only because the work already produced
+                        # is preserved and running the prompt again would
+                        # duplicate it -- not because state changed.
+                        info.error = (
+                            "Agent context overflowed after it had already produced "
+                            "work; that work was preserved and it was not replayed "
+                            "to avoid duplicating it. "
+                            f"{detail}"
+                        )
+                    else:
+                        info.error = detail
+                    info.done = True
+                    Stats().inc_subagent_failed()
+                    self._manager._write_tombstone(info, "error")
+                    logger.warning("Subagent %s context overflow: %s", info.id, exc)
+            elif info._reap_started and is_runtime_death(exc):
                 # The ECHO of our own teardown, not a fault of the run.
                 # ``_force_reap`` resets the run's session (or shuts its shared
                 # handle) BEFORE it cancels this task, so the in-flight stream
@@ -3377,6 +3448,8 @@ class RunEventCoordinator(ManagerComponent):
         is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare).
         """
         # Member capability and native prompt documents are prepared at launch.
+        if info._force_dedicated:
+            return False
         if info.execution_context is not None and info.execution_context.member_id is not None:
             return False
         try:

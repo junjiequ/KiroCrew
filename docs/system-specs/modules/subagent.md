@@ -1280,6 +1280,87 @@ The MECHANISM that delivers that invariant is the write channel, not luck. `ensu
 
 The in-turn ladder below handles what no adapter classifies (and every transient when the durable queue is off — `agent.task_queue_enabled=false`): errors are retried with exponential backoff on the same live session; each retry fires a `subagent_retrying` WS event (chip shows `⟳ retrying`) and a SEL audit record. **Replay-safety**: if ANY activity was observed (text chunk, approved tool turn, or auto-allowed tool call), the retry sends `_TRANSIENT_CONTINUE_MSG` instead of the original prompt — a mutating tool may have executed before the first text chunk, and replaying the full prompt would re-run it. **Budget**: `TRANSIENT_RETRIES` applies only while ZERO activity was observed (replaying the bare prompt is side-effect-free); after any activity, recovery is ONE-SHOT — exactly one continuation turn, matching the main path's `_posttoken_retry_used` rule, since each post-activity continuation is an independent opportunity to repeat a side effect. The two ladders (this one and `dashboard/chat_runner.py`'s) are intentionally-identical copies cross-referenced in both sources; a change to either's predicate or budget must be mirrored. Non-transient errors and exhausted budgets propagate to the generic error arm, with ONE deliberate divergence: the sub-agent ladder has a terminal keep-output branch that `chat_runner`'s ladder does not. When the one post-activity continue is spent, the streamed output is non-empty and the transient error says "failed to generate a response", the stream ends and the run is kept: the warning "_Warning: the backend failed to generate a final response; this is the output streamed before that._" is added to the delivered result after the `completion_keep` cap and to `result.txt`, `partial` is set, and `result_complete` stays false (no complete event). The kept run still counts as a success for `record_success` and `inc_subagent_completed`; that is intended, because the parent got the output. The sibling "failed to process the request" is scoped out and still fails. The interactive chat has its own recovery for this error, so it does not mirror the branch.
 
+## First-Turn Context Overflow Recovery
+
+An `AcpError` carrying `context_overflow=True` is deterministic on the native
+session that raised it. A subagent may recover once only when the failure came
+from its first attempt on a session-shared runtime (`_session_sharing`), before
+any text, tool call, or completed turn, and the run has no `conversation_key`.
+A continuation carries the established conversation's identity and history in a
+non-empty `conversation_key`; rebuilding it cannot satisfy the
+fresh-first-attempt premise, so even a zero-activity overflow is terminal
+without consuming the one-shot recovery. A first attempt that already ran on a
+dedicated process is terminal the same way, without scheduling recovery or
+consuming the one-shot: no transition is evidenced that would be expected to
+make a replacement's envelope small enough or different enough to fit, so
+another teardown, capacity-wait and spawn cycle is not justified.
+The proven invariant is narrower than any diagnosis: a replay on the same native
+session cannot shrink the envelope that session was already rejected on, while
+one fresh dedicated retry of a shared first attempt rebuilds session and
+projection state from scratch. Why the first envelope was too large is not
+established here, so this is best-effort recovery, not a diagnosis of the cause.
+`_run` marks the run recovering, lets its own teardown
+finish (the shared handle is shut), then
+reuses the fresh-task recovery scheduler with `_force_dedicated=True`. After
+teardown, the scheduler reads the fresh run's recorded `_session_id` and removes
+that exact resumable SID through
+`SessionManager.forget_conversation_if_sid`. The live `SessionMap` compares and
+removes the entry in one `_MAP_LOCK` critical section, so a worker-thread writer
+cannot place a successor between the check and deletion. An actual deletion is
+then made durable with `await SessionManager.aflush()` before the scheduler
+clears startup or process state, waits for capacity, allocates the replacement,
+or emits recovery. This is the session registry's persist-before-publish point:
+a process exit after recovery can no longer restore the rejected SID from the
+last on-disk map. An absent mapping changes nothing and skips the flush; a
+different mapped SID is left untouched, skips the flush, and recovery fails
+closed. If the flush raises, the scheduler takes its existing terminal
+recovery-failure path without allocating or reporting recovery, and the finalize
+claim still reports that failure exactly once. A MISSING `_session_id` fails
+closed the same way, before any capacity wait or replacement allocation and
+without reading, altering, or flushing any `SessionMap` entry:
+the identity capture after session acquisition is best-effort while the
+allocation may already have persisted a resumable mapping, and with no rejected
+SID to compare, a mapped SID cannot be proven to be the rejected attempt rather
+than a successor, so a replacement could `session/load` state the run does not
+own. Both closed outcomes take the scheduler's terminal recovery-failure arm
+(`info.error` names the dedicated-session recovery that could not start) and
+report exactly once through the finalize claim.
+A `keep=True` run never reaches this recovery: `_sharing_plan_impl` starts a
+kept run on a dedicated process, so its first-turn overflow is terminal under the
+shared-first-attempt gate above.
+The scheduler next clears the first attempt's startup clock
+(`_startup_deadline_stamp`, then `_exec_started`), then the retired
+runtime's `_pid`, then `_session_sharing` and `_shared_provider`, with every
+update before any capacity-wait suspension. The clock goes first because the
+startup watchdog (`_is_startup_stalled`) reaps a run with `_exec_started` set,
+no PID, no first stream and no turn once that clock passes the startup deadline:
+with the PID cleared and the first attempt's clock left in place, a capacity wait
+longer than the deadline would be force-reaped as a stalled start. A cleared
+clock reads as a run that has not entered `_run_inner`, which the replacement
+has not; `_run_inner_impl` re-stamps it as its first statement. The PID-first
+order among the identity fields makes concurrent samplers stop
+before they can interpret the cleared sharing state; the cleared PID is the
+retired attempt's whether it named a shared runtime or the run's own ended
+process, and the replacement records its own. The
+replacement process therefore starts inside the startup watchdog and receives
+fresh RSS sampling instead of inheriting the first attempt's identity. It then
+rebuilds native skill projection and MCP Tool Search state rather than replaying
+on the session that overflowed. The `_pid` clear is an ordinary
+counted site in `test_pid_reader_ratchet.py`, not an owner-marked one: the
+marker is reserved for the module that owns a runtime and the function that
+ends a process, and retiring a stale reading is neither.
+
+The retry is one-shot (`_context_overflow_retry_used`). A second overflow,
+which can only come from the forced-dedicated replacement, or any overflow after
+observed activity is terminal. Partial text is preserved as the result, and the
+error names the reason replay was withheld, using the same side-effect reading
+as the unexpected-cancel gate below: when a tool ran (`tool_count > 0`) the
+error says replay could repeat side effects, because the fresh runtime has no
+ledger of what the tool changed; when only text, a result or a completed turn
+was observed, no state changed, so the error says the produced work was
+preserved and replay was withheld to avoid duplicating it, without claiming a
+side effect. Replay stays withheld in both cases; only the stated reason differs.
+
 ## Unexpected-Cancel Recovery (one-shot auto-continue)
 
 An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_cancel_recovery`: exists for cancellations arriving from outside the manager's lifecycle (parent task-tree teardown around a live subagent), mirroring the main path's PR #173 recovery. Mechanics:

@@ -1491,6 +1491,17 @@ class SessionAllocationService:
         self._continuable_keys.discard(folded)
         return sid
 
+    def forget_conversation_if_sid(self, key: str, expected_sid: str) -> tuple[bool, str | None]:
+        """Forget the resumable pointer only while it is still *expected_sid*.
+
+        ``SessionMap.delete_if_sid`` compares and deletes in one step under its
+        own lock; a mismatch deletes nothing and preserves the successor's
+        pointer. This is the method's only mutation. Returns the map's
+        ``(removed, current_sid)``.
+        """
+        folded = self._owner._fold_key(key)
+        return self._owner._session_map.delete_if_sid(folded, expected_sid)
+
     def conversation_provider(self, key: str) -> str:
         return self._owner._session_map.get_provider(self._owner._fold_key(key))
 

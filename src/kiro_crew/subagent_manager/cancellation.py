@@ -29,14 +29,20 @@ class CancellationCoordinator(ManagerComponent):
 
     __slots__ = ()
 
-    def _schedule_cancel_recovery_impl(self, info: SubagentInfo) -> None:
-        """Respawn *info*'s run on a fresh task after an unexpected cancellation.
+    def _schedule_cancel_recovery_impl(
+        self, info: SubagentInfo, *, reason: str = "unexpected_cancel"
+    ) -> None:
+        """Respawn *info* on a fresh task after a recoverable terminal event.
 
-        Called from ``_run``'s CancelledError handler — the current task is
-        being cancelled and cannot continue itself, so the continuation runs on
-        a new task. One-shot: gated by ``info._cancel_retry_used`` at the call
-        site. The original run's finally block still performs session cleanup
-        (release/reset) but skips terminal finalization while ``_recovering``.
+        The default serves an unexpected cancellation. ``context_overflow``
+        serves a first-turn overflow and forces the replacement onto a fresh
+        dedicated runtime after the original attempt's handle (shared) or
+        process (dedicated) has finished teardown.
+
+        The current task cannot continue itself, so the replacement runs on a
+        new task. Each caller owns its one-shot gate. The original run's finally
+        block still performs session cleanup but skips terminal finalization
+        while ``_recovering``.
 
         **Cancellation-source contract.** This branch exists for cancellations
         that arrive from OUTSIDE the manager's own lifecycle — in practice the
@@ -86,6 +92,75 @@ class CancellationCoordinator(ManagerComponent):
                 if info.done or info._reap_started or info.reaped or self._manager._shutting_down:
                     info._recovering = False
                     return
+                if reason == "context_overflow":
+                    # Reset preserves a dedicated session's durable pointer so
+                    # an ordinary keep run can resume it. This session was
+                    # rejected before its first turn, however, and loading it
+                    # would reproduce the same deterministic overflow. Forget
+                    # only the exact rejected SID after teardown and before any
+                    # replacement allocation or capacity wait. SessionMap owns
+                    # the comparison and removal under one process-wide lock,
+                    # so a successor SID survives and makes recovery fail closed,
+                    # and so does a run whose rejected SID was never captured.
+                    session_key = f"subagent:{info.id}"
+                    rejected_sid = str(getattr(info, "_session_id", "") or "")
+                    if not rejected_sid:
+                        # The identity capture after session acquisition is
+                        # best-effort, while the allocation may already have
+                        # persisted a resumable mapping for this key. Without
+                        # the rejected SID nothing can tell a mapped SID that
+                        # IS the rejected attempt from a successor, so neither
+                        # deletion nor a replacement that could ``session/load``
+                        # it is safe. Fail closed here, touching no mapping,
+                        # before any capacity wait or allocation -- the same
+                        # terminal arm a preserved successor takes.
+                        raise RuntimeError(
+                            "rejected session identity unknown; cannot retire it "
+                            "before recovery respawn"
+                        )
+                    removed, current_sid = self._manager._sessions.forget_conversation_if_sid(
+                        session_key, rejected_sid
+                    )
+                    if not removed and current_sid is not None:
+                        raise RuntimeError(
+                            "rejected session mapping changed before recovery respawn"
+                        )
+                    if removed:
+                        # Deletion changes the live map immediately, while its
+                        # file rewrite is debounced. Make retirement durable
+                        # before clearing attempt state, waiting for capacity,
+                        # allocating the replacement, or publishing recovery.
+                        # An absent mapping changed nothing and needs no flush;
+                        # a successor mapping failed closed above untouched.
+                        await self._manager._sessions.aflush()
+
+                    # The original task has completed its finally, including
+                    # destruction of its shared handle or the reset of its own
+                    # dedicated process. The replacement has not entered
+                    # ``_run_inner`` yet, so the record must read as a run
+                    # that has not started: the startup watchdog reaps a run
+                    # with ``_exec_started`` set, no PID, no stream and no turn
+                    # once its clock passes the deadline, and the clock still
+                    # stamped here belongs to the FIRST attempt. With the PID
+                    # cleared below, a capacity wait that outlives that stale
+                    # clock would be force-reaped as a stalled start. So both
+                    # clock fields go first, before the PID and before any
+                    # await; ``_run_inner_impl`` re-stamps them for the
+                    # replacement as its first statement.
+                    info._startup_deadline_stamp = None
+                    info._exec_started = None
+                    # Then process identity, because samplers read the PID
+                    # before sharing state; then ownership. The PID is the
+                    # retired first attempt's (a shared runtime this run no
+                    # longer leases, or its own process the reset ended), and
+                    # the replacement records its own in ``_run_inner``. All
+                    # of this runs only after teardown, since clearing any of
+                    # it earlier would make the original teardown treat a
+                    # shared runtime as a dedicated session and reset the
+                    # wrong lifecycle boundary.
+                    info._pid = None
+                    info._session_sharing = False
+                    info._shared_provider = None
                 # Re-acquire a slot through capacity, not blind increment:
                 # the old finally freed our slot and may have drained a queued
                 # spawn into it. Wait (bounded) for a free slot so recovery
@@ -140,10 +215,18 @@ class CancellationCoordinator(ManagerComponent):
                     # failure (with any partial result) even when the respawn
                     # itself could not happen.
                     info.done = True
-                    info.error = "cancelled (recovery failed)"
+                    if reason == "context_overflow":
+                        info.error = (
+                            "agent context exceeded the model window and the dedicated-session "
+                            "recovery could not start"
+                        )
+                        tombstone_cause = "error"
+                    else:
+                        info.error = "cancelled (recovery failed)"
+                        tombstone_cause = "cancelled"
                     info.elapsed = time.time() - info.started
                     Stats().inc_subagent_failed()
-                    self._manager._write_tombstone(info, "cancelled")
+                    self._manager._write_tombstone(info, tombstone_cause)
                     self._manager._record_cost(info)
                 if not info.elapsed:
                     # Report needs an elapsed even when the record above was

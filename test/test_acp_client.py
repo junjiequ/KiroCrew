@@ -9635,6 +9635,83 @@ class TestIsTransientRawError:
         assert auth_exc.transient is False
         assert "authentication failed" in str(auth_exc).lower()
 
+    def test_context_window_overflow_is_structural_and_non_transient(self):
+        import pytest
+
+        import kiro_crew.acp as acp_package
+        from kiro_crew.acp import transport_errors
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "The context window overflowed "
+                "(request_id: 3844b25f-d540-4972-9b0b-03ddb5d177c6)"
+            ),
+        }
+        with patch.object(
+            transport_errors,
+            "_is_transient_raw_error",
+            wraps=transport_errors._is_transient_raw_error,
+        ) as classify:
+            with pytest.raises(AcpError) as raised:
+                _raise_acp_error(error)
+
+        exc = raised.value
+        classify.assert_called_once_with(error, None)
+        assert type(exc) is AcpError
+        assert exc.transient is False
+        assert exc.structural_terminal is True
+        assert exc.context_overflow is True
+        assert "Retrying on the same model session will not help" in str(exc)
+        assert "3844b25f-d540-4972-9b0b-03ddb5d177c6" in str(exc)
+        assert not hasattr(acp_client, "AcpContextOverflow")
+        assert not hasattr(acp_package, "AcpContextOverflow")
+
+    def test_context_window_overflow_tag_is_data_field_only(self):
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "The context window overflowed",
+            "data": "opaque error detail",
+        }
+        with pytest.raises(AcpError) as raised:
+            _raise_acp_error(error)
+
+        exc = raised.value
+        assert type(exc) is AcpError
+        assert exc.transient is False
+        assert exc.structural_terminal is False
+        assert exc.context_overflow is False
+
+    def test_context_window_overflow_wording_is_surface_neutral(self):
+        # The formatter cannot tell a first turn from a later one, and
+        # ``subagent_manager/run.py`` appends this text after its own
+        # post-activity reason, so a startup-only claim would contradict the
+        # caller. Both causes and both remedies must be named.
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "The context window overflowed (request_id: 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0)",
+        }
+        with pytest.raises(AcpError) as raised:
+            _raise_acp_error(error)
+
+        text = str(raised.value)
+        assert "before the turn could run" not in text
+        assert "established conversation" in text
+        assert "accumulated history" in text
+        assert "fresh session" in text
+        assert "always-loaded" in text
+        assert "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" in text
+        assert raised.value.transient is False
+        assert raised.value.structural_terminal is True
+        assert raised.value.context_overflow is True
+
     def test_acp_error_default_transient_is_none(self):
         from kiro_crew.acp.client import AcpError
 

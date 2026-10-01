@@ -93,6 +93,15 @@ retry-eligibility (`_is_transient_raw_error`).
 Both key off the SAME module-level `_RE_*` patterns so wording and retry verdict
 never drift. Notable terminal (non-retryable) classes:
 
+- **Context window overflow**: the provider's exact "The context window
+  overflowed" rejection becomes an ordinary `AcpError` with `transient=False`,
+  `structural_terminal=True`, and `context_overflow=True`. `_raise_acp_error`
+  constructs it through the common `AcpError` path and applies all three facts
+  in the existing data-field-only structural tag block; an echo in the JSON-RPC
+  `message` cannot classify an unrelated failure. It is terminal on the same
+  native session: replaying the same startup envelope cannot make it smaller. A
+  surface may replace the session or runtime only when no model text or tool side
+  effect was observed; subagents use one shared-to-dedicated retry.
 - **Malformed request**: a structural rejection (backend "Improperly formed
   request"). Classified TERMINAL: the identical payload cannot succeed on
   retry, so the message states the request was malformed and points at a repair

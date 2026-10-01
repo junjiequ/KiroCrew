@@ -2740,6 +2740,12 @@ class SubagentInfo:
     # One-shot budget for auto-continue after an UNEXPECTED (non-user, non-
     # shutdown) asyncio cancellation — mirrors the main path's cancel recovery.
     _cancel_retry_used: bool = False
+    # A fresh subagent whose selected agent surface already fills the model
+    # window can recover only by rebuilding that surface. Retry once on a
+    # dedicated runtime, where native skill projection and Tool Search setup run
+    # afresh; a second overflow is terminal so a too-large agent cannot loop.
+    _context_overflow_retry_used: bool = False
+    _force_dedicated: bool = False
     # True while a cancelled run is draining an in-flight off-loop state.json
     # write worker (every off-loop writer). _run's
     # unexpected-cancel recovery gate reads it: on Python 3.10 a second outer
@@ -3175,6 +3181,16 @@ DELIVERY_ROUTING_FIELDS: "dict[str, str]" = {
     "_reap_reason": NOT_DELIVERY_STATE,
     "_reap_started": NOT_DELIVERY_STATE,
     "_recovering": NOT_DELIVERY_STATE,
+    # Recovery clears the first attempt's startup clocks before waiting to
+    # launch its replacement. They govern startup reaping, not delivery.
+    "_exec_started": NOT_DELIVERY_STATE,
+    "_startup_deadline_stamp": NOT_DELIVERY_STATE,
+    # Context-overflow recovery clears the retired shared runtime's identity
+    # before it waits to start the dedicated replacement. These fields govern
+    # process lifecycle and sampling, not where terminal output was delivered.
+    "_pid": NOT_DELIVERY_STATE,
+    "_session_sharing": NOT_DELIVERY_STATE,
+    "_shared_provider": NOT_DELIVERY_STATE,
     # The recovery respawn resets the dead process's RSS readings so the spawn
     # guard prices the fresh process as warming; memory sizing, not delivery.
     "_rss_generation": NOT_DELIVERY_STATE,
@@ -5780,8 +5796,10 @@ class SubagentManager:
     async def _run(self, info: SubagentInfo) -> None:
         return await self._run_events._run_impl(info)
 
-    def _schedule_cancel_recovery(self, info: SubagentInfo) -> None:
-        return self._cancellation._schedule_cancel_recovery_impl(info)
+    def _schedule_cancel_recovery(
+        self, info: SubagentInfo, *, reason: str = "unexpected_cancel"
+    ) -> None:
+        return self._cancellation._schedule_cancel_recovery_impl(info, reason=reason)
 
     async def _touch_activity(self, info: SubagentInfo) -> None:
         return await self._run_events._touch_activity_impl(info)
