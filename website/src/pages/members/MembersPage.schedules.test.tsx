@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { useState } from 'react'
 import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
@@ -144,7 +145,7 @@ async function openCrewmate(name = 'oncall', alsoRoster: string[] = []) {
   )
   fireEvent.click(await screen.findByText(name))
   await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent(`member-${name}`))
-  await screen.findByTestId('member-notes')
+  await screen.findByTestId('member-dashboard')
 }
 
 /** A second dirty surface that refuses every navigation, rendered as a SIBLING after the
@@ -174,7 +175,7 @@ async function openCrewmateWithVeto(name = 'oncall') {
   )
   fireEvent.click(await screen.findByText(name))
   await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent(`member-${name}`))
-  await screen.findByTestId('member-notes')
+  await screen.findByTestId('member-dashboard')
 }
 
 const chip = () => screen.getByTestId(`side-panel-leading-tab-${CREW_SCHEDULES_TAB_ID}`)
@@ -204,6 +205,8 @@ const askToLeave = () => {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  // The Dashboard tab and the in-chat dock are a Feature Preview, on here.
+  localStorage.setItem(PREVIEW_DASHBOARD, '1')
   __resetPanelTabs()
   Object.defineProperty(window, 'innerWidth', { value: WIDE_WINDOW, configurable: true, writable: true })
   vi.mocked(api.crons).mockResolvedValue({ jobs: JOBS } as never)
@@ -211,14 +214,14 @@ beforeEach(() => {
 })
 
 describe('MembersPage Schedules chip', () => {
-  it('sits last in the leading block, after Notes / Work log / Dashboard', async () => {
+  it('sits last in the leading block, after Dashboard / Work log / Notes', async () => {
     await openCrewmate()
     await waitFor(() => expect(chip()).toBeInTheDocument())
     // The leading block alone: the pinned views (Artifacts, Files) follow it and
     // belong to the panel, not to the crewmate.
     const leading = screen.getByTestId('side-panel-leading-tabs')
     expect(within(leading).getAllByRole('tab').map((t) => t.getAttribute('aria-label')))
-      .toEqual(['Notes', 'Work log', 'Dashboard', 'Schedules'])
+      .toEqual(['Dashboard', 'Work log', 'Notes', 'Schedules'])
   })
 
   it('matches a private schedule on the crewmate\'s IMMUTABLE id, not its display name', async () => {
@@ -250,7 +253,7 @@ describe('MembersPage Schedules chip', () => {
     )
     fireEvent.click(await screen.findByText('Radar One'))
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-radar-one'))
-    await screen.findByTestId('member-notes')
+    await screen.findByTestId('member-dashboard')
     await waitFor(() => expect(screen.getByTestId('member-schedules-count')).toHaveTextContent('1/2'))
     fireEvent.click(chip())
     const body = await screen.findByTestId('member-schedules')
@@ -562,7 +565,7 @@ describe('MembersPage Schedules chip', () => {
     )
     fireEvent.click(await screen.findByText('radar'))
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-radar'))
-    await screen.findByTestId('member-notes')
+    await screen.findByTestId('member-dashboard')
     fireEvent.click(chip())
     const body = await screen.findByTestId('member-schedules')
     await within(body).findByTestId('crew-wake-section')
@@ -606,7 +609,7 @@ describe('MembersPage Schedules chip', () => {
     )
     fireEvent.click(await screen.findByText('Radar One'))
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-radar-one'))
-    await screen.findByTestId('member-notes')
+    await screen.findByTestId('member-dashboard')
     fireEvent.click(chip())
     const body = await screen.findByTestId('member-schedules')
     await within(body).findByTestId('crew-wake-section')
@@ -643,7 +646,7 @@ describe('MembersPage Schedules chip', () => {
     renderWithProviders(<MembersPage />)
     fireEvent.click(await screen.findByText('Radar One'))
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-radar-one'))
-    await screen.findByTestId('member-notes')
+    await screen.findByTestId('member-dashboard')
     fireEvent.click(chip())
     const body = await screen.findByTestId('member-schedules')
     await within(body).findByTestId('crew-wake-section')
@@ -836,7 +839,7 @@ describe('MembersPage Schedules chip', () => {
     fireEvent.click(await screen.findByText('oncall'))
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-oncall'))
     fireEvent.click(await screen.findByTestId('member-panel-toggle'))
-    await screen.findByTestId('member-notes')
+    await screen.findByTestId('member-dashboard')
     fireEvent.click(chip())
     const body = await screen.findByTestId('member-schedules')
     await within(body).findByTestId('crew-wake-section')

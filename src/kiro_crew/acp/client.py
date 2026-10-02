@@ -41,6 +41,7 @@ from typing import (
     Any,
     AsyncGenerator,
     AsyncIterator,
+    Awaitable,
     Callable,
     Collection,
     Iterator,
@@ -66,6 +67,7 @@ from kiro_crew.acp import runtime_models, runtime_process_tree, seed_provenance,
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    BackgroundLaunchRecord,
     _dumps_degraded,
     _loggable_request_id,
     _measure_tool_output,
@@ -136,6 +138,7 @@ from kiro_crew.acp.transport_framing import (
     _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     _STDOUT_BUFFER_LIMIT,
     response_write_window_secs,
+    settle_drain,
     write_notification_best_effort,
     write_response_frame_bounded,
 )
@@ -3772,6 +3775,12 @@ class AcpClient:
         # ``session/prompt`` request goes unanswered -- which leaves this armed
         # for ``_settle_codex_compaction`` to close out at the turn's terminal.
         self._codex_compaction_pending: bool = False
+        # When this session's harness last launched work that outlives the
+        # prompt (a backgrounded command, a Workflow). Never reset per turn: a
+        # turn ending says nothing about whether that work has finished, and
+        # this client reads its pipe only while a call is waiting, so the
+        # harness's eventual report of it is not seen until the next prompt.
+        self._background_launches = BackgroundLaunchRecord()
         # Liveness oracle for the stale-turn gate: before ending a silent turn
         # at _STALE_TURN_TIMEOUT, consult /proc evidence so a backend that is
         # provably working (CPU/IO movement in the subprocess subtree) is not
@@ -8867,6 +8876,13 @@ class AcpClient:
         # replacement process, so release it with the oracle it sampled into.
         self._retire_liveness_state()
         self._session_id = None
+        # The launches this record holds died with the process whose harness
+        # started them (a backgrounded command or Workflow runs in that
+        # process's own tree). Carrying it across a respawn would grant the
+        # FRESH tree the watchdog's background-work hold — and its hard-ceiling
+        # grace — on behalf of work that is already dead. "Never reset per
+        # turn" (see __init__) is a statement about turns, not processes.
+        self._background_launches = BackgroundLaunchRecord()
         # The adapter's cumulative cost counter is in-process: a replacement
         # process restarts it at zero, so the delta baseline must restart with
         # it or spend up to the old total is silently dropped — the monotonic
@@ -9516,7 +9532,7 @@ class AcpClient:
                     # ``AcpTimeoutError`` when the child dies before answering
                     # ``initialize``, and as an ``OSError`` on the write that
                     # follows it.
-                    sandbox_failure = await self._sandbox_init_failure()
+                    sandbox_failure = await self._classify_failed_start(self._sandbox_init_failure)
                     if sandbox_failure is not None:
                         _startup_outcome = "sandbox_init_failed"
                         await self._cleanup_failed_live_spawn()
@@ -9550,7 +9566,9 @@ class AcpClient:
                         # startup that died with a throttled registration on its
                         # stderr is pre-prompt by construction, so the typed
                         # transient subclass is the accurate verdict here too.
-                        _throttled = await self._registration_throttle_line()
+                        _throttled = await self._classify_failed_start(
+                            self._registration_throttle_line
+                        )
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
                         # startup error. (Only a harness's declared signed-out
@@ -9585,21 +9603,39 @@ class AcpClient:
             except Exception:  # never let telemetry break session startup
                 logger.debug("session startup metric emit failed", exc_info=True)
 
+    async def _classify_failed_start(self, classify: Callable[[], Awaitable[_T]]) -> _T:
+        """Run one of ``ensure_ready``'s failure-arm classifiers, cleaning up on a cancel.
+
+        Each classifier settles the stderr drain first, which waits, and a cancel
+        landing in that wait propagates (see :func:`settle_drain`). The failure arm
+        has already decided to discard this child by then, and leaving it would
+        keep a live process with a half-built session that the next
+        ``ensure_ready`` takes the warm path straight back onto. So the cleanup the
+        arm would have run runs before the cancel goes on, with the reset in a
+        ``finally`` so a second cancel during the kill still clears the state. A
+        cleanup failure is logged rather than raised: it must not replace the
+        cancel, which is what the caller is owed.
+        """
+        try:
+            return await classify()
+        except asyncio.CancelledError:
+            try:
+                await self._cleanup_failed_live_spawn()
+            except Exception:
+                logger.warning("ACP failed-start cleanup after a cancel failed", exc_info=True)
+            finally:
+                self._reset_state()
+            raise
+
     async def _settle_stderr(self, timeout: float = 0.5) -> None:
         """Bounded wait for the stderr drain, so its ring can be read consistently.
 
-        Same shape and budget as the EOF branch of :meth:`_read_message`, lifted
-        here because the other failure shapes that reach a classifier -- an
-        ``initialize`` timeout, an ``OSError`` on the write after the child died --
-        never pass through it.
+        Same budget as the EOF branch of :meth:`_read_message`, lifted here because
+        the other failure shapes that reach a classifier -- an ``initialize``
+        timeout, an ``OSError`` on the write after the child died -- never pass
+        through it. A cancel of the caller propagates; see :func:`settle_drain`.
         """
-        task = self._stderr_task
-        if task is None or task.done():
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (Exception, asyncio.CancelledError):
-            pass
+        await settle_drain(self._stderr_task, timeout)
 
     async def _sandbox_init_failure(self) -> AcpSandboxInitFailed | None:
         """The classified sandbox-init error for this child's stderr, or ``None``.
@@ -9618,7 +9654,8 @@ class AcpClient:
         ``_read_message`` does: the ring is filled by the drain task while the
         failure that brings us here can arrive from the stdout side or from a
         timeout that never touched it, so a straight read can miss a line already
-        in the pipe. Bounded and swallowing -- this is already a failure path.
+        in the pipe. Bounded, and swallowing everything except a cancel of the
+        caller -- this is already a failure path (see :func:`settle_drain`).
         """
         await self._settle_stderr()
         if not self._stderr_lines:
@@ -9866,11 +9903,11 @@ class AcpClient:
         if not line:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:
-                if self._stderr_task and not self._stderr_task.done():
-                    try:
-                        await asyncio.wait_for(self._stderr_task, timeout=0.5)
-                    except (Exception, asyncio.CancelledError):
-                        pass
+                # Unshielded: the child has exited, so a drain still running past
+                # the budget is held open only by a descendant that inherited the
+                # pipe, and every later settle on this failure would wait on it
+                # again.
+                await settle_drain(self._stderr_task, 0.5, shield=False)
                 stderr_tail = (
                     "; ".join(self._stderr_lines) if self.memory_mode == "persistent" else ""
                 )
@@ -10750,6 +10787,7 @@ class AcpClient:
                     await self._reject_unknown_server_request(msg)
                 elif action == "update":
                     self._track_usage_update(msg)
+                    self._note_background_launch(msg)
                     # Apply the codex compaction state change; this API yields
                     # str so the event has nowhere to go, but the context counts
                     # it drops are what the meter reads next turn.
@@ -10959,6 +10997,7 @@ class AcpClient:
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
                 self._track_usage_update(msg)
+                self._note_background_launch(msg)
                 # codex reports compaction as a marked tool_call pair rather than
                 # as text, so it is read off the FRAME here instead of off a
                 # chunk below. Yielded and then fallen through: the frame is
@@ -11638,6 +11677,23 @@ class AcpClient:
         await asyncio.wait_for(self._turn_done.wait(), timeout=timeout)
         return self._last_stop_reason
 
+    def _note_background_launch(self, msg: JsonRpcMessage) -> None:
+        """Record a background launch the harness reports on this frame, if any."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if self._background_launches.note(params.get("update"), time.monotonic()):
+            logger.info(
+                "ACP: harness launched background work for this session: %s",
+                self._background_launches.describe(),
+            )
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of this session's newest background
+        launch, or ``None`` when its harness reported none (see LLMProvider)."""
+        age = self._background_launches.age(time.monotonic())
+        if age is None:
+            return None
+        return age, self._background_launches.describe()
+
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight AND has not yet been cancelled.
 
@@ -11716,6 +11772,7 @@ class AcpClient:
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
                 self._track_usage_update(msg)
+                self._note_background_launch(msg)
                 # See send_message_stream: settle the codex compaction for the
                 # context counts, drop the event this API cannot return.
                 self._codex_compaction_event(msg)
@@ -13769,6 +13826,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
     "kiro_crew.acp.runtime_models": (
         "advertised_model_ids",
         "resolve_pin_spelling",
+        "resolve_pin_spelling_on",
         "catalog_row_would_drop",
         "resolve_usable_model",
         "_MODEL_SUBSTITUTION_ADVISORY_RE",
@@ -13869,6 +13927,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         advertised_model_ids,
         catalog_row_would_drop,
         resolve_pin_spelling,
+        resolve_pin_spelling_on,
         resolve_usable_model,
     )
     from kiro_crew.acp.runtime_process_tree import (  # noqa: F401

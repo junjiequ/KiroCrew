@@ -61,6 +61,18 @@ export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKe
       // caller makes no assumption about which container it computed against.
       post('/api/chat/folders/reorder', expectedParent === undefined ? { orders } : { orders, expected_parent: expectedParent }).then(j),
     deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
+    /** Delete every folder whose subtree holds no live session and no setting.
+     *  `dryRun` lists the ids (and how many archived sessions each one holds)
+     *  without changing anything; top-level folders are spared unless asked.
+     *  A real run passes the previewed `ids` and deletes only those still empty. */
+    cleanupChatFolders: (opts: { dryRun?: boolean; includeTopLevel?: boolean; ids?: string[] }) =>
+      post('/api/chat/folders/cleanup', { dry_run: !!opts.dryRun, include_top_level: !!opts.includeTopLevel, ...(opts.ids ? { ids: opts.ids } : {}) }).then(j) as Promise<{
+        ok: boolean
+        ids?: string[]
+        deleted?: string[]
+        count: number
+        archived?: Record<string, number>
+      }>,
     /** File a channel's EXISTING conversations into the folder its settings name.
      *
      *  On this transport rather than the panel's own `fetch`, which is what every

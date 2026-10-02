@@ -130,6 +130,7 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/slack/gateway.py"
+      - "src/kiro_crew/slack/gateway_runtime/**/*.py"
       - "src/kiro_crew/dashboard/server.py"
       - "src/kiro_crew/dashboard/handlers/**/*.py"
       - "src/kiro_crew/cli.py"
@@ -411,6 +412,7 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/context.py"
+      - "src/kiro_crew/context_assembly/**/*.py"
       - "src/kiro_crew/memory.py"
       - "src/kiro_crew/vector_memory.py"
       - "src/kiro_crew/vector_memory_runtime/**/*.py"

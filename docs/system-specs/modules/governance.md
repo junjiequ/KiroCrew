@@ -2013,6 +2013,35 @@ real arguments** the ACP event carries:
 - `tool_kind == "fetch"` + `raw_params["url"]` → `network.egress` (the host is
   extracted from the URL so the `host` matcher applies).
 
+Because the item under test is that extracted host, a `host`-matcher pattern
+that carries a character or shape no host can hold never matches. The checks run
+in this order, and the first to hold names the reason: a `/` (a scheme, a path or
+a CIDR mask), an `@` (userinfo), IPv6 brackets (the pattern starts with `[` and
+`_url_host` of the pattern yields an address holding a `:`, as `[::1]` and
+`[::1]:443` both yield `::1`; `_url_host` unwraps them, so the item never has
+them), or a port, meaning exactly one colon with a
+non-empty text before it and only digits after. Exactly one colon is what tells a
+port from an IPv6 literal, which always has two or more, so a bare `::1` or
+`2001:db8::1` stays silent and so does a single-label `server`, while `server:443`
+warns. The text before the colon must also hold no `*`, `?` or `[`: a glob can
+absorb a colon, so `*:443` matches the item `fe80::443` that
+`https://[fe80::443]/x` yields, and `*:443` or `web*:443` stays silent. Any other bracket is an fnmatch character class, which `_match_host`
+honours, so `[ab].example.com`, `[a:].example.com` or
+`web[0-9][0-9].corp.example` is live and stays silent: a colon inside a class
+does not make it IPv6, since `_url_host` finds no host in `[a:].example.com`. Otherwise deadness is read off the pattern, not off `_url_host`: that function cuts a
+bare IPv6 literal at its last colon (`::1` gives `:`) and a netloc at the first
+`?` (`api?.skills.sh` gives `api`), so comparing its output to the pattern would
+condemn live rules. The entry is dead: in deny mode the scope permits exactly what
+the operator wrote it to block, and in allow mode it refuses it.
+`ScopedRuleset.from_dict` therefore logs a warning (beside the Rule-1 dead-deny
+one) naming the scope and the entry's position, such as `deny[0]`. It never logs
+the pattern itself, because a pasted URL can carry userinfo, a signature or an
+`?api_key=` query, and the warning fires on every boot. Only the list the mode
+reads is checked: `allow` in allow mode, `deny` in deny mode. The warning names
+the dead entry and its reason and offers no replacement host. It warns rather than
+raising: refusing the document would turn one stale entry into a boot failure on
+upgrade for a policy that loads today.
+
 `on_tool_call(..., tool_kind=, raw_params=)` carries these from the ACP event
 (`AcpEvent.tool_kind` / `.raw_tool_params`); the call sites thread them
 (`llm_helpers`, `subagent`, `task_executor`, `task_planner`, dashboard
@@ -2849,6 +2878,25 @@ never approved, so the ceiling stands ABOVE the keystone rather than beside it.
 Governed by the `capabilities.decisions` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the rows above).
+
+**A local preset has its own row: `capabilities.decisions_local`.** The row above
+exists because the seam's state reaches a paid third party; a local preset model
+(`decisions/local_models.py`) answers on this machine and sends nothing off it, so a
+fleet that pins hosted Jev off for egress does not thereby withdraw a local model.
+`capabilities.decisions_local` (`capability_default=True`, data only) governs the seam
+only while the gateway's own runtime runs the configured preset on its port
+(`capability.is_local_preset`, the runtime's attestation: `config.json` has other
+writers, so a route-built address there proves nothing about what listens on it). A
+hand-written loopback address, which can be a tunnel to hosted Jev, stays under
+`capabilities.decisions`. A preset-shaped address the gateway does not run answers
+under BOTH rows, denied if either denies, so pinning this row off also stops a server
+started by hand on a preset's port from answering. Both
+chokepoints select the row from the configured provider and the runtime, never from
+the request. `PUT /api/decisions/provider`
+refuses a switch to a withdrawn side with `403 decisions_capability_denied`, and its
+`GET` reports `hosted_permitted` / `local_permitted` so the picker greys that side
+out. `decisions_enabled` is `true` while EITHER row permits, so the card is withheld
+only when both are pinned off. A fleet that wants no local model pins this row too.
 
 **Two chokepoints, because either alone is a half-control.**
 `PUT /api/decisions/consent` refuses an ENABLING write with

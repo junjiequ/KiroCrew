@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, memo, useMemo, useCallback, useId, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, Copy, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server } from 'lucide-react'
+import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, Copy, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import { FolderBody } from '../components/FolderBody'
@@ -14,6 +14,8 @@ import { DndContext, DragOverlay, MeasuringStrategy } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import { shallowEqual, useStore } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '../store'
 import type { RootState } from '../store'
@@ -107,6 +109,7 @@ import { useHistoryPane } from './chat-sidebar/history'
 import { usePinnedSessionOrder, usePinnedOrderAuthority, usePinnedKeyboardReorder } from './chat-sidebar/pinnedOrder'
 import { useStaleCollapse, useStaleMoveWatcher, useStaleNarrowBridge } from './chat-sidebar/stale'
 import { useFolderSort, useFolderVisibility, useFolderFilterReveal, useFolderFilterRows, useFolderMutations, useFolderTree, useRootFolderLanes } from './chat-sidebar/folders'
+import FolderCleanupPanel from './chat-sidebar/FolderCleanupPanel'
 import { useSidebarResize } from './chat-sidebar/resize'
 import { useSidebarTags } from './chat-sidebar/tags'
 import { useBoardColumns, useColumnPopover, useBoardColumnMutations, useColumnMatches, useBoardFolderCollapse } from './chat-sidebar/board'
@@ -2632,6 +2635,7 @@ function ChatSidebar({
     historyOpen, setHistoryOpen, openHistoryPane, historyHeight, historyDragging, historyResize,
   } = useHistoryPane({ setHistoryFilter, slotFilter, dispatch })
   const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [folderCleanupOpen, setFolderCleanupOpen] = useState(false)  // header ⋮ → "Clean up empty folders" panel
   const [manageTagsOpen, setManageTagsOpen] = useState(false)  // header ⋮ → "Manage tags…" panel (list-view tag CRUD)
   const [filterSortOpen, setFilterSortOpen] = useState(false)
   const [cleanupDays, setCleanupDays] = useState(3)
@@ -3292,6 +3296,10 @@ function ChatSidebar({
   } = useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen })
   // A conductor-lane member anchor opens on the Members page (see renderSessionRow).
   const navigate = useNavigate()
+  // The Dynamic Dashboard is a Feature Preview (Settings > Developer): the
+  // kebab's "All dashboards" door is offered only once it is on. The page it
+  // opens stays routable either way, like every preview's route.
+  const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
 
   // Session colors
   const { paletteColors, boost, boostFor, colorMode } = useSessionPalette()
@@ -4433,10 +4441,10 @@ function ChatSidebar({
               <button className="mc-touch-hit w-7 h-7 rounded-md border border-border bg-transparent text-muted cursor-pointer flex items-center justify-center hover:border-border-strong hover:text-text transition-all" title={i18nT('pages.chatSidebar.more_options')} aria-label={i18nT('pages.chatSidebar.more_options')}><MoreVertical size={14} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[180px]">
-              <DropdownMenuItem onSelect={() => navigate('/session-dashboards')}>
+              {dashboardPreview && <DropdownMenuItem onSelect={() => navigate('/session-dashboards')}>
                 <Monitor size={14} className="text-muted" />
                 {i18nT('commandCenter.all_title')}
-              </DropdownMenuItem>
+              </DropdownMenuItem>}
               <DropdownMenuItem disabled={seedStateLanesMutation.isPending} onClick={() => {
                 if (seedStateLanesMutation.isPending) return
                 const isActive = tagColumnsEnabled && rawColumns.length > 0
@@ -4474,6 +4482,10 @@ function ChatSidebar({
               <DropdownMenuItem onClick={() => { setCleanupOpen(!cleanupOpen); setCleanupExpanded(false); setCleanupError('') }}>
                 <BrushCleaning size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.clean_up_sessions')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="clean-up-empty-folders" onClick={() => setFolderCleanupOpen(!folderCleanupOpen)}>
+                <FolderX size={14} className="text-muted" />
+                {i18nT('pages.chatSidebar.clean_up_empty_folders_menu')}
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => { setBulkModelOpen(true); setBulkModel(''); setBulkSkipRunning(true); setBulkModelError('') }}>
                 <Cpu size={14} className="text-muted" />
@@ -4754,6 +4766,7 @@ function ChatSidebar({
        *  and the header's "in split" badge is the way back into a live split. */}
 
       {/* Clean Up dialog */}
+      {folderCleanupOpen && <FolderCleanupPanel folders={folders} onClose={() => setFolderCleanupOpen(false)} />}
       {cleanupOpen && (() => {
         const archivable = cleanupPreview ? cleanupPreview.map(k => localSlots.find(s => s.key === k)).filter(Boolean) as Slot[] : []
         const noStale = cleanupPreview != null && cleanupPreview.length === 0 && !activeIsStale

@@ -361,7 +361,7 @@ def execution_from_record(
         store = payload["store"]
         if not isinstance(store, dict):
             raise ValueError("invalid store")
-        return ExecutionContext(
+        execution = ExecutionContext(
             member_id=payload["member_id"],
             store=MemoryStoreRef(store_id=store["store_id"], member_id=store["member_id"]),
             selection_kind=payload["selection_kind"],
@@ -373,6 +373,92 @@ def execution_from_record(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise _unavailable("malformed execution context") from exc
+    return adopt_removed_synced_crewmate(execution)
+
+
+def _same_agent(name: str, template_id: str) -> bool:
+    """Whether *name* and *template_id* name one agent, a skill view mapped back.
+
+    A record written while the native skill projection was on can carry a
+    ``kirocrew-skill-view-<digest>`` template; the projection's own record says
+    which agent it was built from, even once the view file is gone.
+    """
+    if name == template_id:
+        return True
+    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+
+    if not template_id.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return False
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    return acp_driver.skill_view_source_agent(template_id) == name
+
+
+def is_removed_synced_crewmate(
+    config: Any, execution: ExecutionContext, removed: frozenset[str] | set[str]
+) -> bool:
+    """Whether *execution* names an identity-less crewmate the prune deleted.
+
+    ``crewmate_prune_migration`` removes the ``config.agents`` rows an older
+    agent sync generated: no ``member_id``, the shared ``default`` store, and a
+    name equal to its ``kiro_agent`` (a skill view counts as the agent it was
+    built from). The agent itself stays installed. A record
+    that picked one carries exactly that shape. Both halves must hold: the
+    shape, and the name in *removed* (the prune's own record of what it
+    deleted) while still absent from ``config.agents``. A member deleted by any
+    other route keeps refusing, and so does one with an identity or its own
+    store.
+    """
+    name = execution.selection_name
+    return (
+        execution.selection_kind == "member"
+        and execution.member_id is None
+        and execution.store.store_id == "default"
+        and bool(name)
+        and name in removed
+        and name not in config.agents
+        and _same_agent(name, execution.template_id)
+    )
+
+
+def adopt_removed_synced_crewmate(
+    execution: ExecutionContext, config: Any = None
+) -> ExecutionContext:
+    """Re-read a record bound to a pruned synced crewmate as its template.
+
+    The removed row had no identity and sat on the shared ``default`` store, so
+    the installed agent of the same name on that same store is exactly the
+    binding the row carried. :func:`execution_from_record` applies this to every
+    record it decodes, so a resumed or forked chat, a continued subagent, a cron
+    job and the prompt builder all see one answer instead of each one refusing a
+    member whose row the prune deleted. Any other record is returned unchanged,
+    including when the marker or the config cannot be read.
+    """
+    if (
+        execution.selection_kind != "member"
+        or execution.member_id is not None
+        or execution.store.store_id != "default"
+        or not execution.selection_name
+    ):
+        return execution
+    try:
+        from kiro_crew.crewmate_prune_migration import removed_crewmate_names
+
+        removed = removed_crewmate_names()
+        if execution.selection_name not in removed:
+            return execution
+        if config is None:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            config = KiroCrewConfig.load()
+        adopt = is_removed_synced_crewmate(config, execution, removed)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "prune record or config unreadable; keeping the member record as stored",
+            exc_info=True,
+        )
+        return execution
+    return replace(execution, selection_kind="template") if adopt else execution
 
 
 def member_config_for_id(config: Any, member_id: str) -> tuple[str, Any]:
@@ -930,6 +1016,29 @@ def capture_session_execution(session_key: str, *, template_id: str = "") -> Exe
     return ExecutionContext(None, MemoryStoreRef("default"), "template", template_id, mode)
 
 
+def _carrier_still(meta: Mapping[str, Any], expected: ExecutionContext | None) -> bool:
+    """Whether the carrier stored in *meta* still decodes to *expected*.
+
+    *expected* is a DECODED record, and the decoder re-reads a record bound to a
+    pruned synced crewmate as its template (:func:`adopt_removed_synced_crewmate`).
+    Its ``to_record()`` therefore differs from the bytes still on disk, and a
+    compare-and-set of one against the other refuses every such session as
+    concurrently changed. So the stored side is decoded the same way: two values
+    of one kind. Identical bytes are answered first, without the decode. A
+    stored carrier that does not decode, or decodes to anything else, is a
+    change.
+    """
+    payload = meta.get(EXECUTION_CONTEXT_KEY)
+    if expected is None:
+        return payload is None
+    if payload == expected.to_record():
+        return True
+    try:
+        return execution_from_record(meta) == expected
+    except ValueError:
+        return False
+
+
 def bind_session_execution(
     session_key: str,
     execution: ExecutionContext,
@@ -1004,7 +1113,7 @@ def bind_session_execution(
             if retained != durable and not log.update_metadata_if(
                 session_key,
                 {EXECUTION_CONTEXT_KEY: retained.to_record(), "memory_mode": retained.memory_mode},
-                lambda meta: meta.get(EXECUTION_CONTEXT_KEY) == durable.to_record(),
+                lambda meta: _carrier_still(meta, durable),
             ):
                 raise _unavailable("session changed during privacy tightening")
         elif metadata:
@@ -1032,15 +1141,12 @@ def bind_session_execution(
 
         forget_durable_vouch(session_key)
         return
-    expected = current.to_record() if current is not None else None
     fields = {
         EXECUTION_CONTEXT_KEY: execution.to_record(),
         "memory_store": execution.store.legacy_name,
         "memory_mode": execution.memory_mode,
     }
-    if not log.update_metadata_if(
-        session_key, fields, lambda meta: meta.get(EXECUTION_CONTEXT_KEY) == expected
-    ):
+    if not log.update_metadata_if(session_key, fields, lambda meta: _carrier_still(meta, current)):
         raise _unavailable("session changed during admission")
     # Vouch for what was just committed, AFTER the compare-and-set above, so this
     # process never vouches for an identity the durable record does not carry.

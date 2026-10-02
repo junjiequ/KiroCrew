@@ -1007,6 +1007,17 @@ _DARWIN_PROC_TASKINFO_SIZE = 96
 _DARWIN_PTI_TOTAL_USER_OFFSET = 16
 _DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
 
+# ``proc_pid_rusage(pid, RUSAGE_INFO_V2, buf)`` fills a ``rusage_info_v2``: a
+# 16-byte ``ri_uuid`` followed by 18 uint64 fields, of which
+# ``ri_phys_footprint`` is the eighth (after user/system time, the two wakeup
+# counters, pageins, wired and resident size). Unlike ``proc_pidinfo`` it
+# returns 0/-1 rather than a byte count, so there is no fill size to check the
+# layout against here; test_macos_phys_footprint.py::TestTheRealDarwinAbi checks
+# the offsets against a live libproc on a Mac.
+_DARWIN_RUSAGE_INFO_V2 = 2
+_DARWIN_RUSAGE_INFO_V2_SIZE = 16 + 18 * 8
+_DARWIN_RI_PHYS_FOOTPRINT_OFFSET = 16 + 7 * 8
+
 _darwin_libproc: Any = None
 _darwin_libproc_loaded = False
 
@@ -1034,6 +1045,12 @@ def _darwin_libproc_handle() -> Any:
             ctypes.c_int,
         ]
         lib.proc_pidinfo.restype = ctypes.c_int
+        # Configured on its own: a libproc without this symbol must still
+        # serve every proc_pidinfo probe; only the footprint read goes dark.
+        rusage = getattr(lib, "proc_pid_rusage", None)
+        if rusage is not None:
+            rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            rusage.restype = ctypes.c_int
         _darwin_libproc = lib
     except Exception:
         _darwin_libproc = None
@@ -1110,6 +1127,43 @@ def _darwin_process_start_identity(pid: int) -> ProcessStartIdentity | None:
         return ProcessStartIdentity(f"{sec}.{usec:06d}", ppid)
     except Exception:
         return None
+
+
+def _darwin_process_phys_footprint_bytes(pid: int) -> int | None:
+    """macOS ``phys_footprint`` of *pid* in bytes via ``proc_pid_rusage``.
+
+    The footprint is what jetsam acts on and what Activity Monitor's "Memory"
+    column shows: dirty anonymous memory INCLUDING its compressed and swapped
+    pages. ``ps`` RSS counts only what is resident right now, and on macOS an
+    idle process's grown heap is mostly compressed, so RSS can read a small
+    fraction of the real cost (16x measured on an operator Mac). Needs no
+    entitlement for a same-uid process and never spawns a subprocess.
+    """
+    lib = _darwin_libproc_handle()
+    rusage = getattr(lib, "proc_pid_rusage", None) if lib is not None else None
+    if rusage is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_RUSAGE_INFO_V2_SIZE)
+        if rusage(pid, _DARWIN_RUSAGE_INFO_V2, buf) != 0:
+            return None
+        off = _DARWIN_RI_PHYS_FOOTPRINT_OFFSET
+        # Both x86_64 and arm64 macOS are little-endian.
+        return int.from_bytes(buf.raw[off : off + 8], "little")
+    except Exception:
+        return None
+
+
+def proc_phys_footprint_bytes_for_pid(pid: int) -> int | None:
+    """``phys_footprint`` of *pid* in bytes on macOS; None elsewhere or unreadable.
+
+    The macOS memory figure the runtime ceilings judge by (see
+    ``_darwin_process_phys_footprint_bytes``). Other platforms have no
+    equivalent and answer None, so a caller keeps its own RSS reading there.
+    """
+    if not IS_MACOS:
+        return None
+    return _darwin_process_phys_footprint_bytes(pid)
 
 
 def _darwin_process_start_microtime(pid: int) -> str | None:
@@ -8469,12 +8523,27 @@ class SubtreeSample(NamedTuple):
       many of their command lines contain one of the caller's ``needles``.
       ``None`` means UNMEASURABLE, never zero: rendering "0 processes" for a live
       tree would be a lie, so a surface renders ``None`` as an em dash instead.
+    * ``pss_kb`` — summed proportional set size (``smaps_rollup``), or ``-1``
+      when not requested or the root's is unreadable (non-Linux included).
     """
 
     rss_kb: int
     jiffies: int
     procs: Optional[int]
     matched: Optional[int]
+    pss_kb: int = -1
+
+
+def _proc_pss_kb(pid: int) -> int:
+    """Proportional set size (KiB) of one *pid* from ``smaps_rollup``, or -1."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
 
 
 def proc_subtree_sample(
@@ -8484,6 +8553,7 @@ def proc_subtree_sample(
     jiffies: bool = True,
     counts: bool = False,
     needles: tuple[str, ...] = (),
+    pss: bool = False,
 ) -> SubtreeSample:
     """Walk *pid*'s process subtree ONCE and return every requested reading.
 
@@ -8505,7 +8575,13 @@ def proc_subtree_sample(
     countable — the descendants are not walked at all.
 
     ``counts`` is Linux-only (it matches command lines via
-    :func:`process_matches`) and yields ``(None, None)`` elsewhere.
+    :func:`process_matches`) and yields ``(None, None)`` elsewhere. ``pss`` is
+    Linux-only too (``smaps_rollup``, kernel 4.14+): summed PSS charges each
+    shared page to its sharers proportionally, so it is what the tree costs the
+    host once, where summed VmRSS counts the code pages a tree of node /
+    MCP-server processes shares once per process. ``smaps_rollup`` walks page
+    tables, so it costs far more than a ``status`` read: for an occasional
+    one-off reading, never a periodic sweep.
 
     Coverage caveat for a new caller: the walk reads
     ``/proc/<pid>/task/<tid>/children``, which needs ``CONFIG_PROC_CHILDREN`` and
@@ -8528,7 +8604,8 @@ def proc_subtree_sample(
     total_jiffies = _proc_cpu_jiffies(pid) if jiffies else 0
     procs = 1
     matched = 1 if countable and process_matches(pid, needles) else 0
-    if rss_total < 0 and not jiffies and not countable:
+    pss_total = _proc_pss_kb(pid) if (pss and IS_LINUX) else -1
+    if rss_total < 0 and not jiffies and not countable and pss_total < 0:
         # Nothing a descendant could add — do not pay for the walk.
         return SubtreeSample(-1, total_jiffies, None, None)
     seen = {pid}
@@ -8546,6 +8623,10 @@ def proc_subtree_sample(
                         rss_total += kb
                 if jiffies:
                     total_jiffies += _proc_cpu_jiffies(child)
+                if pss_total >= 0:
+                    kb = _proc_pss_kb(child)
+                    if kb > 0:
+                        pss_total += kb
                 if countable:
                     procs += 1
                     if process_matches(child, needles):
@@ -8553,8 +8634,8 @@ def proc_subtree_sample(
                 nxt.append(child)
         frontier = nxt
     if not countable:
-        return SubtreeSample(rss_total, total_jiffies, None, None)
-    return SubtreeSample(rss_total, total_jiffies, procs, matched)
+        return SubtreeSample(rss_total, total_jiffies, None, None, pss_total)
+    return SubtreeSample(rss_total, total_jiffies, procs, matched, pss_total)
 
 
 def proc_rss_tree_mb_for_pid(pid: int) -> float | None:

@@ -31,10 +31,11 @@ on disk even if you never set it — and a stored value always beats the shipped
 default. Changing a default therefore reaches new installs only: yours keeps
 whatever was written the last time it saved.
 
-Kiro Crew now fixes that for itself on the two agent timeout budgets — the subagent
-timeout and the chat-turn ceiling. On the first start after an upgrade, a stored value
-that is exactly an old shipped default is removed so the current default applies, in
-that same run. It happens once per key: set one back afterwards and it stays yours.
+Kiro Crew now fixes that for itself on three keys: the two agent timeout budgets (the
+subagent timeout and the chat-turn ceiling) and the subagent memory floor
+(`agent.spawn_min_memory_gb`, whose old `4.0` kept subagents from starting on a
+16 GB laptop). On the first start after an upgrade, a stored value that is exactly
+an old shipped default is removed so the current default applies, in that same run. It happens once per key: set one back afterwards and it stays yours.
 Affirming a value with `--keep` before that first start also keeps it.
 
 Everything else is reported, not changed, because a stored value can be a real
@@ -157,7 +158,7 @@ Set a registered value with, for example,
     "max_channel_agents": 3,
     "max_subagents": 0,
     "subagent_max_turns": 1000,
-    "spawn_min_memory_gb": 4.0,
+    "spawn_min_memory_gb": 2.0,
     "soft_stop_budget_secs": 10.0,
     "completion_keep": "head",
     "completion_keep_chars": 3000
@@ -242,7 +243,7 @@ Set a registered value with, for example,
 | `agent.soft_stop_budget_secs` | Seconds to wait for a cooperative cancel before hard-killing the session | `10.0` |
 | `agent.max_subagents` | Max concurrent subagents. `0` auto-sizes the cap at startup from host memory/CPU and a learned per-agent cost. A pin of 1 or 2 is raised to 3, because a cap below 3 would disable auto-sizing and still run under the default | `0` |
 | `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
-| `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
+| `agent.spawn_min_memory_gb` | Free memory (GB) that must remain available after a subagent start is admitted. A dedicated-process start is priced at what such a runtime settles at: about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below `agent.subagent_cost_gb`. A start that shares its parent's runtime is priced about 0.35 GB lower. A spawn that does not fit waits in the durable queue; one with no durable queue (a temporary or incognito memory mode) is refused. An install still carrying the old `4.0` default moves to `2.0` once; a value set back afterwards is kept. 0 disables the check | `2.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
 | `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
@@ -257,6 +258,7 @@ Set a registered value with, for example,
 | `session.empty_response_auto_continue` | After two consecutive empty model responses, send transcript-visible `continue` nudges on the same session | `true` |
 | `session.empty_response_max_continues` | How many `continue` nudges may run back to back before the give-up card (clamped 1-10; above 1 the notice shows "recovery N of M") | `1` |
 | `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
+| `session.compact_wait_secs` | Seconds the automatic-compaction coordinator waits for a compaction to finish before giving up and restarting the session. `0` (the default) uses the built-in budget. A positive value below 60 is raised to 60 and a value above 3600 is capped. Raise it on a host where automatic compaction on a large context window regularly needs longer than the built-in budget | `0.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
 | `session.pool_ttl_secs` | Max age in seconds for pooled processes, discarded at claim time. 0 disables | `1800` |

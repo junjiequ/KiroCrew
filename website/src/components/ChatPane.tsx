@@ -25,6 +25,8 @@ import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import CommandCenterDock from '../pages/chat/command-center/CommandCenterDock'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
@@ -87,6 +89,7 @@ import { slotApprovalMode } from '../utils/slotApprovalMode'
 
 
 import { i18nT } from '../i18n/t'
+import { fetchDashboardConfig } from '../api/dashboardConfigQuery'
 
 /**
  * ChatPane — one live chat session in the native session grid.
@@ -227,6 +230,9 @@ export default function ChatPane({
   // Same gate the main chat uses: hide a Connections-owned OAuth banner only
   // while the card that owns that flow is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
+  // The Dynamic Dashboard is a Feature Preview (Settings > Developer): its
+  // dock is offered only to someone who turned it on, whatever the host wired.
+  const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   // Collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
@@ -523,7 +529,7 @@ export default function ChatPane({
   useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
+  const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
   // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
   // the owner's consent, both the gateway's answers (see useJevAutoSend).
   const jevAutoConsented = useJevAutoSend()
@@ -1746,7 +1752,7 @@ export default function ChatPane({
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
-        {onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
+        {dashboardPreview && onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {/* Rendered on server state only. A `steer-only` host never ASKS for a

@@ -3945,7 +3945,7 @@ fixture's two pins, because pytest hands the test function and every fixture it
 requests the SAME `monkeypatch` instance. Everything after that line reads the
 runner's real free memory — the file is pinned, reads as pinned, and is not pinned
 where it matters. Measured on a macos-15 nightly backend shard reading 2.58 GB
-available, under the 4.5 GB floor: `test_taskq_admission_integration.py`'s
+available, under the 4.5 GB floor then in force: `test_taskq_admission_integration.py`'s
 post-pressure drain deferred the row a second time and failed as
 `assert 'queued' == 'starting'` — nothing in the traceback named memory, and the
 whole nightly publish chain skipped behind it. Scope the patches a test wants
@@ -3984,6 +3984,20 @@ The commonest shape here is not a rate but **an unawaited task**: a handler that
 answers before its work finishes leaves the assertion racing the loop. There is a
 synchronisation point, so use it — `drain_background_tasks(state)` — and see the Rules
 entry for what it looks like when you do not (a different test failing each run).
+
+An unawaited executor job holding a `file_lock` is the sharpest version, because the
+acquire on the event-loop thread is one attempt and never waits (the
+`platform_compat.file_lock` docstring). `await svc.remove(a)` leaves its trust
+revocation running on an executor thread, so a sync `svc.remove_sync(b)` on the next
+line, still on the loop, fails closed (`test_autonudge_refactor_contract`, 7 CI runs
+in one day). Prefer the async mutator, `await svc.remove(b)`. A test whose subject IS
+the sync mutator calls it off the loop (`await asyncio.to_thread(...)`) only when
+nothing else on the service is in flight: no armed timer, no observer, no pending
+persist, since those all belong to the loop. The mirror image is a holder on a fixed
+timer: it races the waiter's own start (`test_posix_lock_ceiling` saw a 4e-05s
+"wait"). Release it when the waiter's own refused attempt on that lock file is seen,
+and release it inside the coroutine, because `asyncio.run` joins its executor before
+an outer `finally` runs and a waiter cannot finish while the lock is held.
 
 Two more shapes, both MEASURED in a 5x full-suite run on Windows:
 
@@ -4505,6 +4519,45 @@ failure. The four extra skips ARE the capability-gated tests standing aside, whi
 proves the runner lacked the capability and the one failure was the test that forgot
 to stand aside with them. No log spelunking required.
 
+### A test that says "every host" but was never run on Windows
+
+`test/test_app_script_cron_sibling_import.py` claimed its recorder cases run "on every
+host". The command-cron case does not: on Windows `run_command_sandboxed` refuses every
+command cron before it spawns (there is no POSIX shell, by design), so the recorder
+stayed empty and the case failed with `AssertionError: []` on every Windows shard of
+every pull request. It was not a flake: it failed the same way every time, locally too.
+
+Two rules close it:
+
+* When the product refuses a feature on some host, a test of that feature gates on the
+  product's OWN refusal probe -- here `cron_script._resolve_command_shell() is None` --
+  not on `sys.platform`. The skip then tracks the product: a host that starts running
+  command crons is held to the pin again. Run the probe under the SAME patches the test
+  body uses: unpatched, this one spawns through the real `wrap_argv`, which raises on a
+  POSIX host with no sandbox backend, so the probe reads that host as shell-less and
+  the skip stands the pin down on exactly the host it was written for.
+* A test whose docstring or name says "every host" / "all platforms" is run on Windows
+  before it merges: locally (`-n0` on one file is seconds) or by reading the
+  `Backend Tests (Windows)` shards of its own round. A recorder or spy that asserts it
+  saw a call is the shape to watch for: on a host that refuses early it sees nothing.
+
+### A frozen list of a surface other branches keep growing
+
+`test/test_context_composition_contract.py` pins the full signature of
+`ContextBuilder.build_message` as a string. A refactor branch recorded the list; a
+feature branch cut from an older base added one keyword. Each was green alone; on main
+together they were red on every platform and every later pull request inherited it.
+Rerunning cannot fix it, which is how to tell it from a flake: the same assertion fails
+on every head built on that main.
+
+A snapshot of a hot surface pins what callers depend on, not every byte. The signature
+tests compare through `_frozen_view`, which drops a NEW keyword-only parameter that has
+a default (no caller can feel it) and keeps everything else -- a removed, renamed,
+reordered or retyped parameter, a new positional or required one, a changed return
+annotation -- red. `test_only_a_compatible_addition_is_tolerated` proves each of those
+still reds. Use the same shape for any new pin over a surface that ordinary feature
+work grows; a byte-exact pin is right only for a surface nobody else edits.
+
 ## Keeping the suite fast
 
 The measured runs above exceeded 100k tests. At that scale, setup overhead rather
@@ -4519,8 +4572,9 @@ pytest test/test_foo.py -n0 -q --no-cov --durations=10
 
 Note that `--store-durations` numbers taken under `-n auto` include worker contention
 and overstate individual tests. Compare candidates **back to back** on the same machine
-(`git stash` / run / `git stash pop` / run); a number from an idle machine measured an
-hour earlier is not a baseline.
+(run the change, then the base in `git worktree add --detach <dir> <base>`; never
+`git stash`: every worktree shares one stash list); a number from an idle machine
+measured an hour earlier is not a baseline.
 
 ### The three highest-leverage patterns
 

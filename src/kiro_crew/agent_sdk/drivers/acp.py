@@ -58,10 +58,12 @@ __all__ = [
     "kiro_cli_resolves",
     "provider_error_client",
     "resolve_pin_spelling",
+    "resolve_pin_spelling_on",
     "run_kiro_native_commands",
     "drain_skill_view_aliases",
     "skill_view_alias_census",
     "skill_view_sidecar_dirs",
+    "skill_view_source_agent",
 ]
 
 
@@ -127,6 +129,20 @@ def resolve_pin_spelling(model_id: str, advertised: object) -> str:
     from kiro_crew.acp.client import resolve_pin_spelling as _impl
 
     return _impl(model_id, advertised)  # type: ignore[arg-type]
+
+
+def resolve_pin_spelling_on(model_id: str, advertised: object, backend: str) -> str:
+    """The spelling *model_id* resolves to on *backend*, or ``""`` when none.
+
+    The same delegation as :func:`resolve_pin_spelling`, to the backend-aware
+    resolver: a harness whose advertised rows are ``<model>[<effort>]`` pairs
+    takes the bare model on its ``model`` config option, so a bare pin resolves
+    there even though the advertised list never spells it. *backend* stays a
+    plain string, so no ACP type crosses the boundary here either.
+    """
+    from kiro_crew.acp.client import resolve_pin_spelling_on as _impl
+
+    return _impl(model_id, advertised, backend=backend)  # type: ignore[arg-type]
 
 
 def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
@@ -660,6 +676,21 @@ def drain_skill_view_aliases() -> int:
     from kiro_crew.acp.skill_projection import drain_stale_aliases
 
     return drain_stale_aliases()
+
+
+def skill_view_source_agent(name: str) -> str | None:
+    """The agent a skill-view name was built from; a plain agent name is itself.
+
+    ``None`` when *name* is a view whose source nothing records, so the caller
+    refuses it rather than guessing an agent. Which record answers is the
+    projection module's rule. Blocking: it may read one sidecar.
+    """
+    from kiro_crew.acp.skill_projection import RetiredSkillView, source_agent_name
+
+    try:
+        return source_agent_name(name)
+    except RetiredSkillView:
+        return None
 
 
 def skill_view_sidecar_dirs() -> tuple[str, str]:

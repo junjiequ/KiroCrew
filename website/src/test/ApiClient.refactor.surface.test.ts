@@ -22,7 +22,7 @@ vi.mock('../utils/resizeImage', () => ({
 }))
 
 const API_KEY_ORDER = [
-  'status', 'tunnelStatus', 'system', 'sessionStorage',
+  'status', 'tunnelStatus', 'system', 'leakedRuntimes', 'reclaimLeakedRuntimes', 'sessionStorage',
   'sessionStorageCleanup', 'sessionStorageRestore', 'sessionStorageEmpty', 'sessionStorageEmptyStatus',
   'sessionInventory', 'sessionInventoryDetail', 'sessionInventoryTrash', 'sessionCrewLogProjections', 'sessionWorkProjection',
   'telemetryStartup', 'telemetryContextTrace', 'usageTurns', 'wakatimeStats',
@@ -120,7 +120,7 @@ const API_KEY_ORDER = [
   'rewind', 'slackLink', 'unlinkSlack', 'pauseSlack',
   'pauseMirror', 'channelTargets', 'linkMirror', 'remindMirror',
   'unlinkMirror', 'slackChannels', 'chatFolders', 'createChatFolder',
-  'updateChatFolder', 'reorderChatFolders', 'deleteChatFolder', 'backfillChannelFolder',
+  'updateChatFolder', 'reorderChatFolders', 'deleteChatFolder', 'cleanupChatFolders', 'backfillChannelFolder',
   'setSlotFolder', 'setSlotColor', 'setSlotColorHex', 'clearSlotColor',
   'setSlotPin', 'chatTags', 'createChatTag',
   'adoptChatTag', 'updateChatTag', 'deleteChatTag', 'setSlotTags',
@@ -175,8 +175,8 @@ const API_KEY_ORDER = [
   'reopenComment', 'deleteArtifactComment', 'editArtifactComment', 'getBrowserInstall',
   'setBrowserToken', 'installBrowserCli', 'installBrowserEngine', 'getBrowserView',
   'startBrowserView', 'openInBrowser', 'getComputerUseConfig', 'saveComputerUseConfig',
-  'getDecisionsConsent', 'getDecisionsProvider', 'saveDecisionsConsent', 'saveDecisionsScope',
-  'saveDecisionsHistoryBudget', 'sendDecisionsFeedback', 'saveDecisionsProvider', 'getSlackConfig', 'getSlackManifest', 'saveSlackConfig',
+  'getDecisionsConsent', 'getDecisionsProvider', 'getDecisionsLocalRuntime', 'saveDecisionsConsent', 'saveDecisionsScope',
+  'saveDecisionsHistoryBudget', 'sendDecisionsFeedback', 'saveDecisionsProvider', 'removeDecisionsLocalModel', 'getSlackConfig', 'getSlackManifest', 'saveSlackConfig',
   'getDiscordConfig', 'saveDiscordConfig', 'getTelegramConfig', 'saveTelegramConfig',
   'getWeComConfig', 'getFeishuConfig', 'saveFeishuConfig', 'saveWeComConfig',
   'getWebexConfig', 'saveWebexConfig', 'getIMessageConfig', 'saveIMessageConfig',

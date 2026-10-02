@@ -1097,6 +1097,16 @@ def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_restart_ready_timeout_override(_floor_monkeypatch):
+    """Keep a developer's ``KIROCREW_RESTART_READY_TIMEOUT`` out of every test.
+
+    ``kirocrew restart`` reads it on every call, and several test files drive
+    ``cli_server._restart`` directly.
+    """
+    _floor_monkeypatch.delenv("KIROCREW_RESTART_READY_TIMEOUT", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_kiro_window_cache():
     """Give every test an EMPTY ``model_registry._KIRO_WINDOWS``, then restore it.
 
@@ -1922,6 +1932,21 @@ def _no_release_feed_network(_floor_monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_carried_auto_update_effect(_floor_monkeypatch) -> None:
+    """Start every test with no derived ``auto_update_effect`` on the status frame.
+
+    The gateway's update loop records the effect it acts on, and a recorded one
+    arms the status path's background re-derivation (git probes, policy reads).
+    Left over from one test, it changes the status field the next test reads and
+    can start that derivation inside an unrelated test's event loop.
+    """
+    from kiro_crew.dashboard.handlers import updates
+
+    _floor_monkeypatch.setattr(updates, "_auto_effect", None)
+    _floor_monkeypatch.setattr(updates, "_auto_effect_task", None)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_catalog_network(_floor_monkeypatch):
     """Make the official app catalog's network seam unreachable for the suite.
 
@@ -1992,7 +2017,7 @@ def named_cron_caller(monkeypatch):
 
 
 #: Comfortably clear of both memory guards ``SubagentManager.spawn`` runs: the
-#: absolute floor (``agent.spawn_min_memory_gb``, 4 GB) and the posture tier
+#: absolute floor (``agent.spawn_min_memory_gb``, 2 GB after a start of up to 1 GB) and the posture tier
 #: (``agent.resource_critical_gb``, 2 GB).
 _HEALTHY_AVAILABLE_GB = 8.0
 
